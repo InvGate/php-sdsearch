@@ -39,7 +39,10 @@ feature set.
   crashed worker).
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the module layout, the reader/writer design,
-and the byte-fidelity details that make the format compatibility work.
+and the byte-fidelity details that make the format compatibility work, and
+[`docs/FORMAT.md`](docs/FORMAT.md) for the byte-level layout of every ZSL index file. The
+PHP API is documented in [`docs/API.md`](docs/API.md) (usage examples) and
+[`sdsearch.stub.php`](sdsearch.stub.php) (signatures + PHPDoc for IDEs / PHPStan).
 
 ## Building
 

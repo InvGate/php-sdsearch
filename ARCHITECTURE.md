@@ -22,6 +22,10 @@ The crate is split in two:
 
 ## Format modules (`sdsearch-core/src/zsl/`)
 
+> For the byte-level layout of each file type (field offsets, encodings, worked hex
+> examples), see [`docs/FORMAT.md`](docs/FORMAT.md). This section maps those file types to
+> the modules that parse and serialize them.
+
 The reader is organized as one module per piece of the ZSL on-disk format, each a
 self-contained parser for that file type:
 

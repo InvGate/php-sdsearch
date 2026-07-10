@@ -3,10 +3,19 @@ name: ci
 # Gates (test, lint) run first and BLOCK the build jobs (needs:). The coverage job is
 # informational (continue-on-error, in no job's needs) so a coverage/token hiccup never
 # reddens the pipeline. Windows uses nightly Rust (ext-php-rs abi_vectorcall).
+# push runs only on main (merge) and release tags; feature-branch pushes are covered by
+# their pull_request run, so a branch with an open PR no longer builds the whole pipeline
+# twice. `concurrency` cancels a superseded run when you push again over an in-flight one.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
