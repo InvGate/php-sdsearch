@@ -1,0 +1,29 @@
+# octocov: self-hosted coverage reporting (no external SaaS).
+# - On PRs: posts/updates a comment with total + per-file coverage and the delta vs main.
+# - On main: stores the report to a GitHub Actions artifact datastore and commits the badge.
+coverage:
+  paths:
+    - coverage/lcov.info
+  badge:
+    path: docs/coverage.svg
+
+# Commit the regenerated badge back to main. "[skip ci]" prevents the commit from re-triggering CI.
+push:
+  if: is_default_branch
+  message: "docs: update coverage badge [skip ci]"
+
+# Store the current report on main so PRs can diff against it. artifact:// = native Actions artifact,
+# no branch, no external service.
+report:
+  if: is_default_branch
+  datastores:
+    - artifact://${GITHUB_REPOSITORY}
+
+# On PRs, read the stored main report to compute the delta.
+diff:
+  if: is_pull_request
+  datastores:
+    - artifact://${GITHUB_REPOSITORY}
+
+comment:
+  if: is_pull_request
