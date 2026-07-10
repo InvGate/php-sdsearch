@@ -21,6 +21,12 @@ jobs:
 
   windows-nts:
     runs-on: windows-latest
+    # ext-php-rs needs the vectorcall ABI on Windows (#![feature(abi_vectorcall)]),
+    # which is nightly-only. The repo's rust-toolchain.toml pins stable and would
+    # otherwise override the nightly toolchain installed below; RUSTUP_TOOLCHAIN
+    # takes precedence over rust-toolchain.toml, so it wins here.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly   # Windows requires nightly (abi_vectorcall)
