@@ -1,0 +1,758 @@
+{
+    "index": "incidents",
+    "num_docs": 4,
+    "fields": [
+        "assigned_group_id_key",
+        "category_id_key",
+        "closed_at_key",
+        "created_at_key",
+        "id_key",
+        "last_update_key",
+        "priority_id_key",
+        "source_id_key",
+        "status_id_key",
+        "title",
+        "type_id_key",
+        "user_id_key",
+        "users"
+    ],
+    "docs": [
+        {
+            "internal_id": 0,
+            "stored": {
+                "title": "New workflow\n",
+                "description": "",
+                "users": "System\n",
+                "id_key": "165",
+                "status_id_key": "6",
+                "category_id_key": "1",
+                "created_at_key": "1783464466",
+                "closed_at_key": "1783464466",
+                "last_update_key": "1783464466",
+                "source_id_key": "2",
+                "priority_id_key": "1",
+                "type_id_key": "1",
+                "user_id_key": "2",
+                "assigned_group_id_key": "2",
+                "id_attr": "165",
+                "title_attr": "New workflow",
+                "description_attr": "",
+                "type_id_attr": "1",
+                "status_id_attr": "6",
+                "users_attr": "System"
+            }
+        },
+        {
+            "internal_id": 1,
+            "stored": {
+                "title": "New workflow\n",
+                "description": "",
+                "users": "System\n",
+                "id_key": "166",
+                "status_id_key": "6",
+                "category_id_key": "1",
+                "created_at_key": "1783464597",
+                "closed_at_key": "1783464597",
+                "last_update_key": "1783464597",
+                "source_id_key": "2",
+                "priority_id_key": "2",
+                "type_id_key": "1",
+                "user_id_key": "2",
+                "assigned_group_id_key": "2",
+                "id_attr": "166",
+                "title_attr": "New workflow",
+                "description_attr": "",
+                "type_id_attr": "1",
+                "status_id_attr": "6",
+                "users_attr": "System"
+            }
+        },
+        {
+            "internal_id": 2,
+            "stored": {
+                "title": "New workflow\n",
+                "description": "",
+                "users": "System\n",
+                "id_key": "167",
+                "status_id_key": "6",
+                "category_id_key": "1",
+                "created_at_key": "1783464910",
+                "closed_at_key": "1783464910",
+                "last_update_key": "1783464910",
+                "source_id_key": "2",
+                "priority_id_key": "2",
+                "type_id_key": "1",
+                "user_id_key": "2",
+                "assigned_group_id_key": "2",
+                "id_attr": "167",
+                "title_attr": "New workflow",
+                "description_attr": "",
+                "type_id_attr": "1",
+                "status_id_attr": "6",
+                "users_attr": "System"
+            }
+        },
+        {
+            "internal_id": 3,
+            "stored": {
+                "title": "New workflow\n",
+                "description": "",
+                "users": "System\n",
+                "id_key": "168",
+                "status_id_key": "6",
+                "category_id_key": "1",
+                "created_at_key": "1783470512",
+                "closed_at_key": "1783470512",
+                "last_update_key": "1783470512",
+                "source_id_key": "2",
+                "priority_id_key": "2",
+                "type_id_key": "1",
+                "user_id_key": "2",
+                "assigned_group_id_key": "2",
+                "id_attr": "168",
+                "title_attr": "New workflow",
+                "description_attr": "",
+                "type_id_attr": "1",
+                "status_id_attr": "6",
+                "users_attr": "System"
+            }
+        }
+    ],
+    "terms": {
+        "assigned_group_id_key": [
+            "2"
+        ],
+        "category_id_key": [
+            "1"
+        ],
+        "closed_at_key": [
+            "1783464466",
+            "1783464597",
+            "1783464910",
+            "1783470512"
+        ],
+        "created_at_key": [
+            "1783464466",
+            "1783464597",
+            "1783464910",
+            "1783470512"
+        ],
+        "id_key": [
+            "165",
+            "166",
+            "167",
+            "168"
+        ],
+        "last_update_key": [
+            "1783464466",
+            "1783464597",
+            "1783464910",
+            "1783470512"
+        ],
+        "priority_id_key": [
+            "1",
+            "2"
+        ],
+        "source_id_key": [
+            "2"
+        ],
+        "status_id_key": [
+            "6"
+        ],
+        "title": [
+            "new",
+            "workflow"
+        ],
+        "type_id_key": [
+            "1"
+        ],
+        "user_id_key": [
+            "2"
+        ],
+        "users": [
+            "system"
+        ]
+    },
+    "doc_freq": {
+        "assigned_group_id_key": {
+            "2": 4
+        },
+        "category_id_key": {
+            "1": 4
+        },
+        "closed_at_key": {
+            "1783464466": 1,
+            "1783464597": 1,
+            "1783464910": 1,
+            "1783470512": 1
+        },
+        "created_at_key": {
+            "1783464466": 1,
+            "1783464597": 1,
+            "1783464910": 1,
+            "1783470512": 1
+        },
+        "id_key": {
+            "165": 1,
+            "166": 1,
+            "167": 1,
+            "168": 1
+        },
+        "last_update_key": {
+            "1783464466": 1,
+            "1783464597": 1,
+            "1783464910": 1,
+            "1783470512": 1
+        },
+        "priority_id_key": {
+            "1": 1,
+            "2": 3
+        },
+        "source_id_key": {
+            "2": 4
+        },
+        "status_id_key": {
+            "6": 4
+        },
+        "title": {
+            "new": 4,
+            "workflow": 4
+        },
+        "type_id_key": {
+            "1": 4
+        },
+        "user_id_key": {
+            "2": 4
+        },
+        "users": {
+            "system": 4
+        }
+    },
+    "postings": {
+        "assigned_group_id_key": {
+            "2": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "category_id_key": {
+            "1": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "closed_at_key": {
+            "1783464466": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783464597": [
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783464910": [
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783470512": [
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "created_at_key": {
+            "1783464466": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783464597": [
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783464910": [
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783470512": [
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "id_key": {
+            "165": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "166": [
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "167": [
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "168": [
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "last_update_key": {
+            "1783464466": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783464597": [
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783464910": [
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "1783470512": [
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "priority_id_key": {
+            "1": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ],
+            "2": [
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "source_id_key": {
+            "2": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "status_id_key": {
+            "6": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "title": {
+            "new": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                }
+            ],
+            "workflow": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        2
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        2
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        2
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        2
+                    ]
+                }
+            ]
+        },
+        "type_id_key": {
+            "1": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "user_id_key": {
+            "2": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        0
+                    ]
+                }
+            ]
+        },
+        "users": {
+            "system": [
+                {
+                    "doc": 0,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                },
+                {
+                    "doc": 1,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                },
+                {
+                    "doc": 2,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                },
+                {
+                    "doc": 3,
+                    "freq": 1,
+                    "positions": [
+                        1
+                    ]
+                }
+            ]
+        }
+    },
+    "query_params": {
+        "fuzzy_similarity": 0.5,
+        "fuzzy_prefix": 3,
+        "wildcard_min_prefix": 0,
+        "field": "title",
+        "term": "new",
+        "prefix": "ne",
+        "typo": "new"
+    },
+    "queries": {
+        "term:title:new": [
+            {
+                "id": 0
+            },
+            {
+                "id": 1
+            },
+            {
+                "id": 2
+            },
+            {
+                "id": 3
+            }
+        ],
+        "wildcard:title:ne*": [
+            {
+                "id": 0
+            },
+            {
+                "id": 1
+            },
+            {
+                "id": 2
+            },
+            {
+                "id": 3
+            }
+        ],
+        "fuzzy:title:new:0.5:3": [
+            {
+                "id": 0
+            },
+            {
+                "id": 1
+            },
+            {
+                "id": 2
+            },
+            {
+                "id": 3
+            }
+        ]
+    }
+}

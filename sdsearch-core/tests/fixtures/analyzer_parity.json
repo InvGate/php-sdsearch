@@ -1,0 +1,73 @@
+[
+    {
+        "input": "Hello World",
+        "tokens": [
+            "hello",
+            "world"
+        ]
+    },
+    {
+        "input": "TICKET-12345",
+        "tokens": [
+            "ticket-12345"
+        ]
+    },
+    {
+        "input": "Mail user@example.com",
+        "tokens": [
+            "mail",
+            "user@example.com"
+        ]
+    },
+    {
+        "input": "see https://a.b/c",
+        "tokens": [
+            "see",
+            "https://a.b/c"
+        ]
+    },
+    {
+        "input": "a --- b",
+        "tokens": [
+            "a",
+            "---",
+            "b"
+        ]
+    },
+    {
+        "input": "Über 2 Ítems",
+        "tokens": [
+            "über",
+            "2",
+            "ítems"
+        ]
+    },
+    {
+        "input": "config.ini path/to/file",
+        "tokens": [
+            "config.ini",
+            "path/to/file"
+        ]
+    },
+    {
+        "input": "CamelCase mixedCASE",
+        "tokens": [
+            "camelcase",
+            "mixedcase"
+        ]
+    },
+    {
+        "input": "İstanbul",
+        "tokens": [
+            "i̇stanbul"
+        ]
+    },
+    {
+        "input": "STRASSE Ünlü İş",
+        "tokens": [
+            "strasse",
+            "ünlü",
+            "i̇ş"
+        ]
+    }
+]

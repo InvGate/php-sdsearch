@@ -1,0 +1,132 @@
+{
+    "index": "multiseg",
+    "num_docs": 5,
+    "queries": {
+        "term:title:vpn": [
+            {
+                "id": 0
+            },
+            {
+                "id": 2
+            }
+        ],
+        "term:title:mysql": [
+            {
+                "id": 1
+            }
+        ],
+        "term:title:backup": [],
+        "wildcard:title:re*": [
+            {
+                "id": 4
+            },
+            {
+                "id": 5
+            }
+        ],
+        "fuzzy:title:mysgl:0.5:3": [
+            {
+                "id": 1
+            }
+        ],
+        "phrase:title:how to": [
+            {
+                "id": 4
+            },
+            {
+                "id": 5
+            }
+        ]
+    },
+    "bool_queries": {
+        "text-only:vpn": [
+            {
+                "id": 0
+            },
+            {
+                "id": 2
+            }
+        ],
+        "text+where:vpn|lang=es": [
+            {
+                "id": 0
+            },
+            {
+                "id": 2
+            }
+        ],
+        "text+in:vpn|cat=1,2": [
+            {
+                "id": 0
+            },
+            {
+                "id": 2
+            }
+        ],
+        "text+in-multi:vpn|cat=3&lang=en": [
+            {
+                "id": 2
+            }
+        ],
+        "where-mustnot:how|lang!=en": [
+            {
+                "id": 4
+            }
+        ],
+        "text-multiword:how to": [
+            {
+                "id": 4
+            },
+            {
+                "id": 5
+            }
+        ]
+    },
+    "docs": [
+        {
+            "id": 0,
+            "stored": {
+                "id_key": "100",
+                "title": "alpha vpn guide",
+                "lang_key": "es",
+                "cat_key": "1"
+            }
+        },
+        {
+            "id": 1,
+            "stored": {
+                "id_key": "101",
+                "title": "beta mysql setup",
+                "lang_key": "es",
+                "cat_key": "2"
+            }
+        },
+        {
+            "id": 2,
+            "stored": {
+                "id_key": "102",
+                "title": "gamma vpn tutorial",
+                "lang_key": "en",
+                "cat_key": "1"
+            }
+        },
+        {
+            "id": 4,
+            "stored": {
+                "id_key": "104",
+                "title": "epsilon how to restore",
+                "lang_key": "es",
+                "cat_key": "2"
+            }
+        },
+        {
+            "id": 5,
+            "stored": {
+                "id_key": "105",
+                "title": "zeta how to reset",
+                "lang_key": "en",
+                "cat_key": "1"
+            }
+        }
+    ]
+}

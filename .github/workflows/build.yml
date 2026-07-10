@@ -1,0 +1,36 @@
+name: build
+on: [push, pull_request]
+
+jobs:
+  linux-nts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          # setup-php provides NTS builds by default on Linux
+      # ext-php-rs uses bindgen, which needs libclang + clang's resource headers
+      # (not just the shared libclang-N library); without this, cargo build fails with
+      # "stddef.h file not found" when generating the PHP bindings.
+      - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - run: cargo test -p sdsearch-core
+      - run: cargo build -p sdsearch-php --release
+      - run: php -d extension=$(pwd)/target/release/libsdsearch.so tests/smoke.php
+
+  windows-nts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly   # Windows requires nightly (abi_vectorcall)
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'                   # NTS x64 build from windows.php.net
+      # same bindgen requirement as linux-nts: libclang + clang resource headers
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1"
+      - run: cargo test -p sdsearch-core
+      - run: cargo build -p sdsearch-php --release
+      - run: php -d extension=${{ github.workspace }}\target\release\sdsearch.dll tests\smoke.php

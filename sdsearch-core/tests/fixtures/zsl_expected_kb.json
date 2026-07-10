@@ -1,0 +1,53 @@
+{
+    "index": "knowledgebase",
+    "num_docs": 20,
+    "query_params": {
+        "fuzzy_similarity": 0.5,
+        "fuzzy_prefix": 3,
+        "wildcard_min_prefix": 0
+    },
+    "queries": {
+        "term:title:vpn": [
+            {
+                "id": 0
+            },
+            {
+                "id": 12
+            }
+        ],
+        "term:title:laptop": [
+            {
+                "id": 7
+            }
+        ],
+        "wildcard:title:print*": [
+            {
+                "id": 13
+            },
+            {
+                "id": 4
+            },
+            {
+                "id": 6
+            }
+        ],
+        "fuzzy:title:passwrd:0.5:3": [
+            {
+                "id": 1
+            }
+        ],
+        "phrase:title:setting up": [
+            {
+                "id": 5
+            },
+            {
+                "id": 15
+            }
+        ],
+        "phrase:title:cloud storage": [
+            {
+                "id": 14
+            }
+        ]
+    }
+}
