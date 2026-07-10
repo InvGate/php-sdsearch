@@ -1,3 +1,18 @@
 [workspace]
 resolver = "2"
 members = ["sdsearch-core", "sdsearch-php"]
+
+# Release profile for the shipped binaries (also used by CI's --release builds, so CI
+# smoke-tests exactly what we ship).
+#
+# INVARIANT: do NOT set `panic = "abort"`. The PHP FFI boundary in sdsearch-php wraps every
+# call in catch_unwind to turn a Rust panic into a catchable PhpException and keep the PHP
+# worker alive. `panic = "abort"` would make catch_unwind catch nothing and abort the whole
+# process on any panic. It must stay the default (`unwind`).
+#
+# Also do NOT build with `-C target-cpu=native` for distributed binaries: it bakes the build
+# runner's CPU features in and can SIGILL on older deployment CPUs. Keep the x86-64 baseline.
+[profile.release]
+strip = "symbols"   # drop the symbol table: smaller binary, no internal-name leakage
+lto = "fat"         # whole-program LTO: maximum optimization (build time is not a concern)
+codegen-units = 1   # let the optimizer work across the whole crate
