@@ -39,7 +39,8 @@ feature set.
   crashed worker).
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the module layout, the reader/writer design,
-and the byte-fidelity details that make the format compatibility work.
+and the byte-fidelity details that make the format compatibility work, and
+[`docs/FORMAT.md`](docs/FORMAT.md) for the byte-level layout of every ZSL index file.
 
 ## Building
 
