@@ -56,11 +56,11 @@ pub fn segment_name(counter: u32) -> String {
 fn read_gen_number(index_dir: &Path) -> std::io::Result<u64> {
     let data = std::fs::read(index_dir.join("segments.gen"))?;
     let mut pos = 0usize;
-    if read_u32_be(&data, &mut pos) != GEN_FORMAT {
+    if read_u32_be(&data, &mut pos)? != GEN_FORMAT {
         return Err(io_err("wrong segments.gen format"));
     }
-    let g1 = read_u64_be(&data, &mut pos);
-    let g2 = read_u64_be(&data, &mut pos);
+    let g1 = read_u64_be(&data, &mut pos)?;
+    let g2 = read_u64_be(&data, &mut pos)?;
     if g1 != g2 {
         return Err(io_err("segments.gen mid-write (g1 != g2)"));
     }
@@ -77,19 +77,19 @@ fn walk_records(
     let is_2_3 = format == FORMAT_2_3;
     let mut offsets = Vec::with_capacity(seg_count as usize);
     for _ in 0..seg_count {
-        let name = read_modified_utf8(data, &mut pos);
+        let name = read_modified_utf8(data, &mut pos)?;
         pos += 4; // docCount
         offsets.push((name, pos)); // the delGen (long) starts here
         pos += 8; // delGen (long)
         if is_2_3 {
-            let doc_store_offset = read_u32_be(data, &mut pos);
+            let doc_store_offset = read_u32_be(data, &mut pos)?;
             if doc_store_offset != 0xFFFF_FFFF {
-                let _seg = read_modified_utf8(data, &mut pos);
+                let _seg = read_modified_utf8(data, &mut pos)?;
                 pos += 1; // docStoreIsCompound byte
             }
         }
         pos += 1; // hasSingleNormFile byte
-        let num_field = read_u32_be(data, &mut pos);
+        let num_field = read_u32_be(data, &mut pos)?;
         if num_field != 0xFFFF_FFFF {
             return Err(io_err("separate norm files unsupported (optimize index)"));
         }
@@ -109,13 +109,13 @@ pub fn read_generation(index_dir: &Path) -> std::io::Result<Generation> {
     let data = std::fs::read(index_dir.join(&fname))?;
 
     let mut pos = 0usize;
-    let format = read_u32_be(&data, &mut pos);
+    let format = read_u32_be(&data, &mut pos)?;
     if format != FORMAT_2_1 && format != FORMAT_2_3 {
         return Err(io_err("unsupported segments file format"));
     }
-    let version = read_u64_be(&data, &mut pos);
-    let name_counter = read_u32_be(&data, &mut pos);
-    let seg_count = read_u32_be(&data, &mut pos);
+    let version = read_u64_be(&data, &mut pos)?;
+    let name_counter = read_u32_be(&data, &mut pos)?;
+    let seg_count = read_u32_be(&data, &mut pos)?;
     debug_assert_eq!(pos, HEADER_LEN);
 
     let (records_end, record_delgen_offsets) = walk_records(&data, pos, format, seg_count)?;
@@ -311,7 +311,7 @@ mod tests {
         // nameCounter bumped to 4 in the new segments_7
         let sb = std::fs::read(dir.join("segments_7")).unwrap();
         let mut p = 12;
-        assert_eq!(read_u32_be(&sb, &mut p), 4);
+        assert_eq!(read_u32_be(&sb, &mut p).unwrap(), 4);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -347,7 +347,7 @@ mod tests {
         // nameCounter bumped to 5 (3 + 2) in the new segments_7
         let sb = std::fs::read(dir.join("segments_7")).unwrap();
         let mut p = 12; // format(4)+version(8) → nameCounter
-        assert_eq!(read_u32_be(&sb, &mut p), 5);
+        assert_eq!(read_u32_be(&sb, &mut p).unwrap(), 5);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -399,7 +399,7 @@ mod tests {
         // nameCounter bumped to 4 (3 + 1)
         let sb = std::fs::read(dir.join("segments_7")).unwrap();
         let mut p = 12; // format(4)+version(8) -> nameCounter
-        assert_eq!(read_u32_be(&sb, &mut p), 4);
+        assert_eq!(read_u32_be(&sb, &mut p).unwrap(), 4);
         assert!(!dir.join("segments.gen.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
     }

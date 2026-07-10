@@ -45,26 +45,26 @@ pub fn write_term_dict(terms: &[TermPostings]) -> DictFiles {
     write_vint(&mut tii, 0); // proxDelta
     write_vint(&mut tii, 24); // IndexDelta
 
-    // state of the previous term in the .tis
-    let mut prev: Option<(String, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
+    // state of the previous term in the .tis (borrows term text from `terms`, no clone)
+    let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
     // state of the last sample in the .tii
-    let mut idx_prev: Option<(String, usize, u64, u64)> = None;
+    let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
     let mut last_index_position: u64 = 24;
 
     for (i, term) in terms.iter().enumerate() {
         let (freq_ptr, prox_ptr) = write_term_postings(&mut frq, &mut prx, &term.docs);
         let doc_freq = term.doc_freq();
 
-        dump_entry(&mut tis, prev.as_ref(), term, doc_freq, freq_ptr, prox_ptr);
-        prev = Some((term.text.clone(), term.field_num, freq_ptr, prox_ptr));
+        dump_entry(&mut tis, prev, term, doc_freq, freq_ptr, prox_ptr);
+        prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
 
         // sample every indexInterval terms
         if (i as u64 + 1).is_multiple_of(INDEX_INTERVAL) {
-            dump_entry(&mut tii, idx_prev.as_ref(), term, doc_freq, freq_ptr, prox_ptr);
+            dump_entry(&mut tii, idx_prev, term, doc_freq, freq_ptr, prox_ptr);
             let index_position = tis.len() as u64;
             write_vint(&mut tii, index_position - last_index_position);
             last_index_position = index_position;
-            idx_prev = Some((term.text.clone(), term.field_num, freq_ptr, prox_ptr));
+            idx_prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
         }
     }
 
@@ -92,14 +92,14 @@ fn patch_long(buf: &mut [u8], offset: usize, v: u64) {
 /// field; writes freq/prox as a delta relative to `prev`, or absolute if `prev` is None.
 fn dump_entry(
     out: &mut Vec<u8>,
-    prev: Option<&(String, usize, u64, u64)>,
+    prev: Option<(&str, usize, u64, u64)>,
     term: &TermPostings,
     doc_freq: u32,
     freq_ptr: u64,
     prox_ptr: u64,
 ) {
     let (prefix_chars, prefix_bytes) = match prev {
-        Some((ptext, pfield, ..)) if *pfield == term.field_num => common_prefix(ptext, &term.text),
+        Some((ptext, pfield, ..)) if pfield == term.field_num => common_prefix(ptext, &term.text),
         _ => (0, 0),
     };
     write_vint(out, prefix_chars as u64);
@@ -167,16 +167,16 @@ mod tests {
         let inv = invert(&docs, &WriterOpts::default());
         let f = write_term_dict(&inv.terms);
         let names = field_names(&inv);
-        let dict = TermDict::read(&f.tis, &names);
+        let dict = TermDict::read(&f.tis, &names).unwrap();
 
         assert_eq!(dict.info("title", "workflow").unwrap().doc_freq, 2);
         assert_eq!(dict.info("title", "done").unwrap().doc_freq, 1);
 
         let body_new = dict.info("body", "new").unwrap();
-        assert_eq!(read_freqs(&f.frq, body_new), vec![(0, 2)]);
+        assert_eq!(read_freqs(&f.frq, body_new).unwrap(), vec![(0, 2)]);
 
         let title_wf = dict.info("title", "workflow").unwrap();
-        assert_eq!(read_all_positions(&f.frq, &f.prx, title_wf), vec![(0, vec![2]), (1, vec![1])]);
+        assert_eq!(read_all_positions(&f.frq, &f.prx, title_wf).unwrap(), vec![(0, vec![2]), (1, vec![1])]);
     }
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
         let f = write_term_dict(&inv.terms);
         assert_eq!(&f.tis[0..4], &[0xFF, 0xFF, 0xFF, 0xFD]); // marker
         let mut pos = 4;
-        assert_eq!(read_u64_be(&f.tis, &mut pos), 3); // 3 terms: a,b,c
+        assert_eq!(read_u64_be(&f.tis, &mut pos).unwrap(), 3); // 3 terms: a,b,c
     }
 
     #[test]
@@ -196,7 +196,7 @@ mod tests {
         let f = write_term_dict(&inv.terms);
         // header 24 bytes; count == 1 (fewer than indexInterval terms)
         let mut pos = 4;
-        assert_eq!(read_u64_be(&f.tii, &mut pos), 1);
+        assert_eq!(read_u64_be(&f.tii, &mut pos).unwrap(), 1);
         // synthetic entry: VInt(0) VInt(0) Int(0xFFFFFFFF) byte(0x0F) VInt0 VInt0 VInt0 VInt(24)
         let expected = [0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00, 0x18];
         assert_eq!(&f.tii[24..24 + expected.len()], &expected);
@@ -213,12 +213,12 @@ mod tests {
         let f = write_term_dict(&inv.terms);
 
         let mut pos = 4;
-        assert_eq!(read_u64_be(&f.tis, &mut pos), 300);
+        assert_eq!(read_u64_be(&f.tis, &mut pos).unwrap(), 300);
         let mut pos = 4;
-        assert_eq!(read_u64_be(&f.tii, &mut pos), 3);
+        assert_eq!(read_u64_be(&f.tii, &mut pos).unwrap(), 3);
 
         // and the .tis is still readable
-        let dict = TermDict::read(&f.tis, &field_names(&inv));
+        let dict = TermDict::read(&f.tis, &field_names(&inv)).unwrap();
         assert_eq!(dict.info("t", "w0000").unwrap().doc_freq, 1);
         assert_eq!(dict.info("t", "w0299").unwrap().doc_freq, 1);
     }

@@ -46,13 +46,13 @@ impl TermDict {
     /// distinguishing field) reproduces exactly what `DictionaryLoader::load` does.
     /// The freq/prox pointers are deltas accumulated across the WHOLE file,
     /// not per field.
-    pub fn read(tis: &[u8], field_names: &[String]) -> TermDict {
+    pub fn read(tis: &[u8], field_names: &[String]) -> std::io::Result<TermDict> {
         let mut pos = 0usize;
-        let _marker = read_i32_be(tis, &mut pos);
-        let term_count = read_u64_be(tis, &mut pos);
-        let _index_interval = read_i32_be(tis, &mut pos);
-        let _skip_interval = read_i32_be(tis, &mut pos);
-        let _max_skip_levels = read_i32_be(tis, &mut pos);
+        let _marker = read_i32_be(tis, &mut pos)?;
+        let term_count = read_u64_be(tis, &mut pos)?;
+        let _index_interval = read_i32_be(tis, &mut pos)?;
+        let _skip_interval = read_i32_be(tis, &mut pos)?;
+        let _max_skip_levels = read_i32_be(tis, &mut pos)?;
 
         let mut by_field: std::collections::HashMap<String, FieldTerms> =
             std::collections::HashMap::new();
@@ -60,12 +60,12 @@ impl TermDict {
         let mut freq_ptr: u64 = 0;
         let mut prox_ptr: u64 = 0;
         for _ in 0..term_count {
-            let shared = read_vint(tis, &mut pos) as usize;
-            let suffix = read_modified_utf8(tis, &mut pos);
-            let field_num = read_vint(tis, &mut pos) as usize;
-            let doc_freq = read_vint(tis, &mut pos) as u32;
-            freq_ptr = freq_ptr.wrapping_add(read_vint(tis, &mut pos));
-            prox_ptr = prox_ptr.wrapping_add(read_vint(tis, &mut pos));
+            let shared = read_vint(tis, &mut pos)? as usize;
+            let suffix = read_modified_utf8(tis, &mut pos)?;
+            let field_num = read_vint(tis, &mut pos)? as usize;
+            let doc_freq = read_vint(tis, &mut pos)? as u32;
+            freq_ptr = freq_ptr.wrapping_add(read_vint(tis, &mut pos)?);
+            prox_ptr = prox_ptr.wrapping_add(read_vint(tis, &mut pos)?);
             // skipOffset is always omitted: skips are disabled (docFreq < skipInterval).
 
             let prefix: String = prev_text.chars().take(shared).collect();
@@ -83,7 +83,7 @@ impl TermDict {
         for ft in by_field.values_mut() {
             ft.offsets.push(ft.text.len() as u32);
         }
-        TermDict { by_field }
+        Ok(TermDict { by_field })
     }
 
     /// Looks up (field, term) by binary search over the field's compact buffer.
@@ -165,8 +165,17 @@ mod tests {
         let cf = CompoundFile::open(&path).unwrap();
         let fnm = cf.names().into_iter().find(|n| n.ends_with(".fnm")).unwrap();
         let tis = cf.names().into_iter().find(|n| n.ends_with(".tis")).unwrap();
-        let names: Vec<String> = read_field_infos(cf.sub(&fnm).unwrap()).into_iter().map(|f| f.name).collect();
-        TermDict::read(cf.sub(&tis).unwrap(), &names)
+        let names: Vec<String> = read_field_infos(cf.sub(&fnm).unwrap()).unwrap().into_iter().map(|f| f.name).collect();
+        TermDict::read(cf.sub(&tis).unwrap(), &names).unwrap()
+    }
+
+    #[test]
+    fn termdict_read_errors_on_truncation() {
+        // marker(4) + termCount(8)=5 + intervals(12), but no term bodies follow
+        let mut buf = vec![0xFF, 0xFF, 0xFF, 0xFD];
+        buf.extend_from_slice(&5u64.to_be_bytes());
+        buf.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert!(TermDict::read(&buf, &[]).is_err());
     }
 
     #[test]

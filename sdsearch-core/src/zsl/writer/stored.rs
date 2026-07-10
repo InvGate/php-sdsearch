@@ -44,11 +44,11 @@ mod tests {
             FieldInfo { name: "id".into(), is_indexed: false },
         ];
 
-        let d0 = read_stored_fields(&fdx, &fdt, &fields, 0);
+        let d0 = read_stored_fields(&fdx, &fdt, &fields, 0).unwrap();
         assert_eq!(d0.get("title").unwrap(), "New workflow\n"); // \n preserved
         assert_eq!(d0.get("id").unwrap(), "42");
 
-        let d1 = read_stored_fields(&fdx, &fdt, &fields, 1);
+        let d1 = read_stored_fields(&fdx, &fdt, &fields, 1).unwrap();
         assert_eq!(d1.get("title").unwrap(), "other\n");
         assert!(!d1.contains_key("id"));
     }
@@ -66,19 +66,19 @@ mod tests {
         let (fdt, fdx) = write_stored(&stored);
         // doc 0: preserves order, field_num and the tokenized flag
         assert_eq!(
-            read_stored_raw(&fdx, &fdt, 0),
+            read_stored_raw(&fdx, &fdt, 0).unwrap(),
             vec![
                 StoredRaw { field_num: 0, value: "New workflow\n".into(), tokenized: true, is_binary: false },
                 StoredRaw { field_num: 2, value: "42".into(), tokenized: false, is_binary: false },
             ]
         );
         // the host application does not index binaries: the round-trip must never report is_binary=true
-        assert!(read_stored_raw(&fdx, &fdt, 0).iter().all(|r| !r.is_binary));
+        assert!(read_stored_raw(&fdx, &fdt, 0).unwrap().iter().all(|r| !r.is_binary));
         assert_eq!(
-            read_stored_raw(&fdx, &fdt, 1),
+            read_stored_raw(&fdx, &fdt, 1).unwrap(),
             vec![StoredRaw { field_num: 0, value: "other\n".into(), tokenized: true, is_binary: false }]
         );
         // out-of-range doc → empty
-        assert!(read_stored_raw(&fdx, &fdt, 9).is_empty());
+        assert!(read_stored_raw(&fdx, &fdt, 9).unwrap().is_empty());
     }
 }

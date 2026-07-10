@@ -59,7 +59,7 @@ impl ZslSegment {
     }
 
     /// stored fields of a doc in write order (LOCAL field_num + tokenized flag).
-    pub fn stored_raw(&self, local_doc: usize) -> Vec<StoredRaw> {
+    pub fn stored_raw(&self, local_doc: usize) -> std::io::Result<Vec<StoredRaw>> {
         read_stored_raw(
             self.cfs.sub(&self.fdx_name).unwrap(),
             self.cfs.sub(&self.fdt_name).unwrap(),
@@ -103,9 +103,9 @@ impl ZslSegment {
         let fnm = name_ending(".fnm").ok_or_else(|| std::io::Error::other("no .fnm"))?;
         let tis = name_ending(".tis").ok_or_else(|| std::io::Error::other("no .tis"))?;
 
-        let fields = read_field_infos(cfs.sub(&fnm).unwrap());
+        let fields = read_field_infos(cfs.sub(&fnm).unwrap())?;
         let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
-        let dict = TermDict::read(cfs.sub(&tis).unwrap(), &field_names);
+        let dict = TermDict::read(cfs.sub(&tis).unwrap(), &field_names)?;
 
         let fdx_name = name_ending(".fdx").ok_or_else(|| std::io::Error::other("no .fdx"))?;
         let num_docs_total = cfs.sub(&fdx_name).unwrap().len() / 8;
@@ -117,12 +117,12 @@ impl ZslSegment {
             None => HashMap::new(),
         };
 
-        // .del lives OUTSIDE the .cfs; we load it only if the file exists.
-        let deletes = del_path
-            .filter(|p| p.exists())
-            .and_then(|p| std::fs::read(p).ok())
-            .map(|b| DeletedDocs::read(&b))
-            .unwrap_or_else(DeletedDocs::none);
+        // .del lives OUTSIDE the .cfs; we load it only if the file exists. A corrupt or
+        // unsupported (sparse) .del surfaces as an error at open time rather than a crash.
+        let deletes = match del_path.filter(|p| p.exists()).and_then(|p| std::fs::read(p).ok()) {
+            Some(b) => DeletedDocs::read(&b)?,
+            None => DeletedDocs::none(),
+        };
 
         let fdt_name = name_ending(".fdt").ok_or_else(|| std::io::Error::other("no .fdt"))?;
         let frq_name = name_ending(".frq").ok_or_else(|| std::io::Error::other("no .frq"))?;
@@ -153,7 +153,9 @@ impl IndexReader for ZslSegment {
 
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
         match self.dict.info(field, term) {
+            // degrade: a corrupt .frq yields no postings rather than a panic across FFI
             Some(ti) => read_freqs(self.cfs.sub(&self.frq_name).unwrap(), ti)
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|(d, _)| !self.deletes.is_deleted(*d))
                 .collect(),
@@ -170,12 +172,14 @@ impl IndexReader for ZslSegment {
     }
 
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
+        // degrade: a corrupt .fdt/.fdx yields no stored fields rather than a panic across FFI
         read_stored_fields(
             self.cfs.sub(&self.fdx_name).unwrap(),
             self.cfs.sub(&self.fdt_name).unwrap(),
             &self.fields,
             doc_id,
         )
+        .unwrap_or_default()
     }
 
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
@@ -190,12 +194,14 @@ impl IndexReader for ZslSegment {
                 let _ = ti;
                 Vec::new()
             }
+            // degrade: corrupt .frq/.prx yields no positions rather than a panic across FFI
             Some(ti) => read_positions(
                 self.cfs.sub(&self.frq_name).unwrap(),
                 self.cfs.sub(&self.prx_name).unwrap(),
                 ti,
                 doc_id,
-            ),
+            )
+            .unwrap_or_default(),
             None => Vec::new(),
         }
     }
@@ -203,11 +209,13 @@ impl IndexReader for ZslSegment {
     /// a single pass over `.frq`/`.prx` for the whole term (vs O(docs) walks).
     fn positions_all(&self, field: &str, term: &str) -> HashMap<usize, Vec<u32>> {
         match self.dict.info(field, term) {
+            // degrade: corrupt .frq/.prx yields no positions rather than a panic across FFI
             Some(ti) if !self.prx_name.is_empty() => read_all_positions(
                 self.cfs.sub(&self.frq_name).unwrap(),
                 self.cfs.sub(&self.prx_name).unwrap(),
                 ti,
             )
+            .unwrap_or_default()
             .into_iter()
             .filter(|(d, _)| !self.deletes.is_deleted(*d))
             .collect(),
@@ -269,6 +277,16 @@ mod tests {
     }
 
     #[test]
+    fn open_errors_on_corrupt_segment() {
+        let dir = std::env::temp_dir().join("sdsearch_seg_open_bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("_x.cfs"), [0x80u8]).unwrap(); // 1-byte garbage .cfs
+        assert!(ZslSegment::open(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn merge_accessors_expose_fields_deletes_norms_terms_stored() {
         let s = seg(); // incidents fixture, 4 docs, no deletes
         // field_infos: includes title (indexed)
@@ -281,7 +299,7 @@ mod tests {
         // all_terms: title:new present
         assert!(s.all_terms().contains(&("title".to_string(), "new".to_string())));
         // stored_raw doc 0: contains id_key="165" (same value as stored_fields)
-        let raw = s.stored_raw(0);
+        let raw = s.stored_raw(0).unwrap();
         let names = s.field_infos();
         let idkey = raw.iter().find(|r| names[r.field_num].name == "id_key");
         assert_eq!(idkey.map(|r| r.value.as_str()), Some("165"));

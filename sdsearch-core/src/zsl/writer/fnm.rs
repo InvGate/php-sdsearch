@@ -28,7 +28,7 @@ mod tests {
         ];
         let fnm = write_fnm(&fields);
         assert_eq!(
-            read_field_infos(&fnm),
+            read_field_infos(&fnm).unwrap(),
             vec![
                 FieldInfo { name: "title".into(), is_indexed: true },
                 FieldInfo { name: "id_attr".into(), is_indexed: false },

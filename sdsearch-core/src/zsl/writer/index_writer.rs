@@ -235,7 +235,7 @@ impl IndexWriter {
                     )),
                 };
                 let bytes = std::fs::read(&del_path)?;
-                let dd = DeletedDocs::read(&bytes);
+                let dd = DeletedDocs::read(&bytes)?;
                 for d in 0..max_doc {
                     if dd.is_deleted(d) {
                         merged.insert(d);

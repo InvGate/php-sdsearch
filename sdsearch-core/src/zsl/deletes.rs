@@ -17,17 +17,21 @@ pub struct DeletedDocs {
 impl DeletedDocs {
     /// Reads a `.del` with the dense BitVector layout.
     ///
-    /// # Panics
-    /// If it detects the sparse/DGaps marker (`0xFFFFFFFF`) in the first 4 bytes:
-    /// that layout is not supported yet (see the module doc).
-    pub fn read(del: &[u8]) -> DeletedDocs {
+    /// # Errors
+    /// Returns `Err` if it detects the sparse/DGaps marker (`0xFFFFFFFF`) in the
+    /// first 4 bytes (that layout is not supported yet — see the module doc) or if
+    /// the header is truncated.
+    pub fn read(del: &[u8]) -> std::io::Result<DeletedDocs> {
         let mut pos = 0usize;
-        let doc_count = read_i32_be(del, &mut pos);
+        let doc_count = read_i32_be(del, &mut pos)?;
         if doc_count == SPARSE_MARKER {
-            panic!("sparse/DGaps .del layout not supported yet; only dense BitVector .del is handled");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sparse/DGaps .del layout not supported; only dense BitVector .del is handled",
+            ));
         }
-        let _bit_count = read_i32_be(del, &mut pos);
-        DeletedDocs { bits: del[pos..].to_vec() }
+        let _bit_count = read_i32_be(del, &mut pos)?;
+        Ok(DeletedDocs { bits: del.get(pos..).unwrap_or(&[]).to_vec() })
     }
 
     pub fn none() -> DeletedDocs {
@@ -54,7 +58,7 @@ mod tests {
         buf.extend_from_slice(&10i32.to_be_bytes());
         buf.extend_from_slice(&1i32.to_be_bytes());
         buf.push(0b0000_0100);
-        let d = DeletedDocs::read(&buf);
+        let d = DeletedDocs::read(&buf).unwrap();
         assert!(d.is_deleted(2));
         assert!(!d.is_deleted(0));
         assert!(!d.is_deleted(9));
@@ -66,12 +70,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "sparse")]
-    fn panics_on_sparse_dgaps_marker() {
+    fn errors_on_sparse_dgaps_marker() {
         // 0xFFFFFFFF (-1 as i32) => sparse/DGaps marker, not supported yet
         let mut buf = Vec::new();
         buf.extend_from_slice(&(-1i32).to_be_bytes());
-        buf.extend_from_slice(&[0x00, 0x01]); // stub of (VInt dgap, byte), irrelevant: it must panic first
-        DeletedDocs::read(&buf);
+        buf.extend_from_slice(&[0x00, 0x01]); // stub of (VInt dgap, byte); read must Err before touching it
+        match DeletedDocs::read(&buf) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected Err on sparse .del marker"),
+        }
     }
 }

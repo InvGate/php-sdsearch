@@ -1,72 +1,72 @@
 //! ZSL postings decode: .frq (doc deltas + freqs) and .prx (positions).
-use crate::zsl::bytes::read_vint;
+use crate::zsl::bytes::{checked_capacity, read_vint};
 use crate::zsl::terms::TermInfo;
 
 /// Decodes `.frq` for a term: docId (accumulated delta) + freq per doc.
 /// `VInt(v)`: `docDelta = v >> 1`; if `v & 1 == 1` the freq is 1 (implicit),
 /// otherwise a second `VInt(freq)` is read.
-pub fn read_freqs(frq: &[u8], info: &TermInfo) -> Vec<(usize, u32)> {
+pub fn read_freqs(frq: &[u8], info: &TermInfo) -> std::io::Result<Vec<(usize, u32)>> {
     let mut pos = info.freq_pointer as usize;
-    let mut out = Vec::with_capacity(info.doc_freq as usize);
+    let mut out = Vec::with_capacity(checked_capacity(info.doc_freq as usize, frq.len().saturating_sub(pos)));
     let mut prev = 0usize;
     for _ in 0..info.doc_freq {
-        let v = read_vint(frq, &mut pos);
+        let v = read_vint(frq, &mut pos)?;
         let doc_delta = (v >> 1) as usize;
-        let freq = if v & 1 == 1 { 1 } else { read_vint(frq, &mut pos) as u32 };
+        let freq = if v & 1 == 1 { 1 } else { read_vint(frq, &mut pos)? as u32 };
         let doc_id = prev + doc_delta;
         out.push((doc_id, freq));
         prev = doc_id;
     }
-    out
+    Ok(out)
 }
 
 /// Decodes the `.prx` positions for `doc_id`, walking `.frq` in parallel
 /// to know how many positions to consume per doc.
-pub fn read_positions(frq: &[u8], prx: &[u8], info: &TermInfo, doc_id: usize) -> Vec<u32> {
+pub fn read_positions(frq: &[u8], prx: &[u8], info: &TermInfo, doc_id: usize) -> std::io::Result<Vec<u32>> {
     let mut fpos = info.freq_pointer as usize;
     let mut ppos = info.prox_pointer as usize;
     let mut prev = 0usize;
     for _ in 0..info.doc_freq {
-        let v = read_vint(frq, &mut fpos);
+        let v = read_vint(frq, &mut fpos)?;
         let doc_delta = (v >> 1) as usize;
-        let freq = if v & 1 == 1 { 1 } else { read_vint(frq, &mut fpos) as u32 };
+        let freq = if v & 1 == 1 { 1 } else { read_vint(frq, &mut fpos)? as u32 };
         let d = prev + doc_delta;
-        let mut positions = Vec::with_capacity(freq as usize);
+        let mut positions = Vec::with_capacity(checked_capacity(freq as usize, prx.len().saturating_sub(ppos)));
         let mut prev_pos = 0u32;
         for _ in 0..freq {
-            prev_pos += read_vint(prx, &mut ppos) as u32;
+            prev_pos += read_vint(prx, &mut ppos)? as u32;
             positions.push(prev_pos);
         }
         if d == doc_id {
-            return positions;
+            return Ok(positions);
         }
         prev = d;
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 /// Decodes ALL positions of a term in a single pass: doc -> positions.
 /// Avoids re-walking `.frq`/`.prx` from the pointer for each doc (which made phrase O(C·docFreq)).
-pub fn read_all_positions(frq: &[u8], prx: &[u8], info: &TermInfo) -> Vec<(usize, Vec<u32>)> {
+pub fn read_all_positions(frq: &[u8], prx: &[u8], info: &TermInfo) -> std::io::Result<Vec<(usize, Vec<u32>)>> {
     let mut fpos = info.freq_pointer as usize;
     let mut ppos = info.prox_pointer as usize;
     let mut prev = 0usize;
-    let mut out = Vec::with_capacity(info.doc_freq as usize);
+    let mut out = Vec::with_capacity(checked_capacity(info.doc_freq as usize, frq.len().saturating_sub(fpos)));
     for _ in 0..info.doc_freq {
-        let v = read_vint(frq, &mut fpos);
+        let v = read_vint(frq, &mut fpos)?;
         let doc_delta = (v >> 1) as usize;
-        let freq = if v & 1 == 1 { 1 } else { read_vint(frq, &mut fpos) as u32 };
+        let freq = if v & 1 == 1 { 1 } else { read_vint(frq, &mut fpos)? as u32 };
         let d = prev + doc_delta;
-        let mut positions = Vec::with_capacity(freq as usize);
+        let mut positions = Vec::with_capacity(checked_capacity(freq as usize, prx.len().saturating_sub(ppos)));
         let mut prev_pos = 0u32;
         for _ in 0..freq {
-            prev_pos += read_vint(prx, &mut ppos) as u32;
+            prev_pos += read_vint(prx, &mut ppos)? as u32;
             positions.push(prev_pos);
         }
         out.push((d, positions));
         prev = d;
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -89,11 +89,17 @@ mod tests {
     fn freqs_match_oracle_for_new() {
         let cf = cfs();
         let sub = |ext: &str| cf.sub(&cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap()).unwrap().to_vec();
-        let names: Vec<String> = read_field_infos(&sub(".fnm")).into_iter().map(|f| f.name).collect();
-        let dict = TermDict::read(&sub(".tis"), &names);
+        let names: Vec<String> = read_field_infos(&sub(".fnm")).unwrap().into_iter().map(|f| f.name).collect();
+        let dict = TermDict::read(&sub(".tis"), &names).unwrap();
         let info = dict.info("title", "new").unwrap();
-        let freqs = read_freqs(&sub(".frq"), info);
+        let freqs = read_freqs(&sub(".frq"), info).unwrap();
         // "new" is in all 4 docs (all "New workflow"), freq 1 each
         assert_eq!(freqs, vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn read_freqs_errors_on_truncated_frq() {
+        let info = TermInfo { doc_freq: 3, freq_pointer: 0, prox_pointer: 0 };
+        assert!(read_freqs(&[], &info).is_err());
     }
 }

@@ -72,22 +72,28 @@ pub fn merge_segments(
             map[local] = Some(next_id);
 
             // stored: copy in order, remapping field_num local -> merged.
-            let remapped: Vec<StoredField> = seg
-                .stored_raw(local)
-                .into_iter()
-                .map(|r| {
-                    assert!(
-                        !r.is_binary,
-                        "merge: binary stored field not supported (local field_num {}); the host application does not index binaries",
-                        r.field_num
-                    );
-                    StoredField {
-                        field_num: field_index[&local_fields[r.field_num].name],
-                        value: r.value,
-                        tokenized: r.tokenized,
-                    }
-                })
-                .collect();
+            let raw = seg.stored_raw(local)?;
+            let mut remapped: Vec<StoredField> = Vec::with_capacity(raw.len());
+            for r in raw {
+                if r.is_binary {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("merge: binary stored field not supported (local field_num {})", r.field_num),
+                    ));
+                }
+                let name = &local_fields
+                    .get(r.field_num)
+                    .ok_or_else(|| std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("merge: stored field_num {} out of range", r.field_num),
+                    ))?
+                    .name;
+                remapped.push(StoredField {
+                    field_num: field_index[name],
+                    value: r.value,
+                    tokenized: r.tokenized,
+                });
+            }
             stored.push(remapped);
 
             // norms: for each indexed merged field, copy the segment's raw byte (255 if the
@@ -113,10 +119,12 @@ pub fn merge_segments(
     // positions silently. Fail loudly (the host application always writes .prx for indexed fields).
     for seg in &segs {
         let has_indexed = seg.field_infos().iter().any(|fi| fi.is_indexed);
-        assert!(
-            !has_indexed || seg.has_prx(),
-            "merge: segment with indexed fields but no .prx — positions unavailable"
-        );
+        if has_indexed && !seg.has_prx() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "merge: segment with indexed fields but no .prx — positions unavailable",
+            ));
+        }
     }
     // (merged_field_num, text) -> (new_doc -> positions). BTreeMap => new doc-ids ascending.
     let mut term_map: HashMap<(usize, String), BTreeMap<usize, Vec<u32>>> = HashMap::new();
@@ -124,8 +132,10 @@ pub fn merge_segments(
         for (field_name, text) in seg.all_terms() {
             let mf = field_index[&field_name];
             // positions_all ALREADY filters deletes and yields (local -> positions) in one pass.
-            let entry = term_map.entry((mf, text.clone())).or_default();
-            for (local, positions) in seg.positions_all(&field_name, &text) {
+            // Use `text` before moving it into the map key => no clone per (segment, term).
+            let all = seg.positions_all(&field_name, &text);
+            let entry = term_map.entry((mf, text)).or_default();
+            for (local, positions) in all {
                 if let Some(new_id) = doc_maps[si][local] {
                     entry.insert(new_id, positions);
                 }

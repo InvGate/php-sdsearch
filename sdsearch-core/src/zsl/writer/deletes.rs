@@ -33,7 +33,7 @@ mod tests {
         del.insert(2);
         del.insert(60);
         let bytes = write_del_file(63, &del);
-        let read = DeletedDocs::read(&bytes);
+        let read = DeletedDocs::read(&bytes).unwrap();
         assert!(read.is_deleted(2));
         assert!(read.is_deleted(60));
         assert!(!read.is_deleted(0));

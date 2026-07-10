@@ -2,6 +2,7 @@
 
 use crate::index::{IndexReader, SegmentMeta};
 use crate::serialize::read_vint;
+use crate::zsl::bytes::checked_capacity;
 use fst::{IntoStreamer, Streamer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -47,6 +48,54 @@ impl Segment {
         self.fsts.get(field).and_then(|m| m.get(term.as_bytes()))
     }
 
+    /// Fallible core of `postings_for`; the trait method degrades an `Err`
+    /// (corrupt/truncated postings) to an empty result instead of panicking.
+    fn try_postings_for(&self, field: &str, term: &str) -> std::io::Result<Vec<(usize, u32)>> {
+        let Some(off) = self.offset_of(field, term) else {
+            return Ok(Vec::new());
+        };
+        let data = &self.postings[field];
+        let mut pos = off as usize;
+        let doc_freq = read_vint(data, &mut pos)? as usize;
+        let mut out = Vec::with_capacity(checked_capacity(doc_freq, data.len().saturating_sub(pos)));
+        let mut prev = 0usize;
+        for _ in 0..doc_freq {
+            let delta = read_vint(data, &mut pos)? as usize;
+            let freq = read_vint(data, &mut pos)? as u32;
+            for _ in 0..freq {
+                read_vint(data, &mut pos)?; // skip positions
+            }
+            let doc_id = prev + delta;
+            out.push((doc_id, freq));
+            prev = doc_id;
+        }
+        Ok(out)
+    }
+
+    /// Fallible core of `positions_for` (see `try_postings_for`).
+    fn try_positions_for(&self, field: &str, term: &str, doc_id: usize) -> std::io::Result<Vec<u32>> {
+        let Some(off) = self.offset_of(field, term) else {
+            return Ok(Vec::new());
+        };
+        let data = &self.postings[field];
+        let mut pos = off as usize;
+        let doc_freq = read_vint(data, &mut pos)? as usize;
+        let mut prev = 0usize;
+        for _ in 0..doc_freq {
+            let delta = read_vint(data, &mut pos)? as usize;
+            let freq = read_vint(data, &mut pos)? as usize;
+            let d = prev + delta;
+            let mut positions = Vec::with_capacity(checked_capacity(freq, data.len().saturating_sub(pos)));
+            for _ in 0..freq {
+                positions.push(read_vint(data, &mut pos)? as u32);
+            }
+            if d == doc_id {
+                return Ok(positions);
+            }
+            prev = d;
+        }
+        Ok(Vec::new())
+    }
 }
 
 impl IndexReader for Segment {
@@ -59,32 +108,16 @@ impl IndexReader for Segment {
             Some(off) => {
                 let data = &self.postings[field];
                 let mut pos = off as usize;
-                read_vint(data, &mut pos) as usize
+                // degrade: a corrupt docFreq varint reports 0 rather than panicking
+                read_vint(data, &mut pos).unwrap_or(0) as usize
             }
             None => 0,
         }
     }
 
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
-        let Some(off) = self.offset_of(field, term) else {
-            return Vec::new();
-        };
-        let data = &self.postings[field];
-        let mut pos = off as usize;
-        let doc_freq = read_vint(data, &mut pos) as usize;
-        let mut out = Vec::with_capacity(doc_freq);
-        let mut prev = 0usize;
-        for _ in 0..doc_freq {
-            let delta = read_vint(data, &mut pos) as usize;
-            let freq = read_vint(data, &mut pos) as u32;
-            for _ in 0..freq {
-                read_vint(data, &mut pos); // skip positions
-            }
-            let doc_id = prev + delta;
-            out.push((doc_id, freq));
-            prev = doc_id;
-        }
-        out
+        // degrade: corrupt postings yield no results rather than a panic across FFI
+        self.try_postings_for(field, term).unwrap_or_default()
     }
 
     fn field_len(&self, doc_id: usize, field: &str) -> u32 {
@@ -115,27 +148,8 @@ impl IndexReader for Segment {
 
     /// positions of `term` in `field` for `doc_id`, ascending order.
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
-        let Some(off) = self.offset_of(field, term) else {
-            return Vec::new();
-        };
-        let data = &self.postings[field];
-        let mut pos = off as usize;
-        let doc_freq = read_vint(data, &mut pos) as usize;
-        let mut prev = 0usize;
-        for _ in 0..doc_freq {
-            let delta = read_vint(data, &mut pos) as usize;
-            let freq = read_vint(data, &mut pos) as usize;
-            let d = prev + delta;
-            let mut positions = Vec::with_capacity(freq);
-            for _ in 0..freq {
-                positions.push(read_vint(data, &mut pos) as u32);
-            }
-            if d == doc_id {
-                return positions;
-            }
-            prev = d;
-        }
-        Vec::new()
+        // degrade: corrupt postings yield no positions rather than a panic across FFI
+        self.try_positions_for(field, term, doc_id).unwrap_or_default()
     }
 
     fn indexed_fields(&self) -> Vec<String> {

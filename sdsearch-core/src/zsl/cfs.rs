@@ -1,5 +1,5 @@
 //! Compound file reader (.cfs): a single file that packs several segment sub-files.
-use crate::zsl::bytes::{read_modified_utf8, read_u64_be, read_vint};
+use crate::zsl::bytes::{checked_capacity, read_modified_utf8, read_u64_be, read_vint};
 use memmap2::Mmap;
 use std::path::Path;
 
@@ -15,19 +15,26 @@ impl CompoundFile {
         let mmap = unsafe { Mmap::map(&file)? };
         let total = mmap.len();
         let mut pos = 0usize;
-        let count = read_vint(&mmap, &mut pos) as usize;
+        let count = read_vint(&mmap, &mut pos)? as usize;
         // read the (offset, name) entries in order
-        let mut raw: Vec<(u64, String)> = Vec::with_capacity(count);
+        let mut raw: Vec<(u64, String)> = Vec::with_capacity(checked_capacity(count, total));
         for _ in 0..count {
-            let offset = read_u64_be(&mmap, &mut pos);
-            let name = read_modified_utf8(&mmap, &mut pos);
+            let offset = read_u64_be(&mmap, &mut pos)?;
+            let name = read_modified_utf8(&mmap, &mut pos)?;
             raw.push((offset, name));
         }
-        // each sub-file runs from its offset to the next one's (or EOF)
-        let mut entries = Vec::with_capacity(count);
+        // each sub-file runs from its offset to the next one's (or EOF); validate the
+        // offsets so a corrupt .cfs surfaces as an error instead of an out-of-range slice.
+        let mut entries = Vec::with_capacity(checked_capacity(count, total));
         for i in 0..count {
             let start = raw[i].0 as usize;
             let end = if i + 1 < count { raw[i + 1].0 as usize } else { total };
+            if start > end || end > total {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("cfs sub-file offset out of range: start={start} end={end} total={total}"),
+                ));
+            }
             entries.push((raw[i].1.clone(), start, end));
         }
         Ok(CompoundFile { mmap, entries })

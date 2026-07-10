@@ -1,6 +1,6 @@
 //! Parser for ZSL's generation files (segments.gen + segments_N).
 
-use crate::zsl::bytes::{read_modified_utf8, read_u32_be, read_u64_be};
+use crate::zsl::bytes::{checked_capacity, read_byte, read_modified_utf8, read_u32_be, read_u64_be};
 use std::path::Path;
 
 /// minimal per-segment info taken from the generation file.
@@ -36,12 +36,12 @@ fn io_err(msg: &str) -> std::io::Error {
 fn read_generation(index_dir: &Path) -> std::io::Result<u64> {
     let data = std::fs::read(index_dir.join("segments.gen"))?;
     let mut pos = 0usize;
-    let format = read_u32_be(&data, &mut pos);
+    let format = read_u32_be(&data, &mut pos)?;
     if format != 0xFFFF_FFFE {
         return Err(io_err("wrong segments.gen format"));
     }
-    let gen1 = read_u64_be(&data, &mut pos);
-    let gen2 = read_u64_be(&data, &mut pos);
+    let gen1 = read_u64_be(&data, &mut pos)?;
+    let gen2 = read_u64_be(&data, &mut pos)?;
     if gen1 != gen2 {
         return Err(io_err("segments.gen mid-write (gen1 != gen2)"));
     }
@@ -59,41 +59,38 @@ pub fn read_segment_infos(index_dir: &Path) -> std::io::Result<Vec<SegmentInfo>>
     let data = std::fs::read(index_dir.join(&fname))?;
     let mut pos = 0usize;
 
-    let format = read_u32_be(&data, &mut pos);
+    let format = read_u32_be(&data, &mut pos)?;
     // 0xFFFFFFFC = FORMAT_2_3, 0xFFFFFFFD = FORMAT_2_1
     let is_2_3 = match format {
         0xFFFF_FFFC => true,
         0xFFFF_FFFD => false,
         _ => return Err(io_err("unsupported segments file format")),
     };
-    let _version = read_u64_be(&data, &mut pos); // version (long)
-    let _name_counter = read_u32_be(&data, &mut pos); // segment name counter
-    let seg_count = read_u32_be(&data, &mut pos) as usize;
+    let _version = read_u64_be(&data, &mut pos)?; // version (long)
+    let _name_counter = read_u32_be(&data, &mut pos)?; // segment name counter
+    let seg_count = read_u32_be(&data, &mut pos)? as usize;
 
-    let mut out = Vec::with_capacity(seg_count);
+    let mut out = Vec::with_capacity(checked_capacity(seg_count, data.len()));
     for _ in 0..seg_count {
-        let name = read_modified_utf8(&data, &mut pos);
-        let doc_count = read_u32_be(&data, &mut pos) as usize;
-        let del_gen = read_u64_be(&data, &mut pos) as i64;
+        let name = read_modified_utf8(&data, &mut pos)?;
+        let doc_count = read_u32_be(&data, &mut pos)? as usize;
+        let del_gen = read_u64_be(&data, &mut pos)? as i64;
 
         if is_2_3 {
-            let doc_store_offset = read_u32_be(&data, &mut pos);
+            let doc_store_offset = read_u32_be(&data, &mut pos)?;
             if doc_store_offset != 0xFFFF_FFFF {
-                let _doc_store_segment = read_modified_utf8(&data, &mut pos);
-                let _doc_store_is_compound = data[pos]; // readByte
-                pos += 1;
+                let _doc_store_segment = read_modified_utf8(&data, &mut pos)?;
+                let _doc_store_is_compound = read_byte(&data, &mut pos)?;
             }
         }
 
-        let _has_single_norm_file = data[pos]; // readByte
-        pos += 1;
-        let num_field = read_u32_be(&data, &mut pos);
+        let _has_single_norm_file = read_byte(&data, &mut pos)?;
+        let num_field = read_u32_be(&data, &mut pos)?;
         if num_field != 0xFFFF_FFFF {
             // separate norm files => unoptimized index; ZSL doesn't support it either.
             return Err(io_err("separate norm files unsupported (optimize index)"));
         }
-        let _is_compound_byte = data[pos]; // readByte (0xFF/0x00/0x01)
-        pos += 1;
+        let _is_compound_byte = read_byte(&data, &mut pos)?;
 
         out.push(SegmentInfo { name, doc_count, del_gen });
     }

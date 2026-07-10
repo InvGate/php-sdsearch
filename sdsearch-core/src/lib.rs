@@ -24,4 +24,16 @@ mod tests {
     fn version_is_not_empty() {
         assert!(!version().is_empty());
     }
+
+    /// The FFI boundary in sdsearch-php relies on `catch_unwind`, which only works
+    /// with `panic = "unwind"`. If a profile ever sets `panic = "abort"`, reader
+    /// panics become uncatchable process aborts. This documents/enforces the invariant.
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // intentional: a compile-config invariant guard
+    fn panic_is_unwind() {
+        assert!(
+            !cfg!(panic = "abort"),
+            "sdsearch requires panic = \"unwind\" so the FFI catch_unwind net works"
+        );
+    }
 }
