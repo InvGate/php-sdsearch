@@ -39,9 +39,18 @@ impl Segment {
         for field in &meta.fields {
             let bytes = std::fs::read(dir.join(format!("terms.{field}.fst")))?;
             fsts.insert(field.clone(), fst::Map::new(bytes).map_err(io)?);
-            postings.insert(field.clone(), std::fs::read(dir.join(format!("postings.{field}.bin")))?);
+            postings.insert(
+                field.clone(),
+                std::fs::read(dir.join(format!("postings.{field}.bin")))?,
+            );
         }
-        Ok(Segment { num_docs: meta.num_docs, fsts, postings, lengths, stored })
+        Ok(Segment {
+            num_docs: meta.num_docs,
+            fsts,
+            postings,
+            lengths,
+            stored,
+        })
     }
 
     fn offset_of(&self, field: &str, term: &str) -> Option<u64> {
@@ -57,7 +66,8 @@ impl Segment {
         let data = &self.postings[field];
         let mut pos = off as usize;
         let doc_freq = read_vint(data, &mut pos)? as usize;
-        let mut out = Vec::with_capacity(checked_capacity(doc_freq, data.len().saturating_sub(pos)));
+        let mut out =
+            Vec::with_capacity(checked_capacity(doc_freq, data.len().saturating_sub(pos)));
         let mut prev = 0usize;
         for _ in 0..doc_freq {
             let delta = read_vint(data, &mut pos)? as usize;
@@ -73,7 +83,12 @@ impl Segment {
     }
 
     /// Fallible core of `positions_for` (see `try_postings_for`).
-    fn try_positions_for(&self, field: &str, term: &str, doc_id: usize) -> std::io::Result<Vec<u32>> {
+    fn try_positions_for(
+        &self,
+        field: &str,
+        term: &str,
+        doc_id: usize,
+    ) -> std::io::Result<Vec<u32>> {
         let Some(off) = self.offset_of(field, term) else {
             return Ok(Vec::new());
         };
@@ -85,7 +100,8 @@ impl Segment {
             let delta = read_vint(data, &mut pos)? as usize;
             let freq = read_vint(data, &mut pos)? as usize;
             let d = prev + delta;
-            let mut positions = Vec::with_capacity(checked_capacity(freq, data.len().saturating_sub(pos)));
+            let mut positions =
+                Vec::with_capacity(checked_capacity(freq, data.len().saturating_sub(pos)));
             for _ in 0..freq {
                 positions.push(read_vint(data, &mut pos)? as u32);
             }
@@ -121,7 +137,11 @@ impl IndexReader for Segment {
     }
 
     fn field_len(&self, doc_id: usize, field: &str) -> u32 {
-        self.lengths.get(field).and_then(|v| v.get(doc_id)).copied().unwrap_or(0)
+        self.lengths
+            .get(field)
+            .and_then(|v| v.get(doc_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
@@ -149,7 +169,8 @@ impl IndexReader for Segment {
     /// positions of `term` in `field` for `doc_id`, ascending order.
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
         // degrade: corrupt postings yield no positions rather than a panic across FFI
-        self.try_positions_for(field, term, doc_id).unwrap_or_default()
+        self.try_positions_for(field, term, doc_id)
+            .unwrap_or_default()
     }
 
     fn indexed_fields(&self) -> Vec<String> {
@@ -240,7 +261,10 @@ mod tests {
 
         assert_eq!(seg.positions_for("body", "quick", 0), vec![0, 3]);
         assert_eq!(seg.positions_for("body", "brown", 0), vec![1]);
-        assert_eq!(seg.positions_for("body", "quick", 0), mem.positions_for("body", "quick", 0));
+        assert_eq!(
+            seg.positions_for("body", "quick", 0),
+            mem.positions_for("body", "quick", 0)
+        );
         // freq is still correct after skipping positions
         assert_eq!(seg.postings_for("body", "quick"), vec![(0, 2)]);
         std::fs::remove_dir_all(&dir).unwrap();

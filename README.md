@@ -1,6 +1,7 @@
 # sdsearch
 
-[![build](https://github.com/InvGate/php-sdsearch/actions/workflows/build.yml/badge.svg)](https://github.com/InvGate/php-sdsearch/actions/workflows/build.yml)
+[![CI](https://github.com/InvGate/php-sdsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/InvGate/php-sdsearch/actions/workflows/ci.yml)
+[![coverage](https://raw.githubusercontent.com/InvGate/php-sdsearch/main/docs/coverage.svg)](https://github.com/InvGate/php-sdsearch/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A native Rust engine that reads **and** writes the [Zend Search Lucene](https://framework.zend.com/manual/1.12/en/zend.search.lucene.html)
@@ -101,10 +102,14 @@ them as a shape-of-the-win indicator, not a guarantee.
 
 ## Continuous integration
 
-`.github/workflows/build.yml` builds and tests on both **Linux** and **Windows** on every
-push/PR: `cargo test -p sdsearch-core`, a release build of the PHP extension, and a smoke
-test that loads it into PHP and calls into it. No ZSL install is needed in CI — it only
-exercises the fixture-backed test suite and the extension build/load.
+The pipeline in `.github/workflows/ci.yml` runs on every push/PR:
+
+- **`test`** — `cargo test` (whole workspace) and `cargo clippy --all-targets -- -D warnings`.
+- **`lint`** — `cargo fmt --all --check` plus supply-chain checks: `cargo audit`, `cargo deny`, and `cargo machete`.
+- **`coverage`** — measures `sdsearch-core` coverage with `cargo-llvm-cov` and reports it via [octocov](https://github.com/k1LoW/octocov): a comment on each PR with the coverage delta vs `main`, plus the coverage badge above. It is informational and never blocks the pipeline.
+- **`build-linux` / `build-windows`** — release-build the PHP extension and run a smoke test that loads it into PHP, then upload the `.so`/`.dll` as build artifacts. These run only after `test` and `lint` pass.
+
+No ZSL install is needed in CI — it only exercises the fixture-backed test suite and the extension build/load.
 
 ## License
 

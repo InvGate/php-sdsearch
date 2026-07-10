@@ -64,22 +64,38 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         where_groups: dto
             .r#where
             .into_iter()
-            .map(|w| WhereGroup { field: w.field, values: w.values, occur: occur_from(&w.occur) })
+            .map(|w| WhereGroup {
+                field: w.field,
+                values: w.values,
+                occur: occur_from(&w.occur),
+            })
             .collect(),
         in_groups: dto
             .r#in
             .into_iter()
-            .map(|i| InGroup { field: i.field, values: i.values })
+            .map(|i| InGroup {
+                field: i.field,
+                values: i.values,
+            })
             .collect(),
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
     };
-    let hits = search_index(Path::new(index_dir), &params, dto.min_score, dto.limit as usize)
-        .map_err(|e| format!("sdsearch: {e}"))?;
+    let hits = search_index(
+        Path::new(index_dir),
+        &params,
+        dto.min_score,
+        dto.limit as usize,
+    )
+    .map_err(|e| format!("sdsearch: {e}"))?;
     let out: Vec<HitDto> = hits
         .into_iter()
-        .map(|h| HitDto { id: h.id as u64, score: h.score, fields: h.fields })
+        .map(|h| HitDto {
+            id: h.id as u64,
+            score: h.score,
+            fields: h.fields,
+        })
         .collect();
     serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
 }
@@ -180,7 +196,10 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
     let params = QueryParams {
         text: String::new(),
         where_groups: Vec::new(),
-        in_groups: vec![InGroup { field: id_field.to_string(), values: vec![value.to_string()] }],
+        in_groups: vec![InGroup {
+            field: id_field.to_string(),
+            values: vec![value.to_string()],
+        }],
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
@@ -196,7 +215,10 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
 /// remove (e.g. multi-language categories: one `id_key` with N docs, or `language_key:xx`
 /// with many). The ids are in the same space as `delete_document`.
 fn resolve_doc_ids(index: &ZslIndex, field: &str, value: &str) -> Vec<i64> {
-    let query = Query::Term { field: Some(field.to_string()), text: value.to_string() };
+    let query = Query::Term {
+        field: Some(field.to_string()),
+        text: value.to_string(),
+    };
     let hits = search(index, &query, 0.0, usize::MAX);
     hits.iter().map(|h| h.id as i64).collect()
 }
@@ -205,7 +227,10 @@ fn resolve_doc_ids(index: &ZslIndex, field: &str, value: &str) -> Vec<i64> {
 #[php(change_method_case = "none")]
 impl Writer {
     pub fn __construct() -> Self {
-        Writer { inner: None, reader: None }
+        Writer {
+            inner: None,
+            reader: None,
+        }
     }
 
     /// opens the streaming writer over an existing ZSL index (takes the write-lock) + a cached
@@ -252,7 +277,9 @@ impl Writer {
             }
             Ok(Ok(None)) => Ok(false),
             Ok(Err(msg)) => Err(PhpException::default(msg)),
-            Err(_) => Err(PhpException::default("sdsearch: panic in try_open".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in try_open".to_string(),
+            )),
         }
     }
 
@@ -264,11 +291,15 @@ impl Writer {
             .reader
             .as_ref()
             .ok_or_else(|| PhpException::default("sdsearch: writer not open".to_string()))?;
-        let result = catch_unwind(AssertUnwindSafe(|| resolve_doc_id(index, &id_field, &value)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            resolve_doc_id(index, &id_field, &value)
+        }));
         match result {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(msg)) => Err(PhpException::default(msg)),
-            Err(_) => Err(PhpException::default("sdsearch: panic in find_doc_id".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in find_doc_id".to_string(),
+            )),
         }
     }
 
@@ -285,7 +316,9 @@ impl Writer {
         let result = catch_unwind(AssertUnwindSafe(|| resolve_doc_ids(index, &field, &value)));
         match result {
             Ok(v) => Ok(v),
-            Err(_) => Err(PhpException::default("sdsearch: panic in find_doc_ids".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in find_doc_ids".to_string(),
+            )),
         }
     }
 
@@ -305,7 +338,9 @@ impl Writer {
         }));
         match result {
             Ok(()) => Ok(()),
-            Err(_) => Err(PhpException::default("sdsearch: panic in delete_document".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in delete_document".to_string(),
+            )),
         }
     }
 
@@ -317,12 +352,15 @@ impl Writer {
             .ok_or_else(|| PhpException::default("sdsearch: writer not open".to_string()))?;
         let result = catch_unwind(AssertUnwindSafe(|| {
             let doc = doc_from_json(&doc_json)?;
-            iw.add_document(doc).map_err(|e| format!("sdsearch: add: {e}"))
+            iw.add_document(doc)
+                .map_err(|e| format!("sdsearch: add: {e}"))
         }));
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(PhpException::default(msg)),
-            Err(_) => Err(PhpException::default("sdsearch: panic in add_document".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in add_document".to_string(),
+            )),
         }
     }
 
@@ -339,7 +377,9 @@ impl Writer {
         match result {
             Ok(Ok(report)) => Ok(report.doc_count as i64),
             Ok(Err(msg)) => Err(PhpException::default(msg)),
-            Err(_) => Err(PhpException::default("sdsearch: panic in commit".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in commit".to_string(),
+            )),
         }
     }
 
@@ -351,12 +391,15 @@ impl Writer {
             .ok_or_else(|| PhpException::default("sdsearch: writer not open".to_string()))?;
         self.reader = None;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            iw.optimize().map_err(|e| format!("sdsearch: optimize: {e}"))
+            iw.optimize()
+                .map_err(|e| format!("sdsearch: optimize: {e}"))
         }));
         match result {
             Ok(Ok(report)) => Ok(report.doc_count as i64),
             Ok(Err(msg)) => Err(PhpException::default(msg)),
-            Err(_) => Err(PhpException::default("sdsearch: panic in optimize".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in optimize".to_string(),
+            )),
         }
     }
 
@@ -369,7 +412,9 @@ impl Writer {
         let result = catch_unwind(AssertUnwindSafe(|| iw.document_count()));
         match result {
             Ok(count) => Ok(count as i64),
-            Err(_) => Err(PhpException::default("sdsearch: panic in document_count".to_string())),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic in document_count".to_string(),
+            )),
         }
     }
 }

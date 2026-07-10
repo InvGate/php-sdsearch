@@ -47,7 +47,7 @@ pub fn write_term_dict(terms: &[TermPostings]) -> DictFiles {
 
     // state of the previous term in the .tis (borrows term text from `terms`, no clone)
     let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
-    // state of the last sample in the .tii
+                                                          // state of the last sample in the .tii
     let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
     let mut last_index_position: u64 = 24;
 
@@ -176,12 +176,17 @@ mod tests {
         assert_eq!(read_freqs(&f.frq, body_new).unwrap(), vec![(0, 2)]);
 
         let title_wf = dict.info("title", "workflow").unwrap();
-        assert_eq!(read_all_positions(&f.frq, &f.prx, title_wf).unwrap(), vec![(0, vec![2]), (1, vec![1])]);
+        assert_eq!(
+            read_all_positions(&f.frq, &f.prx, title_wf).unwrap(),
+            vec![(0, vec![2]), (1, vec![1])]
+        );
     }
 
     #[test]
     fn tis_header_has_marker_and_backpatched_term_count() {
-        let docs = vec![WriterDoc { fields: vec![WriterField::text("t", "a b c")] }];
+        let docs = vec![WriterDoc {
+            fields: vec![WriterField::text("t", "a b c")],
+        }];
         let inv = invert(&docs, &WriterOpts::default());
         let f = write_term_dict(&inv.terms);
         assert_eq!(&f.tis[0..4], &[0xFF, 0xFF, 0xFF, 0xFD]); // marker
@@ -191,14 +196,18 @@ mod tests {
 
     #[test]
     fn tii_starts_with_synthetic_entry_and_count_one_for_small_batch() {
-        let docs = vec![WriterDoc { fields: vec![WriterField::text("t", "a b c")] }];
+        let docs = vec![WriterDoc {
+            fields: vec![WriterField::text("t", "a b c")],
+        }];
         let inv = invert(&docs, &WriterOpts::default());
         let f = write_term_dict(&inv.terms);
         // header 24 bytes; count == 1 (fewer than indexInterval terms)
         let mut pos = 4;
         assert_eq!(read_u64_be(&f.tii, &mut pos).unwrap(), 1);
         // synthetic entry: VInt(0) VInt(0) Int(0xFFFFFFFF) byte(0x0F) VInt0 VInt0 VInt0 VInt(24)
-        let expected = [0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00, 0x18];
+        let expected = [
+            0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00, 0x18,
+        ];
         assert_eq!(&f.tii[24..24 + expected.len()], &expected);
         assert_eq!(f.tii.len(), 24 + expected.len()); // only header + synthetic
     }
@@ -206,8 +215,13 @@ mod tests {
     #[test]
     fn tii_samples_every_index_interval_terms() {
         // 300 unique terms in one field -> count = (300 - 300%128)/128 + 1 = 3
-        let value: String = (0..300).map(|i| format!("w{i:04}")).collect::<Vec<_>>().join(" ");
-        let docs = vec![WriterDoc { fields: vec![WriterField::text("t", &value)] }];
+        let value: String = (0..300)
+            .map(|i| format!("w{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let docs = vec![WriterDoc {
+            fields: vec![WriterField::text("t", &value)],
+        }];
         let inv = invert(&docs, &WriterOpts::default());
         assert_eq!(inv.terms.len(), 300);
         let f = write_term_dict(&inv.terms);

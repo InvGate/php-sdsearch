@@ -33,15 +33,33 @@ mod tests {
     fn stored_roundtrips_through_reader_preserving_trailing_newline() {
         let stored = vec![
             vec![
-                StoredField { field_num: 0, value: "New workflow\n".into(), tokenized: true },
-                StoredField { field_num: 1, value: "42".into(), tokenized: false },
+                StoredField {
+                    field_num: 0,
+                    value: "New workflow\n".into(),
+                    tokenized: true,
+                },
+                StoredField {
+                    field_num: 1,
+                    value: "42".into(),
+                    tokenized: false,
+                },
             ],
-            vec![StoredField { field_num: 0, value: "other\n".into(), tokenized: true }],
+            vec![StoredField {
+                field_num: 0,
+                value: "other\n".into(),
+                tokenized: true,
+            }],
         ];
         let (fdt, fdx) = write_stored(&stored);
         let fields = vec![
-            FieldInfo { name: "title".into(), is_indexed: true },
-            FieldInfo { name: "id".into(), is_indexed: false },
+            FieldInfo {
+                name: "title".into(),
+                is_indexed: true,
+            },
+            FieldInfo {
+                name: "id".into(),
+                is_indexed: false,
+            },
         ];
 
         let d0 = read_stored_fields(&fdx, &fdt, &fields, 0).unwrap();
@@ -58,25 +76,55 @@ mod tests {
         use crate::zsl::stored::{read_stored_raw, StoredRaw};
         let stored = vec![
             vec![
-                StoredField { field_num: 0, value: "New workflow\n".into(), tokenized: true },
-                StoredField { field_num: 2, value: "42".into(), tokenized: false },
+                StoredField {
+                    field_num: 0,
+                    value: "New workflow\n".into(),
+                    tokenized: true,
+                },
+                StoredField {
+                    field_num: 2,
+                    value: "42".into(),
+                    tokenized: false,
+                },
             ],
-            vec![StoredField { field_num: 0, value: "other\n".into(), tokenized: true }],
+            vec![StoredField {
+                field_num: 0,
+                value: "other\n".into(),
+                tokenized: true,
+            }],
         ];
         let (fdt, fdx) = write_stored(&stored);
         // doc 0: preserves order, field_num and the tokenized flag
         assert_eq!(
             read_stored_raw(&fdx, &fdt, 0).unwrap(),
             vec![
-                StoredRaw { field_num: 0, value: "New workflow\n".into(), tokenized: true, is_binary: false },
-                StoredRaw { field_num: 2, value: "42".into(), tokenized: false, is_binary: false },
+                StoredRaw {
+                    field_num: 0,
+                    value: "New workflow\n".into(),
+                    tokenized: true,
+                    is_binary: false
+                },
+                StoredRaw {
+                    field_num: 2,
+                    value: "42".into(),
+                    tokenized: false,
+                    is_binary: false
+                },
             ]
         );
         // the host application does not index binaries: the round-trip must never report is_binary=true
-        assert!(read_stored_raw(&fdx, &fdt, 0).unwrap().iter().all(|r| !r.is_binary));
+        assert!(read_stored_raw(&fdx, &fdt, 0)
+            .unwrap()
+            .iter()
+            .all(|r| !r.is_binary));
         assert_eq!(
             read_stored_raw(&fdx, &fdt, 1).unwrap(),
-            vec![StoredRaw { field_num: 0, value: "other\n".into(), tokenized: true, is_binary: false }]
+            vec![StoredRaw {
+                field_num: 0,
+                value: "other\n".into(),
+                tokenized: true,
+                is_binary: false
+            }]
         );
         // out-of-range doc → empty
         assert!(read_stored_raw(&fdx, &fdt, 9).unwrap().is_empty());

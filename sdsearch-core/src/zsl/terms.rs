@@ -75,7 +75,11 @@ impl TermDict {
             let ft = by_field.entry(field).or_default();
             ft.offsets.push(ft.text.len() as u32);
             ft.text.extend_from_slice(text.as_bytes());
-            ft.infos.push(TermInfo { doc_freq, freq_pointer: freq_ptr, prox_pointer: prox_ptr });
+            ft.infos.push(TermInfo {
+                doc_freq,
+                freq_pointer: freq_ptr,
+                prox_pointer: prox_ptr,
+            });
 
             prev_text = text;
         }
@@ -141,7 +145,10 @@ impl TermDict {
         let mut out = Vec::new();
         for (field, ft) in &self.by_field {
             for i in 0..ft.len() {
-                out.push((field.clone(), String::from_utf8_lossy(ft.term(i)).into_owned()));
+                out.push((
+                    field.clone(),
+                    String::from_utf8_lossy(ft.term(i)).into_owned(),
+                ));
             }
         }
         out
@@ -156,16 +163,31 @@ mod tests {
     use std::path::PathBuf;
 
     fn dict() -> TermDict {
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index"));
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index"
+        ));
         let path = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
             .unwrap();
         let cf = CompoundFile::open(&path).unwrap();
-        let fnm = cf.names().into_iter().find(|n| n.ends_with(".fnm")).unwrap();
-        let tis = cf.names().into_iter().find(|n| n.ends_with(".tis")).unwrap();
-        let names: Vec<String> = read_field_infos(cf.sub(&fnm).unwrap()).unwrap().into_iter().map(|f| f.name).collect();
+        let fnm = cf
+            .names()
+            .into_iter()
+            .find(|n| n.ends_with(".fnm"))
+            .unwrap();
+        let tis = cf
+            .names()
+            .into_iter()
+            .find(|n| n.ends_with(".tis"))
+            .unwrap();
+        let names: Vec<String> = read_field_infos(cf.sub(&fnm).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
         TermDict::read(cf.sub(&tis).unwrap(), &names).unwrap()
     }
 
@@ -202,8 +224,14 @@ mod tests {
         got.sort();
         // the incidents fixture has 4 docs "New workflow" + fields id_key/users/etc.
         // minimal stable assertion: title:new and title:workflow are present.
-        assert!(got.contains(&("title".to_string(), "new".to_string())), "got={got:?}");
-        assert!(got.contains(&("title".to_string(), "workflow".to_string())), "got={got:?}");
+        assert!(
+            got.contains(&("title".to_string(), "new".to_string())),
+            "got={got:?}"
+        );
+        assert!(
+            got.contains(&("title".to_string(), "workflow".to_string())),
+            "got={got:?}"
+        );
         // total count = sum of terms per field (non-empty)
         assert!(!got.is_empty());
     }

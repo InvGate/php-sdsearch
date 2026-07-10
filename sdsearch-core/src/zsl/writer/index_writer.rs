@@ -20,16 +20,16 @@ use std::path::{Path, PathBuf};
 
 pub struct IndexWriter {
     dir: PathBuf,
-    _lock: WriteLock, // released on Drop
-    base: Generation, // snapshot of generation N at open()
+    _lock: WriteLock,      // released on Drop
+    base: Generation,      // snapshot of generation N at open()
     base_live_docs: usize, // live docs of generation N (Σ maxDoc − deleted)
     /// base generation's segment table: (name, maxDoc, delGen), in segments_N order.
     base_segments: Vec<(String, u32, i64)>,
     /// buffered deletions keyed by base segment name (ids LOCAL to the segment).
     pending_deletes: HashMap<String, BTreeSet<usize>>,
-    next_name_counter: u32, // starts at base.name_counter, ++ per flush
+    next_name_counter: u32,   // starts at base.name_counter, ++ per flush
     flushed: Vec<NewSegment>, // segments flushed in this session (not yet committed)
-    buffer: Vec<WriterDoc>, // in-RAM docs not yet flushed
+    buffer: Vec<WriterDoc>,   // in-RAM docs not yet flushed
     max_buffered_docs: usize,
     opts: WriterOpts,
 }
@@ -89,7 +89,10 @@ impl IndexWriter {
             let seg_len = *max_doc as usize;
             if global_doc_id < base + seg_len {
                 let local = global_doc_id - base;
-                self.pending_deletes.entry(name.clone()).or_default().insert(local);
+                self.pending_deletes
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(local);
                 return;
             }
             base += seg_len;
@@ -114,7 +117,10 @@ impl IndexWriter {
         }
         let seg_name = segments::segment_name(self.next_name_counter);
         let doc_count = write_segment_cfs(&self.dir, &seg_name, &self.buffer, &self.opts)?;
-        self.flushed.push(NewSegment { name: seg_name, doc_count: doc_count as u32 });
+        self.flushed.push(NewSegment {
+            name: seg_name,
+            doc_count: doc_count as u32,
+        });
         self.next_name_counter += 1;
         self.buffer.clear();
         Ok(())
@@ -142,14 +148,16 @@ impl IndexWriter {
             // not the session doc_count (which is 0 if nothing was added). The indexing feed uses
             // Writer::document_count(), but the field's contract must still be correct.
             let total: usize = infos.iter().map(|s| s.doc_count).sum();
-            return Ok(CommitReport { doc_count: total, ..commit_rep });
+            return Ok(CommitReport {
+                doc_count: total,
+                ..commit_rep
+            });
         }
 
         // 3) merge -> bytes of the merged .cfs. Name = next from name_counter.
         let gen = segments::read_generation(&self.dir)?;
         let merged_name = segments::segment_name(gen.name_counter);
-        let refs: Vec<(String, i64)> =
-            infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
         let result = merge::merge_segments(&self.dir, &merged_name, &refs)?;
         // (merge_segments dropped its mmaps on return => on Windows the old ones can be unlinked)
 
@@ -243,8 +251,15 @@ impl IndexWriter {
                 }
             }
 
-            let next_gen = if cur_del_gen == -1 { 1 } else { cur_del_gen + 1 };
-            let del_fname = format!("{seg_name}_{}.del", crate::zsl::segments::to_base36(next_gen as u64));
+            let next_gen = if cur_del_gen == -1 {
+                1
+            } else {
+                cur_del_gen + 1
+            };
+            let del_fname = format!(
+                "{seg_name}_{}.del",
+                crate::zsl::segments::to_base36(next_gen as u64)
+            );
             let del_bytes = write_del_file(max_doc, &merged);
             super::durability::write_atomic(&self.dir.join(&del_fname), &del_bytes)?;
             del_gen_overrides.insert(seg_name.clone(), next_gen);
@@ -259,7 +274,11 @@ impl IndexWriter {
             &flushed,
         )?;
 
-        Ok(CommitReport { generation, segments, doc_count })
+        Ok(CommitReport {
+            generation,
+            segments,
+            doc_count,
+        })
     }
 }
 
@@ -301,7 +320,9 @@ mod tests {
 
     /// doc with a unique term `zqxmark` in `title` (for doc_freq) + a per-index suffix.
     fn doc_mark(i: usize) -> WriterDoc {
-        WriterDoc { fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))] }
+        WriterDoc {
+            fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))],
+        }
     }
 
     #[test]
@@ -317,7 +338,10 @@ mod tests {
     #[test]
     fn document_count_tracks_base_plus_flushed_plus_buffer() {
         let dir = temp_kb_full();
-        let opts = WriterOpts { max_buffered_docs: 2, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(&dir, opts).unwrap();
         assert_eq!(w.document_count(), 20); // base KB live docs
 
@@ -342,14 +366,20 @@ mod tests {
         let before = ZslIndex::open(&dir).unwrap().num_docs();
         assert_eq!(before, 20);
 
-        let opts = WriterOpts { max_buffered_docs: 2, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(&dir, opts).unwrap();
         for i in 0..5 {
             w.add_document(doc_mark(i)).unwrap(); // cap 2 → flushes after 2 and 4; buffer=1
         }
         let rep = w.commit().unwrap(); // flush the remaining 1 → 3 segments: _3,_4,_5
         assert_eq!(rep.doc_count, 5);
-        assert_eq!(rep.segments, vec!["_3".to_string(), "_4".to_string(), "_5".to_string()]);
+        assert_eq!(
+            rep.segments,
+            vec!["_3".to_string(), "_4".to_string(), "_5".to_string()]
+        );
         assert_eq!(rep.generation, 7);
 
         // the native reader sees base + 5 docs, the term spread across the 3 segments
@@ -363,7 +393,10 @@ mod tests {
     #[test]
     fn drop_without_commit_untouched_generation_and_cleans_orphans() {
         let dir = temp_kb_full();
-        let opts = WriterOpts { max_buffered_docs: 1, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            ..WriterOpts::default()
+        };
         {
             let mut w = IndexWriter::open(&dir, opts).unwrap();
             w.add_document(doc_mark(0)).unwrap(); // cap 1 → immediate flush: _3.cfs
@@ -373,7 +406,7 @@ mod tests {
         assert!(!dir.join("_3.cfs").exists()); // orphan cleaned by Drop
         assert!(!dir.join("segments_7").exists()); // generation NOT flipped
         assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 20); // intact
-        // lock released → re-open OK
+                                                                  // lock released → re-open OK
         let _w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -429,7 +462,10 @@ mod tests {
         let dir = temp_kb_full();
 
         // step 1: build a multi-segment base: _2 (KB, 20 docs) + _3,_4 (4 new docs).
-        let opts = WriterOpts { max_buffered_docs: 2, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
         let mut w1 = IndexWriter::open(&dir, opts).unwrap();
         for i in 0..4 {
             w1.add_document(doc_mark(i)).unwrap(); // cap 2 → flush after 2 and after 4: _3, _4
@@ -469,7 +505,10 @@ mod tests {
         let dir = temp_kb_full();
 
         // multi-seg base + deletes
-        let opts = WriterOpts { max_buffered_docs: 2, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(&dir, opts).unwrap();
         for i in 0..4 {
             w.add_document(doc_mark(i)).unwrap();
@@ -524,7 +563,10 @@ mod tests {
         let w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
         // KB is 1 segment with no deletions → optimize is a no-op.
         let rep = w.optimize().unwrap();
-        assert_eq!(rep.doc_count, before, "optimize no-op must report the index total");
+        assert_eq!(
+            rep.doc_count, before,
+            "optimize no-op must report the index total"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

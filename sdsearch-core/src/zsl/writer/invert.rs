@@ -64,7 +64,10 @@ pub fn invert(docs: &[WriterDoc], _opts: &WriterOpts) -> Inverted {
         for field in &doc.fields {
             // field number = first-seen order (== ZSL's addField).
             let field_num = *field_index.entry(field.name.clone()).or_insert_with(|| {
-                fields.push(FieldMeta { name: field.name.clone(), indexed: false });
+                fields.push(FieldMeta {
+                    name: field.name.clone(),
+                    indexed: false,
+                });
                 fields.len() - 1
             });
             // NOTE (minor divergence vs ZSL, byte-diagnostic-only): ZSL clones a Text/Keyword
@@ -140,14 +143,22 @@ pub fn invert(docs: &[WriterDoc], _opts: &WriterOpts) -> Inverted {
         .enumerate()
         .map(|(fnum, meta)| {
             if meta.indexed {
-                (0..doc_count).map(|d| field_doc_numterms.get(&(fnum, d)).copied()).collect()
+                (0..doc_count)
+                    .map(|d| field_doc_numterms.get(&(fnum, d)).copied())
+                    .collect()
             } else {
                 Vec::new()
             }
         })
         .collect();
 
-    Inverted { fields, terms, norm_lengths, stored, doc_count }
+    Inverted {
+        fields,
+        terms,
+        norm_lengths,
+        stored,
+        doc_count,
+    }
 }
 
 #[cfg(test)]
@@ -199,10 +210,19 @@ mod tests {
         let body = 1;
 
         // term order by (fieldName·\0·text): body\0new < title\0done < title\0new < title\0workflow
-        let order: Vec<(usize, &str)> = inv.terms.iter().map(|t| (t.field_num, t.text.as_str())).collect();
+        let order: Vec<(usize, &str)> = inv
+            .terms
+            .iter()
+            .map(|t| (t.field_num, t.text.as_str()))
+            .collect();
         assert_eq!(
             order,
-            vec![(body, "new"), (title, "done"), (title, "new"), (title, "workflow")]
+            vec![
+                (body, "new"),
+                (title, "done"),
+                (title, "new"),
+                (title, "workflow")
+            ]
         );
 
         // 1-based positions within the field
@@ -269,8 +289,16 @@ mod tests {
         assert_eq!(
             inv.stored[0],
             vec![
-                StoredField { field_num: 0, value: "hi".into(), tokenized: true },
-                StoredField { field_num: 1, value: "999".into(), tokenized: false },
+                StoredField {
+                    field_num: 0,
+                    value: "hi".into(),
+                    tokenized: true
+                },
+                StoredField {
+                    field_num: 1,
+                    value: "999".into(),
+                    tokenized: false
+                },
             ]
         );
     }

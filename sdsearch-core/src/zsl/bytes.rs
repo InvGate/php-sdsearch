@@ -33,7 +33,10 @@ use std::io::{self, ErrorKind};
 /// Error for a read that runs off the end of the buffer.
 #[inline]
 pub fn truncated(pos: usize) -> io::Error {
-    io::Error::new(ErrorKind::UnexpectedEof, format!("truncated index data at offset {pos}"))
+    io::Error::new(
+        ErrorKind::UnexpectedEof,
+        format!("truncated index data at offset {pos}"),
+    )
 }
 
 /// Clamp a file-derived element count to what could physically fit in the
@@ -80,7 +83,10 @@ pub fn read_byte(data: &[u8], pos: &mut usize) -> io::Result<u8> {
 /// modified-UTF-8 = UTF-8 except NUL is encoded as C0 80.
 pub fn read_modified_utf8(data: &[u8], pos: &mut usize) -> io::Result<String> {
     let char_count = read_vint(data, pos)? as usize;
-    let mut s = String::with_capacity(checked_capacity(char_count, data.len().saturating_sub(*pos)));
+    let mut s = String::with_capacity(checked_capacity(
+        char_count,
+        data.len().saturating_sub(*pos),
+    ));
     for _ in 0..char_count {
         let b0 = read_byte(data, pos)?;
         if b0 & 0x80 == 0 {
@@ -93,7 +99,8 @@ pub fn read_modified_utf8(data: &[u8], pos: &mut usize) -> io::Result<String> {
             // 3-byte (BMP).
             let b1 = read_byte(data, pos)?;
             let b2 = read_byte(data, pos)?;
-            let cp = (((b0 & 0x0F) as u32) << 12) | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
+            let cp =
+                (((b0 & 0x0F) as u32) << 12) | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
             s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         } else {
             // 4-byte (supplementary plane). ZSL's PHP writer stores standard UTF-8 (not Java's
@@ -157,14 +164,27 @@ mod tests {
         // Java surrogates) → the reader must decode them as 1 code point (real documents with
         // emoji drifted without the 4-byte branch).
         for s in [
-            "", "hi", "über", "a€b", "na\u{0}me", "TICKET-12345", "user@example.com",
-            "a\u{1F600}b", "\u{20000}", "mix \u{1F4A9} end", "über\u{1F680}",
+            "",
+            "hi",
+            "über",
+            "a€b",
+            "na\u{0}me",
+            "TICKET-12345",
+            "user@example.com",
+            "a\u{1F600}b",
+            "\u{20000}",
+            "mix \u{1F4A9} end",
+            "über\u{1F680}",
         ] {
             let mut buf = Vec::new();
             write_modified_utf8(&mut buf, s);
             // the charCount prefix must be the number of code points
             let mut pos = 0;
-            assert_eq!(read_modified_utf8(&buf, &mut pos).unwrap(), s, "roundtrip {s:?}");
+            assert_eq!(
+                read_modified_utf8(&buf, &mut pos).unwrap(),
+                s,
+                "roundtrip {s:?}"
+            );
             assert_eq!(pos, buf.len(), "consumed all bytes of {s:?}");
         }
     }
@@ -172,10 +192,16 @@ mod tests {
     #[test]
     fn reads_big_endian_integers() {
         let mut pos = 0;
-        assert_eq!(read_u32_be(&[0x00, 0x00, 0x01, 0x00], &mut pos).unwrap(), 256);
+        assert_eq!(
+            read_u32_be(&[0x00, 0x00, 0x01, 0x00], &mut pos).unwrap(),
+            256
+        );
         assert_eq!(pos, 4);
         let mut pos = 0;
-        assert_eq!(read_i32_be(&[0xFF, 0xFF, 0xFF, 0xFD], &mut pos).unwrap(), -3);
+        assert_eq!(
+            read_i32_be(&[0xFF, 0xFF, 0xFF, 0xFD], &mut pos).unwrap(),
+            -3
+        );
         let mut pos = 0;
         assert_eq!(read_u64_be(&[0, 0, 0, 0, 0, 0, 0, 5], &mut pos).unwrap(), 5);
     }

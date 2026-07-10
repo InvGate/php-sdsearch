@@ -33,11 +33,11 @@ mod tests {
 
     #[test]
     fn keeps_email_and_url_as_one_token() {
-        assert_eq!(analyze("Mail user@example.com"), vec!["mail", "user@example.com"]);
         assert_eq!(
-            analyze("see https://a.b/c"),
-            vec!["see", "https://a.b/c"]
+            analyze("Mail user@example.com"),
+            vec!["mail", "user@example.com"]
         );
+        assert_eq!(analyze("see https://a.b/c"), vec!["see", "https://a.b/c"]);
     }
 
     #[test]

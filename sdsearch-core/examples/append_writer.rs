@@ -34,8 +34,12 @@ fn default_true() -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let index_dir = args.get(1).expect("usage: append_writer <index_dir> <docs.json>");
-    let docs_path = args.get(2).expect("usage: append_writer <index_dir> <docs.json>");
+    let index_dir = args
+        .get(1)
+        .expect("usage: append_writer <index_dir> <docs.json>");
+    let docs_path = args
+        .get(2)
+        .expect("usage: append_writer <index_dir> <docs.json>");
 
     let raw = std::fs::read_to_string(docs_path).expect("could not read docs.json");
     let spec: Spec = serde_json::from_str(&raw).expect("invalid docs.json");
@@ -54,7 +58,12 @@ fn main() {
                         "unindexed" => FieldKind::UnIndexed,
                         other => panic!("unknown kind: {other}"),
                     };
-                    WriterField { name: f.name, value: f.value, kind, stored: f.stored }
+                    WriterField {
+                        name: f.name,
+                        value: f.value,
+                        kind,
+                        stored: f.stored,
+                    }
                 })
                 .collect(),
         })

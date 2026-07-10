@@ -143,7 +143,10 @@ pub fn write_appended_generation(
     write_generation_with_new_segments(
         index_dir,
         gen,
-        &[NewSegment { name: new_segment_name.to_string(), doc_count: new_segment_doc_count }],
+        &[NewSegment {
+            name: new_segment_name.to_string(),
+            doc_count: new_segment_doc_count,
+        }],
     )
 }
 
@@ -154,7 +157,12 @@ pub fn write_generation_with_new_segments(
     gen: &Generation,
     new_segments: &[NewSegment],
 ) -> std::io::Result<u64> {
-    write_generation_with_delgens(index_dir, gen, &std::collections::HashMap::new(), new_segments)
+    write_generation_with_delgens(
+        index_dir,
+        gen,
+        &std::collections::HashMap::new(),
+        new_segments,
+    )
 }
 
 /// Writes the next generation: copies the existing records verbatim BUT patches in-place the
@@ -327,8 +335,14 @@ mod tests {
             &dir,
             &gen,
             &[
-                NewSegment { name: "_3".into(), doc_count: 3 },
-                NewSegment { name: "_4".into(), doc_count: 4 },
+                NewSegment {
+                    name: "_3".into(),
+                    doc_count: 3,
+                },
+                NewSegment {
+                    name: "_4".into(),
+                    doc_count: 4,
+                },
             ],
         )
         .unwrap();

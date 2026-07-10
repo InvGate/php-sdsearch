@@ -48,8 +48,7 @@ mod tests {
         let fnm = b"field-infos-bytes".to_vec();
         let tis = b"term-dict-bytes-longer".to_vec();
         let frq = vec![0u8, 1, 2, 3, 4];
-        let files: Vec<(&str, &[u8])> =
-            vec![(".fnm", &fnm), (".tis", &tis), (".frq", &frq)];
+        let files: Vec<(&str, &[u8])> = vec![(".fnm", &fnm), (".tis", &tis), (".frq", &frq)];
 
         let cfs = write_cfs("_7", &files);
 

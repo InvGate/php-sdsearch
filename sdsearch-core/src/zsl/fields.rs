@@ -14,7 +14,10 @@ pub fn read_field_infos(fnm: &[u8]) -> std::io::Result<Vec<FieldInfo>> {
     for _ in 0..count {
         let name = read_modified_utf8(fnm, &mut pos)?;
         let flags = read_byte(fnm, &mut pos)?;
-        out.push(FieldInfo { name, is_indexed: flags & 0x01 != 0 });
+        out.push(FieldInfo {
+            name,
+            is_indexed: flags & 0x01 != 0,
+        });
     }
     Ok(out)
 }
@@ -37,8 +40,14 @@ mod tests {
         assert_eq!(
             fields,
             vec![
-                FieldInfo { name: "title".into(), is_indexed: true },
-                FieldInfo { name: "id_attr".into(), is_indexed: false },
+                FieldInfo {
+                    name: "title".into(),
+                    is_indexed: true
+                },
+                FieldInfo {
+                    name: "id_attr".into(),
+                    is_indexed: false
+                },
             ]
         );
     }

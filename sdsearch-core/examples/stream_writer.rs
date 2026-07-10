@@ -69,14 +69,19 @@ fn main() {
 /// `stream_writer delete <index_dir> <gid1,gid2,...>`: opens the `IndexWriter`, marks each gid
 /// as deleted (`delete_document`) and commits. Prints `{"deleted":N,"generation":G}`.
 fn run_delete(args: &[String]) {
-    let index_dir = args.get(2).expect("usage: stream_writer delete <index_dir> <gid1,gid2,...>");
-    let gids_raw = args.get(3).expect("usage: stream_writer delete <index_dir> <gid1,gid2,...>");
+    let index_dir = args
+        .get(2)
+        .expect("usage: stream_writer delete <index_dir> <gid1,gid2,...>");
+    let gids_raw = args
+        .get(3)
+        .expect("usage: stream_writer delete <index_dir> <gid1,gid2,...>");
     let gids: Vec<usize> = gids_raw
         .split(',')
         .map(|s| s.trim().parse().expect("invalid gid (expected an integer)"))
         .collect();
 
-    let mut w = IndexWriter::open(Path::new(index_dir), WriterOpts::default()).expect("open failed");
+    let mut w =
+        IndexWriter::open(Path::new(index_dir), WriterOpts::default()).expect("open failed");
     for gid in &gids {
         w.delete_document(*gid);
     }
@@ -92,7 +97,9 @@ fn run_delete(args: &[String]) {
 /// `stream_writer optimize <index_dir>`: opens the IndexWriter and runs optimize() (merge
 /// everything into 1 compacted segment). Prints `{"optimized":true,"generation":G,"doc_count":D}`.
 fn run_optimize(args: &[String]) {
-    let index_dir = args.get(2).expect("usage: stream_writer optimize <index_dir>");
+    let index_dir = args
+        .get(2)
+        .expect("usage: stream_writer optimize <index_dir>");
     let w = IndexWriter::open(Path::new(index_dir), WriterOpts::default()).expect("open failed");
     let report = w.optimize().expect("optimize failed");
     println!(
@@ -106,7 +113,9 @@ fn run_optimize(args: &[String]) {
 /// LOCK_WOULDBLOCK and exits 3. Used by the inter-process test zsl_interprocess_lock.rs.
 fn run_hold_lock(args: &[String]) {
     use std::io::Write;
-    let index_dir = args.get(2).expect("usage: stream_writer hold-lock <index_dir> <hold_ms>");
+    let index_dir = args
+        .get(2)
+        .expect("usage: stream_writer hold-lock <index_dir> <hold_ms>");
     let hold_ms: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
     match IndexWriter::open(Path::new(index_dir), WriterOpts::default()) {
         Ok(w) => {
@@ -127,14 +136,21 @@ fn run_hold_lock(args: &[String]) {
 }
 
 fn run_stream(args: &[String]) {
-    let index_dir = args.get(1).expect("usage: stream_writer <index_dir> <docs.json> [cap]");
-    let docs_path = args.get(2).expect("usage: stream_writer <index_dir> <docs.json> [cap]");
+    let index_dir = args
+        .get(1)
+        .expect("usage: stream_writer <index_dir> <docs.json> [cap]");
+    let docs_path = args
+        .get(2)
+        .expect("usage: stream_writer <index_dir> <docs.json> [cap]");
     let cap: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
 
     let raw = std::fs::read_to_string(docs_path).expect("could not read docs.json");
     let spec: Spec = serde_json::from_str(&raw).expect("invalid docs.json");
 
-    let opts = WriterOpts { max_buffered_docs: cap, ..WriterOpts::default() };
+    let opts = WriterOpts {
+        max_buffered_docs: cap,
+        ..WriterOpts::default()
+    };
     let t0 = std::time::Instant::now();
     let mut w = IndexWriter::open(Path::new(index_dir), opts).expect("open failed");
     for d in spec.docs {
@@ -148,10 +164,16 @@ fn run_stream(args: &[String]) {
                     "unindexed" => FieldKind::UnIndexed,
                     other => panic!("unknown kind: {other}"),
                 };
-                WriterField { name: f.name, value: f.value, kind, stored: f.stored }
+                WriterField {
+                    name: f.name,
+                    value: f.value,
+                    kind,
+                    stored: f.stored,
+                }
             })
             .collect();
-        w.add_document(WriterDoc { fields }).expect("add_document failed");
+        w.add_document(WriterDoc { fields })
+            .expect("add_document failed");
     }
     let report = w.commit().expect("commit failed");
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;

@@ -23,15 +23,27 @@ mod tests {
     #[test]
     fn fnm_roundtrips_names_and_indexed_flag_through_reader() {
         let fields = vec![
-            FieldMeta { name: "title".into(), indexed: true },
-            FieldMeta { name: "id_attr".into(), indexed: false },
+            FieldMeta {
+                name: "title".into(),
+                indexed: true,
+            },
+            FieldMeta {
+                name: "id_attr".into(),
+                indexed: false,
+            },
         ];
         let fnm = write_fnm(&fields);
         assert_eq!(
             read_field_infos(&fnm).unwrap(),
             vec![
-                FieldInfo { name: "title".into(), is_indexed: true },
-                FieldInfo { name: "id_attr".into(), is_indexed: false },
+                FieldInfo {
+                    name: "title".into(),
+                    is_indexed: true
+                },
+                FieldInfo {
+                    name: "id_attr".into(),
+                    is_indexed: false
+                },
             ]
         );
     }

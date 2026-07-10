@@ -52,9 +52,16 @@ mod tests {
         let (fp, pp) = write_term_postings(&mut frq, &mut prx, &docs);
         assert_eq!((fp, pp), (0, 0));
 
-        let info = TermInfo { doc_freq: 2, freq_pointer: fp, prox_pointer: pp };
+        let info = TermInfo {
+            doc_freq: 2,
+            freq_pointer: fp,
+            prox_pointer: pp,
+        };
         assert_eq!(read_freqs(&frq, &info).unwrap(), vec![(0, 2), (2, 1)]);
-        assert_eq!(read_all_positions(&frq, &prx, &info).unwrap(), vec![(0, vec![1, 2]), (2, vec![1])]);
+        assert_eq!(
+            read_all_positions(&frq, &prx, &info).unwrap(),
+            vec![(0, vec![1, 2]), (2, vec![1])]
+        );
     }
 
     #[test]
@@ -66,10 +73,17 @@ mod tests {
         let (fp, pp) = write_term_postings(&mut frq, &mut prx, &[(1usize, vec![3u32, 7])]);
         assert!(fp > 0 && pp > 0);
 
-        let info = TermInfo { doc_freq: 1, freq_pointer: fp, prox_pointer: pp };
+        let info = TermInfo {
+            doc_freq: 1,
+            freq_pointer: fp,
+            prox_pointer: pp,
+        };
         assert_eq!(read_freqs(&frq, &info).unwrap(), vec![(1, 2)]);
         // 0-based position? no: we store them raw; deltas 3 then 4 -> 3,7
-        assert_eq!(read_all_positions(&frq, &prx, &info).unwrap(), vec![(1, vec![3, 7])]);
+        assert_eq!(
+            read_all_positions(&frq, &prx, &info).unwrap(),
+            vec![(1, vec![3, 7])]
+        );
     }
 
     #[test]
@@ -78,8 +92,15 @@ mod tests {
         let mut frq = Vec::new();
         let mut prx = Vec::new();
         let (fp, pp) = write_term_postings(&mut frq, &mut prx, &[(5usize, vec![0u32])]);
-        let info = TermInfo { doc_freq: 1, freq_pointer: fp, prox_pointer: pp };
+        let info = TermInfo {
+            doc_freq: 1,
+            freq_pointer: fp,
+            prox_pointer: pp,
+        };
         assert_eq!(read_freqs(&frq, &info).unwrap(), vec![(5, 1)]);
-        assert_eq!(read_all_positions(&frq, &prx, &info).unwrap(), vec![(5, vec![0])]);
+        assert_eq!(
+            read_all_positions(&frq, &prx, &info).unwrap(),
+            vec![(5, vec![0])]
+        );
     }
 }
