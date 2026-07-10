@@ -1,0 +1,170 @@
+name: release
+
+# Publishes the PHP 8.4 NTS extension binaries on a version tag (e.g. v0.1.0):
+#   - sdsearch-windows-x64-php84nts.dll   (Windows)
+#   - sdsearch-ubuntu-x64-php84nts.so     (glibc ~2.39: Ubuntu 22.04+/Debian recent)
+#   - sdsearch-el8-x64-php84nts.so        (glibc 2.28: RHEL/CentOS/Rocky/Alma 8 & 9)
+# The EL8 build links an older glibc, so it also loads on recent Ubuntu — it is the most
+# portable Linux binary; the ubuntu build is shipped as well for parity with CI.
+#
+# workflow_dispatch does a dry run: it builds + smoke-tests + uploads artifacts but does NOT
+# create a GitHub Release (only a tag push does).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build + smoke (Windows, nightly, PHP 8.4 NTS)
+    runs-on: windows-latest
+    # ext-php-rs needs nightly on Windows for abi_vectorcall (RUSTUP_TOOLCHAIN overrides the
+    # stable pin in rust-toolchain.toml).
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1"
+      - run: cargo build -p sdsearch-php --release
+      - name: Smoke test (extension loads + sdsearch_version)
+        run: php -d extension="${{ github.workspace }}\target\release\sdsearch.dll" tests\smoke.php
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\sdsearch.dll dist\sdsearch-windows-x64-php84nts.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdsearch-windows-x64-php84nts
+          path: dist/*
+          if-no-files-found: error
+
+  build-ubuntu:
+    name: Build + smoke (Ubuntu, PHP 8.4 NTS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: none
+          extensions: none
+      - name: Assert PHP build is NTS
+        run: php -v | grep -q 'NTS' || { echo "::error::expected an NTS PHP build, got:"; php -v; exit 1; }
+      - name: Install clang (ext-php-rs bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p sdsearch-php --release
+      - name: Smoke test (extension loads + sdsearch_version)
+        run: php -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/release/libsdsearch.so dist/sdsearch-ubuntu-x64-php84nts.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdsearch-ubuntu-x64-php84nts
+          path: dist/*
+          if-no-files-found: error
+
+  build-el8:
+    name: Build + smoke (EL8, glibc 2.28, PHP 8.4 NTS)
+    runs-on: ubuntu-latest
+    # Build inside a Rocky 8 container (glibc 2.28) so the .so loads on RHEL/CentOS/Rocky/Alma
+    # 8 and 9. PHP 8.4 NTS dev headers come from the Remi repo. Rocky 8's glibc 2.28 is new
+    # enough for GitHub's bundled node20 actions (which is why CentOS 7 / glibc 2.17 is not an
+    # option here).
+    container: rockylinux:8
+    # ext-php-rs's build script does not auto-detect PHP inside this container even though
+    # /usr/bin/php is on PATH; point it explicitly at the Remi PHP 8.4 binary + php-config.
+    env:
+      PHP: /usr/bin/php
+      PHP_CONFIG: /usr/bin/php-config
+    steps:
+      - name: Install PHP 8.4 NTS + build toolchain
+        run: |
+          set -euxo pipefail
+          dnf install -y epel-release
+          dnf install -y https://rpms.remirepo.net/enterprise/remi-release-8.rpm
+          dnf module reset -y php
+          dnf module enable -y php:remi-8.4
+          dnf install -y php-cli php-devel clang llvm-devel gcc make git tar
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Assert PHP is 8.4 NTS
+        run: |
+          php -v
+          php -v | grep -q 'NTS' || { echo "::error::expected an NTS PHP build"; exit 1; }
+          php -v | grep -q '8\.4\.' || { echo "::error::expected PHP 8.4"; exit 1; }
+      - run: cargo build -p sdsearch-php --release
+      - name: Smoke test (extension loads + sdsearch_version)
+        run: php -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/release/libsdsearch.so dist/sdsearch-el8-x64-php84nts.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdsearch-el8-x64-php84nts
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-ubuntu, build-el8]
+    # Only publish on a tag push; workflow_dispatch stops after the builds (dry run).
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # create the release
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert tag matches crate version
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' sdsearch-core/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "crate version: $VERSION, tag: $TAG"
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match crate version v$VERSION (bump sdsearch-core/Cargo.toml or fix the tag)"
+            exit 1
+          fi
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            PHP 8.4 NTS native extension binaries.
+
+            | File | Platform | glibc | Loads on |
+            |---|---|---|---|
+            | `sdsearch-windows-x64-php84nts.dll` | Windows x64 | — | Windows, PHP 8.4 NTS |
+            | `sdsearch-ubuntu-x64-php84nts.so` | Linux x64 | ~2.39 | Ubuntu 22.04+/Debian recent, PHP 8.4 NTS |
+            | `sdsearch-el8-x64-php84nts.so` | Linux x64 | 2.28 | RHEL/CentOS/Rocky/Alma 8 & 9 (+ recent Ubuntu), PHP 8.4 NTS |
