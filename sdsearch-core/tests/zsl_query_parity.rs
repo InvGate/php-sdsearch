@@ -23,7 +23,11 @@ fn expected() -> Expected {
 }
 
 fn seg() -> ZslSegment {
-    ZslSegment::open(&PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index"))).unwrap()
+    ZslSegment::open(&PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/zsl_index"
+    )))
+    .unwrap()
 }
 
 fn doc_set(hits: &[sdsearch_core::search::Hit]) -> Vec<usize> {

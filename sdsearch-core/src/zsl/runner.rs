@@ -37,7 +37,13 @@ fn fallback_query(text: &str) -> Option<Query> {
     let mut clauses: Vec<(Occur, Query)> = Vec::new();
     for tok in analyze(text) {
         if seen.insert(tok.clone()) {
-            clauses.push((Occur::Should, Query::Term { field: None, text: tok }));
+            clauses.push((
+                Occur::Should,
+                Query::Term {
+                    field: None,
+                    text: tok,
+                },
+            ));
         }
     }
     if clauses.is_empty() {
@@ -54,12 +60,19 @@ mod tests {
     use std::path::PathBuf;
 
     fn multiseg() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index_multiseg"))
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ))
     }
     fn params(text: &str) -> QueryParams {
         QueryParams {
-            text: text.into(), where_groups: vec![], in_groups: vec![],
-            fuzzy_similarity: 0.5, fuzzy_prefix_len: 3, wildcard_min_prefix: 0,
+            text: text.into(),
+            where_groups: vec![],
+            in_groups: vec![],
+            fuzzy_similarity: 0.5,
+            fuzzy_prefix_len: 3,
+            wildcard_min_prefix: 0,
         }
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {
@@ -80,7 +93,10 @@ mod tests {
         // text "vpn" (Must) + in cat=999 (Must, no doc) => empty primary;
         // the all-fields fallback "vpn" recovers [0,2].
         let mut p = params("vpn");
-        p.in_groups = vec![InGroup { field: "cat".into(), values: vec!["999".into()] }];
+        p.in_groups = vec![InGroup {
+            field: "cat".into(),
+            values: vec!["999".into()],
+        }];
         let hits = search_index(&multiseg(), &p, 0.0, 0).unwrap();
         assert_eq!(ids(&hits), vec![0, 2]);
     }

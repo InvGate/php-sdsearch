@@ -35,8 +35,12 @@ fn params(text: &str) -> QueryParams {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let dir = args.get(1).expect("usage: diff_read <index_dir> <queries.json>");
-    let qpath = args.get(2).expect("usage: diff_read <index_dir> <queries.json>");
+    let dir = args
+        .get(1)
+        .expect("usage: diff_read <index_dir> <queries.json>");
+    let qpath = args
+        .get(2)
+        .expect("usage: diff_read <index_dir> <queries.json>");
 
     let raw = std::fs::read_to_string(qpath).expect("could not read queries.json");
     let spec: QSpec = serde_json::from_str(&raw).expect("invalid queries.json");

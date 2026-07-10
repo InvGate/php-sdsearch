@@ -1,5 +1,7 @@
 //! Stored fields reader (.fdt indexed by .fdx).
-use crate::zsl::bytes::{checked_capacity, read_byte, read_modified_utf8, read_u64_be, read_vint, truncated};
+use crate::zsl::bytes::{
+    checked_capacity, read_byte, read_modified_utf8, read_u64_be, read_vint, truncated,
+};
 use crate::zsl::fields::FieldInfo;
 use std::collections::HashMap;
 
@@ -29,7 +31,10 @@ pub fn read_stored_raw(fdx: &[u8], fdt: &[u8], doc_id: usize) -> std::io::Result
     let fdt_off = read_u64_be(fdx, &mut p)? as usize;
     let mut pos = fdt_off;
     let stored_count = read_vint(fdt, &mut pos)? as usize;
-    out.reserve(checked_capacity(stored_count, fdt.len().saturating_sub(pos)));
+    out.reserve(checked_capacity(
+        stored_count,
+        fdt.len().saturating_sub(pos),
+    ));
     for _ in 0..stored_count {
         let field_num = read_vint(fdt, &mut pos)? as usize;
         let flags = read_byte(fdt, &mut pos)?;
@@ -44,7 +49,12 @@ pub fn read_stored_raw(fdx: &[u8], fdt: &[u8], doc_id: usize) -> std::io::Result
         } else {
             read_modified_utf8(fdt, &mut pos)?
         };
-        out.push(StoredRaw { field_num, value, tokenized, is_binary });
+        out.push(StoredRaw {
+            field_num,
+            value,
+            tokenized,
+            is_binary,
+        });
     }
     Ok(out)
 }
@@ -75,21 +85,39 @@ mod tests {
     use std::path::PathBuf;
 
     fn cfs() -> CompoundFile {
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index"));
-        let path = std::fs::read_dir(&dir).unwrap()
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index"
+        ));
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false)).unwrap();
+            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .unwrap();
         CompoundFile::open(&path).unwrap()
     }
 
     #[test]
     fn stored_fields_match_zsl_oracle_for_doc0() {
         let cf = cfs();
-        let fnm = cf.names().into_iter().find(|n| n.ends_with(".fnm")).unwrap();
-        let fdx = cf.names().into_iter().find(|n| n.ends_with(".fdx")).unwrap();
-        let fdt = cf.names().into_iter().find(|n| n.ends_with(".fdt")).unwrap();
+        let fnm = cf
+            .names()
+            .into_iter()
+            .find(|n| n.ends_with(".fnm"))
+            .unwrap();
+        let fdx = cf
+            .names()
+            .into_iter()
+            .find(|n| n.ends_with(".fdx"))
+            .unwrap();
+        let fdt = cf
+            .names()
+            .into_iter()
+            .find(|n| n.ends_with(".fdt"))
+            .unwrap();
         let fields = read_field_infos(cf.sub(&fnm).unwrap()).unwrap();
-        let stored = read_stored_fields(cf.sub(&fdx).unwrap(), cf.sub(&fdt).unwrap(), &fields, 0).unwrap();
+        let stored =
+            read_stored_fields(cf.sub(&fdx).unwrap(), cf.sub(&fdt).unwrap(), &fields, 0).unwrap();
         // FULL parity with what ZSL stored for doc 0 (read from the oracle).
         // tokenized Text fields (title, users) carry a trailing '\n' that compactText()
         // adds — it's a faithful part of the bytes, NOT trimmed.
@@ -98,12 +126,18 @@ mod tests {
 
     fn oracle_doc0_stored() -> std::collections::HashMap<String, String> {
         #[derive(serde::Deserialize)]
-        struct Oracle { docs: Vec<OracleDoc> }
+        struct Oracle {
+            docs: Vec<OracleDoc>,
+        }
         #[derive(serde::Deserialize)]
-        struct OracleDoc { stored: std::collections::HashMap<String, String> }
+        struct OracleDoc {
+            stored: std::collections::HashMap<String, String>,
+        }
         let raw = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_expected.json"
-        )).expect("oracle missing");
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_expected.json"
+        ))
+        .expect("oracle missing");
         let o: Oracle = serde_json::from_str(&raw).unwrap();
         o.docs.into_iter().next().unwrap().stored
     }

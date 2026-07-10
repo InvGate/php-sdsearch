@@ -50,13 +50,28 @@ pub struct WriterField {
 
 impl WriterField {
     pub fn text(name: &str, value: &str) -> Self {
-        Self { name: name.into(), value: value.into(), kind: FieldKind::Text, stored: true }
+        Self {
+            name: name.into(),
+            value: value.into(),
+            kind: FieldKind::Text,
+            stored: true,
+        }
     }
     pub fn keyword(name: &str, value: &str) -> Self {
-        Self { name: name.into(), value: value.into(), kind: FieldKind::Keyword, stored: true }
+        Self {
+            name: name.into(),
+            value: value.into(),
+            kind: FieldKind::Keyword,
+            stored: true,
+        }
     }
     pub fn unindexed(name: &str, value: &str) -> Self {
-        Self { name: name.into(), value: value.into(), kind: FieldKind::UnIndexed, stored: true }
+        Self {
+            name: name.into(),
+            value: value.into(),
+            kind: FieldKind::UnIndexed,
+            stored: true,
+        }
     }
 }
 
@@ -76,7 +91,10 @@ pub struct WriterOpts {
 
 impl Default for WriterOpts {
     fn default() -> Self {
-        Self { doc_boost: 1.0, max_buffered_docs: 1000 }
+        Self {
+            doc_boost: 1.0,
+            max_buffered_docs: 1000,
+        }
     }
 }
 
@@ -157,9 +175,14 @@ pub fn append_documents(
     let doc_count = write_segment_cfs(index_dir, &seg_name, docs, opts)?;
 
     // only once the .cfs is on disk do we flip the generation.
-    let new_gen = segments::write_appended_generation(index_dir, &gen, &seg_name, doc_count as u32)?;
+    let new_gen =
+        segments::write_appended_generation(index_dir, &gen, &seg_name, doc_count as u32)?;
 
-    Ok(AppendReport { segment_name: seg_name, doc_count, generation: new_gen })
+    Ok(AppendReport {
+        segment_name: seg_name,
+        doc_count,
+        generation: new_gen,
+    })
 }
 
 #[cfg(test)]
@@ -174,7 +197,8 @@ mod tests {
     /// copies the ENTIRE KB fixture (incl. `_2.cfs`) to a fresh temp dir.
     fn temp_kb_full() -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sdsearch_append_{}_{}", std::process::id(), n));
+        let dir =
+            std::env::temp_dir().join(format!("sdsearch_append_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         let src = std::path::PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),

@@ -1,6 +1,8 @@
 //! Parser for ZSL's generation files (segments.gen + segments_N).
 
-use crate::zsl::bytes::{checked_capacity, read_byte, read_modified_utf8, read_u32_be, read_u64_be};
+use crate::zsl::bytes::{
+    checked_capacity, read_byte, read_modified_utf8, read_u32_be, read_u64_be,
+};
 use std::path::Path;
 
 /// minimal per-segment info taken from the generation file.
@@ -92,7 +94,11 @@ pub fn read_segment_infos(index_dir: &Path) -> std::io::Result<Vec<SegmentInfo>>
         }
         let _is_compound_byte = read_byte(&data, &mut pos)?;
 
-        out.push(SegmentInfo { name, doc_count, del_gen });
+        out.push(SegmentInfo {
+            name,
+            doc_count,
+            del_gen,
+        });
     }
     Ok(out)
 }
@@ -103,7 +109,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn kb_dir() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index_kb"))
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ))
     }
 
     #[test]

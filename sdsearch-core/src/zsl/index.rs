@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 struct Entry {
-    base: usize,     // global doc id of the segment's first doc
-    max_doc: usize,  // size of the id space (incl. deletes)
+    base: usize,    // global doc id of the segment's first doc
+    max_doc: usize, // size of the id space (incl. deletes)
     seg: ZslSegment,
 }
 
@@ -33,7 +33,11 @@ impl ZslIndex {
         }
         let num_docs = entries.iter().map(|e| e.seg.num_docs()).sum();
         let total_docs = entries.iter().map(|e| e.max_doc).sum();
-        Ok(ZslIndex { entries, num_docs, total_docs })
+        Ok(ZslIndex {
+            entries,
+            num_docs,
+            total_docs,
+        })
     }
 
     /// (entry, local id) that owns the global id, or None if out of range.
@@ -55,7 +59,10 @@ impl IndexReader for ZslIndex {
     }
 
     fn doc_freq(&self, field: &str, term: &str) -> usize {
-        self.entries.iter().map(|e| e.seg.doc_freq(field, term)).sum()
+        self.entries
+            .iter()
+            .map(|e| e.seg.doc_freq(field, term))
+            .sum()
     }
 
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
@@ -124,7 +131,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn kb() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index_kb"))
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ))
     }
 
     #[test]
@@ -133,7 +143,10 @@ mod tests {
         let seg = ZslSegment::open(&kb()).unwrap();
         assert_eq!(idx.num_docs(), seg.num_docs());
         assert_eq!(idx.doc_freq("title", "vpn"), seg.doc_freq("title", "vpn"));
-        assert_eq!(idx.postings_for("title", "vpn"), seg.postings_for("title", "vpn"));
+        assert_eq!(
+            idx.postings_for("title", "vpn"),
+            seg.postings_for("title", "vpn")
+        );
         // stored routing: the same doc returns the same id_key
         let d0 = idx.postings_for("title", "vpn")[0].0;
         assert_eq!(idx.stored_fields(d0), seg.stored_fields(d0));

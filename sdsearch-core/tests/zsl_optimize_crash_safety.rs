@@ -26,7 +26,9 @@ fn temp_kb_full() -> std::path::PathBuf {
 }
 
 fn doc(i: usize) -> WriterDoc {
-    WriterDoc { fields: vec![WriterField::text("title", &format!("zqxc unique{i}"))] }
+    WriterDoc {
+        fields: vec![WriterField::text("title", &format!("zqxc unique{i}"))],
+    }
 }
 
 /// lowercase base36 (== ZSL) — replicated here because `to_base36` is internal to the crate.
@@ -49,7 +51,10 @@ fn interrupted_before_gen_flip_reader_keeps_old_generation() {
     let dir = temp_kb_full();
 
     // multi-seg base (gen advances via the commit)
-    let opts = WriterOpts { max_buffered_docs: 2, ..WriterOpts::default() };
+    let opts = WriterOpts {
+        max_buffered_docs: 2,
+        ..WriterOpts::default()
+    };
     let mut w = IndexWriter::open(&dir, opts).unwrap();
     for i in 0..4 {
         w.add_document(doc(i)).unwrap();

@@ -31,7 +31,9 @@ impl DeletedDocs {
             ));
         }
         let _bit_count = read_i32_be(del, &mut pos)?;
-        Ok(DeletedDocs { bits: del.get(pos..).unwrap_or(&[]).to_vec() })
+        Ok(DeletedDocs {
+            bits: del.get(pos..).unwrap_or(&[]).to_vec(),
+        })
     }
 
     pub fn none() -> DeletedDocs {

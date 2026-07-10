@@ -13,11 +13,16 @@ fn temp_kb() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("sdsearch_rdwr_{}_{}", std::process::id(), n));
     std::fs::create_dir_all(&dir).unwrap();
-    let src = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index_kb"));
+    let src = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/zsl_index_kb"
+    ));
     for f in std::fs::read_dir(&src).unwrap() {
         let f = f.unwrap().path();
         let name = f.file_name().unwrap().to_string_lossy();
-        if name.contains("lock") || name.ends_with(".sti") { continue; }
+        if name.contains("lock") || name.ends_with(".sti") {
+            continue;
+        }
         std::fs::copy(&f, dir.join(f.file_name().unwrap())).unwrap();
     }
     dir

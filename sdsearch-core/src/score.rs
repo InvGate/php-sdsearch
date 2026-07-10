@@ -31,7 +31,10 @@ pub fn score_term(
     doc_id: usize,
     term_freq: u32,
 ) -> f32 {
-    let idf = idf(index.total_docs() as f32, index.doc_freq(field, term) as f32);
+    let idf = idf(
+        index.total_docs() as f32,
+        index.doc_freq(field, term) as f32,
+    );
     score_with_idf(idf, term_freq, index.field_len(doc_id, field))
 }
 

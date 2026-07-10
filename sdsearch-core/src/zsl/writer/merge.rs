@@ -45,7 +45,10 @@ pub fn merge_segments(
     for seg in &segs {
         for fi in seg.field_infos() {
             let idx = *field_index.entry(fi.name.clone()).or_insert_with(|| {
-                fields.push(FieldMeta { name: fi.name.clone(), indexed: false });
+                fields.push(FieldMeta {
+                    name: fi.name.clone(),
+                    indexed: false,
+                });
                 fields.len() - 1
             });
             fields[idx].indexed |= fi.is_indexed;
@@ -78,15 +81,20 @@ pub fn merge_segments(
                 if r.is_binary {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("merge: binary stored field not supported (local field_num {})", r.field_num),
+                        format!(
+                            "merge: binary stored field not supported (local field_num {})",
+                            r.field_num
+                        ),
                     ));
                 }
                 let name = &local_fields
                     .get(r.field_num)
-                    .ok_or_else(|| std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("merge: stored field_num {} out of range", r.field_num),
-                    ))?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("merge: stored field_num {} out of range", r.field_num),
+                        )
+                    })?
                     .name;
                 remapped.push(StoredField {
                     field_num: field_index[name],
@@ -166,7 +174,10 @@ pub fn merge_segments(
     let dict = terms::write_term_dict(&merged_terms);
     let cfs_bytes = assemble_cfs(merged_name, &fnm_bytes, &fdt, &fdx, &nrm, &dict);
 
-    Ok(MergeResult { cfs_bytes, doc_count })
+    Ok(MergeResult {
+        cfs_bytes,
+        doc_count,
+    })
 }
 
 #[cfg(test)]
@@ -197,13 +208,16 @@ mod tests {
     }
 
     fn doc_mark(i: usize) -> WriterDoc {
-        WriterDoc { fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))] }
+        WriterDoc {
+            fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))],
+        }
     }
 
     /// writes the merged bytes as the ONLY segment in a new dir and opens it with the reader.
     fn read_merged(cfs_bytes: &[u8], doc_count: usize) -> ZslSegment {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let out = std::env::temp_dir().join(format!("sdsearch_merged_{}_{}", std::process::id(), n));
+        let out =
+            std::env::temp_dir().join(format!("sdsearch_merged_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("_m.cfs"), cfs_bytes).unwrap();
         let seg = ZslSegment::open_named(&out, "_m", -1).unwrap();
@@ -217,7 +231,10 @@ mod tests {
         let dir = temp_kb_full();
 
         // multi-segment base: KB _2 (20 docs) + _3,_4 (4 docs with unique term 'zqxmark')
-        let opts = WriterOpts { max_buffered_docs: 2, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(&dir, opts).unwrap();
         for i in 0..4 {
             w.add_document(doc_mark(i)).unwrap();
@@ -274,7 +291,10 @@ mod tests {
             std::env::temp_dir().join(format!("sdsearch_merge_bin_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let fields = vec![FieldMeta { name: "bin_field".to_string(), indexed: false }];
+        let fields = vec![FieldMeta {
+            name: "bin_field".to_string(),
+            indexed: false,
+        }];
         let fnm_bytes = fnm::write_fnm(&fields);
 
         // .fdt of a doc with one field: VInt(stored_count=1) + VInt(field_num=0) + flags(0x02)
@@ -323,7 +343,10 @@ mod tests {
             std::env::temp_dir().join(format!("sdsearch_merge_noprx_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let fields = vec![FieldMeta { name: "body".to_string(), indexed: true }];
+        let fields = vec![FieldMeta {
+            name: "body".to_string(),
+            indexed: true,
+        }];
         let fnm_bytes = fnm::write_fnm(&fields);
 
         // a doc with no stored fields: enough for `open_named` to compute max_doc == 1.
@@ -360,12 +383,19 @@ mod tests {
         let dir = temp_kb_full();
 
         // cap=1 → each add flushes its own segment: KB (_2) + 2 new ones (_3, _4).
-        let opts = WriterOpts { max_buffered_docs: 1, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(&dir, opts).unwrap();
-        w.add_document(WriterDoc { fields: vec![WriterField::text("title", "zqmerge alpha")] })
-            .unwrap();
-        w.add_document(WriterDoc { fields: vec![WriterField::text("title", "zqmerge beta")] })
-            .unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("title", "zqmerge alpha")],
+        })
+        .unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("title", "zqmerge beta")],
+        })
+        .unwrap();
         w.commit().unwrap();
 
         // + a delete on the base (gid 0, lives in _2): the merge must EXCLUDE that doc, not
@@ -375,7 +405,11 @@ mod tests {
         w2.commit().unwrap();
 
         let infos = read_segment_infos(&dir).unwrap();
-        assert!(infos.len() >= 3, "expected multi-segment (KB + 2 flushed), got {}", infos.len());
+        assert!(
+            infos.len() >= 3,
+            "expected multi-segment (KB + 2 flushed), got {}",
+            infos.len()
+        );
         let live = ZslIndex::open(&dir).unwrap().num_docs();
 
         // DIRECT merge of the primitive (not via `IndexWriter::optimize()`) over all the
@@ -384,7 +418,10 @@ mod tests {
         let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
         let merged_name = crate::zsl::writer::segments::segment_name(gen.name_counter);
         let merged = merge_segments(&dir, &merged_name, &refs).unwrap();
-        assert_eq!(merged.doc_count, live, "merge doc_count must equal the total live docs");
+        assert_eq!(
+            merged.doc_count, live,
+            "merge doc_count must equal the total live docs"
+        );
 
         // write the merged `.cfs` and flip the generation by hand (same steps 4-5 as
         // `optimize()`, but exercising `merge_segments` directly) to re-read with the full

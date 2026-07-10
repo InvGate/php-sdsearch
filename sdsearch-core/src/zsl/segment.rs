@@ -80,7 +80,11 @@ impl ZslSegment {
     }
 
     /// opens a named segment (`<seg_name>.cfs`) and its `.del` per `del_gen`.
-    pub fn open_named(index_dir: &Path, seg_name: &str, del_gen: i64) -> std::io::Result<ZslSegment> {
+    pub fn open_named(
+        index_dir: &Path,
+        seg_name: &str,
+        del_gen: i64,
+    ) -> std::io::Result<ZslSegment> {
         let cfs_path = index_dir.join(format!("{seg_name}.cfs"));
         let del_path = match del_gen {
             -1 => None,
@@ -110,8 +114,11 @@ impl ZslSegment {
         let fdx_name = name_ending(".fdx").ok_or_else(|| std::io::Error::other("no .fdx"))?;
         let num_docs_total = cfs.sub(&fdx_name).unwrap().len() / 8;
 
-        let indexed: Vec<String> =
-            fields.iter().filter(|f| f.is_indexed).map(|f| f.name.clone()).collect();
+        let indexed: Vec<String> = fields
+            .iter()
+            .filter(|f| f.is_indexed)
+            .map(|f| f.name.clone())
+            .collect();
         let norms = match name_ending(".nrm") {
             Some(n) => read_norms(cfs.sub(&n).unwrap(), &indexed, num_docs_total),
             None => HashMap::new(),
@@ -119,7 +126,10 @@ impl ZslSegment {
 
         // .del lives OUTSIDE the .cfs; we load it only if the file exists. A corrupt or
         // unsupported (sparse) .del surfaces as an error at open time rather than a crash.
-        let deletes = match del_path.filter(|p| p.exists()).and_then(|p| std::fs::read(p).ok()) {
+        let deletes = match del_path
+            .filter(|p| p.exists())
+            .and_then(|p| std::fs::read(p).ok())
+        {
             Some(b) => DeletedDocs::read(&b)?,
             None => DeletedDocs::none(),
         };
@@ -129,10 +139,21 @@ impl ZslSegment {
         let prx_name = name_ending(".prx").unwrap_or_default();
 
         let _ = index_dir; // the .del was already resolved above
-        let num_docs_live = (0..num_docs_total).filter(|&d| !deletes.is_deleted(d)).count();
+        let num_docs_live = (0..num_docs_total)
+            .filter(|&d| !deletes.is_deleted(d))
+            .count();
         Ok(ZslSegment {
-            num_docs_total, num_docs_live, fields, dict, norms, deletes, cfs,
-            fdx_name, fdt_name, frq_name, prx_name,
+            num_docs_total,
+            num_docs_live,
+            fields,
+            dict,
+            norms,
+            deletes,
+            cfs,
+            fdx_name,
+            fdt_name,
+            frq_name,
+            prx_name,
         })
     }
 }
@@ -148,7 +169,10 @@ impl IndexReader for ZslSegment {
     }
 
     fn doc_freq(&self, field: &str, term: &str) -> usize {
-        self.dict.info(field, term).map(|ti| ti.doc_freq as usize).unwrap_or(0)
+        self.dict
+            .info(field, term)
+            .map(|ti| ti.doc_freq as usize)
+            .unwrap_or(0)
     }
 
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
@@ -224,8 +248,12 @@ impl IndexReader for ZslSegment {
     }
 
     fn indexed_fields(&self) -> Vec<String> {
-        let mut v: Vec<String> =
-            self.fields.iter().filter(|f| f.is_indexed).map(|f| f.name.clone()).collect();
+        let mut v: Vec<String> = self
+            .fields
+            .iter()
+            .filter(|f| f.is_indexed)
+            .map(|f| f.name.clone())
+            .collect();
         v.sort();
         v
     }
@@ -237,7 +265,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn seg() -> ZslSegment {
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index"));
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index"
+        ));
         ZslSegment::open(&dir).unwrap()
     }
 
@@ -251,24 +282,36 @@ mod tests {
         let s = seg();
         // incidents index: "new" in title in all 4 docs, freq 1 each
         assert_eq!(s.doc_freq("title", "new"), 4);
-        assert_eq!(s.postings_for("title", "new"), vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
+        assert_eq!(
+            s.postings_for("title", "new"),
+            vec![(0, 1), (1, 1), (2, 1), (3, 1)]
+        );
     }
 
     #[test]
     fn stored_fields_round_trip() {
         let s = seg();
-        assert_eq!(s.stored_fields(0).get("id_key").map(String::as_str), Some("165"));
+        assert_eq!(
+            s.stored_fields(0).get("id_key").map(String::as_str),
+            Some("165")
+        );
     }
 
     #[test]
     fn open_named_matches_scanning_open() {
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index_kb"));
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
         // KB has a single segment "_2" with no deletes (del_gen -1)
         let named = ZslSegment::open_named(&dir, "_2", -1).unwrap();
         let scanned = ZslSegment::open(&dir).unwrap();
         assert_eq!(named.max_doc(), 20);
         assert_eq!(named.num_docs(), scanned.num_docs());
-        assert_eq!(named.postings_for("title", "vpn"), scanned.postings_for("title", "vpn"));
+        assert_eq!(
+            named.postings_for("title", "vpn"),
+            scanned.postings_for("title", "vpn")
+        );
     }
 
     #[test]
@@ -289,15 +332,20 @@ mod tests {
     #[test]
     fn merge_accessors_expose_fields_deletes_norms_terms_stored() {
         let s = seg(); // incidents fixture, 4 docs, no deletes
-        // field_infos: includes title (indexed)
-        assert!(s.field_infos().iter().any(|f| f.name == "title" && f.is_indexed));
+                       // field_infos: includes title (indexed)
+        assert!(s
+            .field_infos()
+            .iter()
+            .any(|f| f.name == "title" && f.is_indexed));
         // is_deleted: nothing deleted in the fixture
         assert!(!s.is_deleted(0));
         // norm_bytes: title has a 4-byte column (one per doc)
         assert_eq!(s.norm_bytes("title").map(|c| c.len()), Some(4));
         assert!(s.norm_bytes("campo_inexistente").is_none());
         // all_terms: title:new present
-        assert!(s.all_terms().contains(&("title".to_string(), "new".to_string())));
+        assert!(s
+            .all_terms()
+            .contains(&("title".to_string(), "new".to_string())));
         // stored_raw doc 0: contains id_key="165" (same value as stored_fields)
         let raw = s.stored_raw(0).unwrap();
         let names = s.field_infos();

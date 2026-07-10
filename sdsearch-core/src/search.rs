@@ -21,11 +21,19 @@ pub struct Hit {
 /// raw scores (doc_id, score) of a term in a field. No sort/filter/hydration.
 /// The idf is computed ONCE (constant over the posting list), not per doc.
 pub(crate) fn term_scores(index: &impl IndexReader, field: &str, term: &str) -> Vec<(usize, f32)> {
-    let idf = idf(index.total_docs() as f32, index.doc_freq(field, term) as f32);
+    let idf = idf(
+        index.total_docs() as f32,
+        index.doc_freq(field, term) as f32,
+    );
     index
         .postings_for(field, term)
         .into_iter()
-        .map(|(doc_id, tf)| (doc_id, score_with_idf(idf, tf, index.field_len(doc_id, field))))
+        .map(|(doc_id, tf)| {
+            (
+                doc_id,
+                score_with_idf(idf, tf, index.field_len(doc_id, field)),
+            )
+        })
         .collect()
 }
 
@@ -38,7 +46,10 @@ pub(crate) fn union_scores(
 ) -> HashMap<usize, f32> {
     let mut scored: HashMap<usize, f32> = HashMap::new();
     for term in terms {
-        let idf = idf(index.total_docs() as f32, index.doc_freq(field, term) as f32);
+        let idf = idf(
+            index.total_docs() as f32,
+            index.doc_freq(field, term) as f32,
+        );
         for (doc_id, tf) in index.postings_for(field, term) {
             *scored.entry(doc_id).or_insert(0.0) +=
                 score_with_idf(idf, tf, index.field_len(doc_id, field));
@@ -131,7 +142,9 @@ pub(crate) fn fuzzy_terms(
     const MAX_FUZZY_TERMS: usize = 1024;
     if matched.len() > MAX_FUZZY_TERMS {
         matched.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
         });
         matched.truncate(MAX_FUZZY_TERMS);
     }
@@ -170,8 +183,13 @@ pub(crate) fn phrase_scores(
     for doc in candidates {
         let first = per_term[0].0.get(&doc).unwrap_or(&empty);
         let is_match = first.iter().any(|&p| {
-            (1..terms.len())
-                .all(|i| per_term[i].0.get(&doc).unwrap_or(&empty).contains(&(p + i as u32)))
+            (1..terms.len()).all(|i| {
+                per_term[i]
+                    .0
+                    .get(&doc)
+                    .unwrap_or(&empty)
+                    .contains(&(p + i as u32))
+            })
         });
         if is_match {
             let s: f32 = (0..terms.len())
@@ -194,8 +212,10 @@ pub(crate) fn finalize(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    let mut ranked: Vec<(usize, f32)> =
-        scored.into_iter().filter(|(_, s)| *s >= min_score).collect();
+    let mut ranked: Vec<(usize, f32)> = scored
+        .into_iter()
+        .filter(|(_, s)| *s >= min_score)
+        .collect();
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -204,7 +224,11 @@ pub(crate) fn finalize(
     ranked.truncate(limit);
     ranked
         .into_iter()
-        .map(|(id, score)| Hit { id, score, fields: index.stored_fields(id) })
+        .map(|(id, score)| Hit {
+            id,
+            score,
+            fields: index.stored_fields(id),
+        })
         .collect()
 }
 
@@ -311,7 +335,10 @@ mod tests {
     #[test]
     fn returns_stored_fields() {
         let hits = term_query(&build(), "body", "foo", 0.0, 10);
-        assert_eq!(hits[0].fields.get("body").map(String::as_str), Some("foo foo baz"));
+        assert_eq!(
+            hits[0].fields.get("body").map(String::as_str),
+            Some("foo foo baz")
+        );
     }
 
     #[test]
@@ -331,7 +358,12 @@ mod tests {
 
     fn wildcard_corpus() -> MemoryIndex {
         let mut idx = MemoryIndex::new();
-        for text in ["testing guide", "tested feature", "text editor", "team meeting"] {
+        for text in [
+            "testing guide",
+            "tested feature",
+            "text editor",
+            "team meeting",
+        ] {
             let mut d = Document::new();
             d.add("body", text, FieldKind::Text);
             idx.add_document(d);

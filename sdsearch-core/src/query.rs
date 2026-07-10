@@ -2,7 +2,9 @@
 //! and build_query: a port of Zend Lucene's boolean query builder for the surface the host application uses.
 
 use crate::index::IndexReader;
-use crate::search::{finalize, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms, Hit};
+use crate::search::{
+    finalize, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms, Hit,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,11 +17,28 @@ pub enum Occur {
 #[derive(Debug, Clone)]
 pub enum Query {
     /// exact term; field None = all indexed fields (ZSL null-field rewrite).
-    Term { field: Option<String>, text: String },
-    Wildcard { field: Option<String>, pattern: String, min_prefix_len: usize },
-    Fuzzy { field: Option<String>, text: String, similarity: f32, prefix_len: usize },
-    Phrase { field: String, terms: Vec<String> },
-    Boolean { clauses: Vec<(Occur, Query)> },
+    Term {
+        field: Option<String>,
+        text: String,
+    },
+    Wildcard {
+        field: Option<String>,
+        pattern: String,
+        min_prefix_len: usize,
+    },
+    Fuzzy {
+        field: Option<String>,
+        text: String,
+        similarity: f32,
+        prefix_len: usize,
+    },
+    Phrase {
+        field: String,
+        terms: Vec<String>,
+    },
+    Boolean {
+        clauses: Vec<(Occur, Query)>,
+    },
 }
 
 /// target fields of a leaf: the given one, or all indexed fields if None.
@@ -42,7 +61,11 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
             }
             acc
         }
-        Query::Wildcard { field, pattern, min_prefix_len } => {
+        Query::Wildcard {
+            field,
+            pattern,
+            min_prefix_len,
+        } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
@@ -53,7 +76,12 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
             }
             acc
         }
-        Query::Fuzzy { field, text, similarity, prefix_len } => {
+        Query::Fuzzy {
+            field,
+            text,
+            similarity,
+            prefix_len,
+        } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
@@ -75,12 +103,21 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
 /// Lucene-style boolean semantics: must (intersection, required), should (sum/coord),
 /// must-not (exclusion); if there is no must, at least one should must match.
 fn eval_boolean(index: &impl IndexReader, clauses: &[(Occur, Query)]) -> HashMap<usize, f32> {
-    let musts: Vec<HashMap<usize, f32>> =
-        clauses.iter().filter(|(o, _)| *o == Occur::Must).map(|(_, q)| eval(index, q)).collect();
-    let shoulds: Vec<HashMap<usize, f32>> =
-        clauses.iter().filter(|(o, _)| *o == Occur::Should).map(|(_, q)| eval(index, q)).collect();
-    let mustnots: Vec<HashMap<usize, f32>> =
-        clauses.iter().filter(|(o, _)| *o == Occur::MustNot).map(|(_, q)| eval(index, q)).collect();
+    let musts: Vec<HashMap<usize, f32>> = clauses
+        .iter()
+        .filter(|(o, _)| *o == Occur::Must)
+        .map(|(_, q)| eval(index, q))
+        .collect();
+    let shoulds: Vec<HashMap<usize, f32>> = clauses
+        .iter()
+        .filter(|(o, _)| *o == Occur::Should)
+        .map(|(_, q)| eval(index, q))
+        .collect();
+    let mustnots: Vec<HashMap<usize, f32>> = clauses
+        .iter()
+        .filter(|(o, _)| *o == Occur::MustNot)
+        .map(|(_, q)| eval(index, q))
+        .collect();
 
     // accumulated score and matched (should+must) clauses per doc, for the coord.
     let mut score: HashMap<usize, f32> = HashMap::new();
@@ -128,7 +165,12 @@ fn eval_boolean(index: &impl IndexReader, clauses: &[(Occur, Query)]) -> HashMap
     let total = (musts.len() + shoulds.len()).max(1) as f32;
     score
         .into_iter()
-        .map(|(d, s)| (d, s * (matched.get(&d).copied().unwrap_or(0) as f32 / total)))
+        .map(|(d, s)| {
+            (
+                d,
+                s * (matched.get(&d).copied().unwrap_or(0) as f32 / total),
+            )
+        })
         .collect()
 }
 
@@ -202,36 +244,64 @@ impl std::error::Error for QueryError {}
 fn text_subquery(p: &QueryParams) -> Query {
     let lc = p.text.to_lowercase();
     // escaping mirrors the host's query builder: str_replace ':', ',', '-' -> '\:', '\,', '\-'.
-    let esc = lc.replace(':', "\\:").replace(',', "\\,").replace('-', "\\-");
+    let esc = lc
+        .replace(':', "\\:")
+        .replace(',', "\\,")
+        .replace('-', "\\-");
     let esc_words: Vec<&str> = esc.split_whitespace().collect();
     let mut clauses: Vec<(Occur, Query)> = Vec::new();
 
     if esc_words.len() > 1 {
         for w in &esc_words {
-            clauses.push((Occur::Should, Query::Fuzzy {
-                field: None, text: (*w).to_string(),
-                similarity: p.fuzzy_similarity, prefix_len: p.fuzzy_prefix_len,
-            }));
+            clauses.push((
+                Occur::Should,
+                Query::Fuzzy {
+                    field: None,
+                    text: (*w).to_string(),
+                    similarity: p.fuzzy_similarity,
+                    prefix_len: p.fuzzy_prefix_len,
+                },
+            ));
         }
     }
-    clauses.push((Occur::Should, Query::Fuzzy {
-        field: None, text: esc.clone(),
-        similarity: p.fuzzy_similarity, prefix_len: p.fuzzy_prefix_len,
-    }));
-    clauses.push((Occur::Should, Query::Wildcard {
-        field: None, pattern: format!("{esc}*"), min_prefix_len: p.wildcard_min_prefix,
-    }));
+    clauses.push((
+        Occur::Should,
+        Query::Fuzzy {
+            field: None,
+            text: esc.clone(),
+            similarity: p.fuzzy_similarity,
+            prefix_len: p.fuzzy_prefix_len,
+        },
+    ));
+    clauses.push((
+        Occur::Should,
+        Query::Wildcard {
+            field: None,
+            pattern: format!("{esc}*"),
+            min_prefix_len: p.wildcard_min_prefix,
+        },
+    ));
     // QueryParser::parse(RAW text): the analyzer tokenizes the original text ->
     // one all-fields term (default-OR) per token.
     for tok in crate::analysis::analyze(&p.text) {
-        clauses.push((Occur::Should, Query::Term { field: None, text: tok }));
+        clauses.push((
+            Occur::Should,
+            Query::Term {
+                field: None,
+                text: tok,
+            },
+        ));
     }
     Query::Boolean { clauses }
 }
 
 /// key-field name (for IN): appends "_key" only if the field does not already contain it.
 fn key_field_in(field: &str) -> String {
-    if field.contains("_key") { field.to_string() } else { format!("{field}_key") }
+    if field.contains("_key") {
+        field.to_string()
+    } else {
+        format!("{field}_key")
+    }
 }
 
 /// builds the boolean Query equivalent to Zend Lucene's boolean query builder for the supported surface.
@@ -256,7 +326,15 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
         let clauses: Vec<(Occur, Query)> = wg
             .values
             .iter()
-            .map(|v| (Occur::Should, Query::Term { field: Some(field.clone()), text: v.clone() }))
+            .map(|v| {
+                (
+                    Occur::Should,
+                    Query::Term {
+                        field: Some(field.clone()),
+                        text: v.clone(),
+                    },
+                )
+            })
             .collect();
         top.push((wg.occur, Query::Boolean { clauses }));
     }
@@ -274,11 +352,22 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
         // IN: conditional key-field naming (appends "_key" only when missing).
         let field = key_field_in(&ig.field);
         for v in &ig.values {
-            in_clauses.push((Occur::Should, Query::Term { field: Some(field.clone()), text: v.clone() }));
+            in_clauses.push((
+                Occur::Should,
+                Query::Term {
+                    field: Some(field.clone()),
+                    text: v.clone(),
+                },
+            ));
         }
     }
     if !in_clauses.is_empty() {
-        top.push((Occur::Must, Query::Boolean { clauses: in_clauses }));
+        top.push((
+            Occur::Must,
+            Query::Boolean {
+                clauses: in_clauses,
+            },
+        ));
     }
 
     Ok(Query::Boolean { clauses: top })
@@ -294,7 +383,11 @@ mod tests {
         // doc0 title="vpn guide" lang="es"; doc1 title="vpn setup" lang="en";
         // doc2 title="mysql notes" lang="es"
         let mut idx = MemoryIndex::new();
-        let rows = [("vpn guide", "es"), ("vpn setup", "en"), ("mysql notes", "es")];
+        let rows = [
+            ("vpn guide", "es"),
+            ("vpn setup", "en"),
+            ("mysql notes", "es"),
+        ];
         for (title, lang) in rows {
             let mut d = Document::new();
             d.add("title", title, FieldKind::Text);
@@ -315,7 +408,9 @@ mod tests {
             Query::Term { field: Some(f), .. }
             | Query::Wildcard { field: Some(f), .. }
             | Query::Fuzzy { field: Some(f), .. } => f == field,
-            Query::Boolean { clauses } => clauses.iter().any(|(_, c)| query_mentions_field(c, field)),
+            Query::Boolean { clauses } => {
+                clauses.iter().any(|(_, c)| query_mentions_field(c, field))
+            }
             _ => false,
         }
     }
@@ -323,36 +418,81 @@ mod tests {
     #[test]
     fn must_requires_all_clauses() {
         // vpn AND lang=es => only doc0
-        let q = Query::Boolean { clauses: vec![
-            (Occur::Must, Query::Term { field: Some("title".into()), text: "vpn".into() }),
-            (Occur::Must, Query::Term { field: Some("lang_key".into()), text: "es".into() }),
-        ]};
+        let q = Query::Boolean {
+            clauses: vec![
+                (
+                    Occur::Must,
+                    Query::Term {
+                        field: Some("title".into()),
+                        text: "vpn".into(),
+                    },
+                ),
+                (
+                    Occur::Must,
+                    Query::Term {
+                        field: Some("lang_key".into()),
+                        text: "es".into(),
+                    },
+                ),
+            ],
+        };
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0]);
     }
 
     #[test]
     fn should_unions_when_no_must() {
-        let q = Query::Boolean { clauses: vec![
-            (Occur::Should, Query::Term { field: Some("title".into()), text: "vpn".into() }),
-            (Occur::Should, Query::Term { field: Some("title".into()), text: "mysql".into() }),
-        ]};
+        let q = Query::Boolean {
+            clauses: vec![
+                (
+                    Occur::Should,
+                    Query::Term {
+                        field: Some("title".into()),
+                        text: "vpn".into(),
+                    },
+                ),
+                (
+                    Occur::Should,
+                    Query::Term {
+                        field: Some("title".into()),
+                        text: "mysql".into(),
+                    },
+                ),
+            ],
+        };
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0, 1, 2]);
     }
 
     #[test]
     fn mustnot_excludes() {
         // vpn AND NOT lang=en => doc0 (doc1 excluded)
-        let q = Query::Boolean { clauses: vec![
-            (Occur::Must, Query::Term { field: Some("title".into()), text: "vpn".into() }),
-            (Occur::MustNot, Query::Term { field: Some("lang_key".into()), text: "en".into() }),
-        ]};
+        let q = Query::Boolean {
+            clauses: vec![
+                (
+                    Occur::Must,
+                    Query::Term {
+                        field: Some("title".into()),
+                        text: "vpn".into(),
+                    },
+                ),
+                (
+                    Occur::MustNot,
+                    Query::Term {
+                        field: Some("lang_key".into()),
+                        text: "en".into(),
+                    },
+                ),
+            ],
+        };
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0]);
     }
 
     #[test]
     fn all_fields_term_searches_every_indexed_field() {
         // field None => searches "es" in all indexed fields; matches lang_key of doc0 and doc2
-        let q = Query::Term { field: None, text: "es".into() };
+        let q = Query::Term {
+            field: None,
+            text: "es".into(),
+        };
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0, 2]);
     }
 
@@ -379,7 +519,11 @@ mod tests {
         // a where group with occur=Should is OPTIONAL: it boosts but does NOT filter.
         // build_query suffixes the raw field "lang" -> term over "lang_key".
         let mut p = params("vpn");
-        p.where_groups = vec![WhereGroup { field: "lang".into(), values: vec!["es".into()], occur: Occur::Should }];
+        p.where_groups = vec![WhereGroup {
+            field: "lang".into(),
+            values: vec!["es".into()],
+            occur: Occur::Should,
+        }];
         let q = build_query(&p).unwrap();
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0, 1]);
     }
@@ -388,7 +532,11 @@ mod tests {
     fn build_query_where_must_narrows() {
         // occur=Must does filter (intersection): vpn AND lang=es => {0}.
         let mut p = params("vpn");
-        p.where_groups = vec![WhereGroup { field: "lang".into(), values: vec!["es".into()], occur: Occur::Must }];
+        p.where_groups = vec![WhereGroup {
+            field: "lang".into(),
+            values: vec!["es".into()],
+            occur: Occur::Must,
+        }];
         let q = build_query(&p).unwrap();
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0]);
     }
@@ -396,7 +544,11 @@ mod tests {
     #[test]
     fn build_query_where_mustnot() {
         let mut p = params("vpn");
-        p.where_groups = vec![WhereGroup { field: "lang".into(), values: vec!["en".into()], occur: Occur::MustNot }];
+        p.where_groups = vec![WhereGroup {
+            field: "lang".into(),
+            values: vec!["en".into()],
+            occur: Occur::MustNot,
+        }];
         let q = build_query(&p).unwrap();
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0]);
     }
@@ -409,7 +561,11 @@ mod tests {
     #[test]
     fn build_query_empty_field_is_error() {
         let mut p = params("vpn");
-        p.where_groups = vec![WhereGroup { field: "".into(), values: vec!["x".into()], occur: Occur::Should }];
+        p.where_groups = vec![WhereGroup {
+            field: "".into(),
+            values: vec!["x".into()],
+            occur: Occur::Should,
+        }];
         assert!(matches!(build_query(&p), Err(QueryError::EmptyField)));
     }
 
@@ -417,10 +573,17 @@ mod tests {
     fn build_query_where_suffixes_key_unconditionally() {
         // WHERE always appends "_key" (parity with the host's WHERE-clause builder): "status" -> "status_key".
         let mut p = params("x");
-        p.where_groups = vec![WhereGroup { field: "status".into(), values: vec!["1".into()], occur: Occur::Must }];
+        p.where_groups = vec![WhereGroup {
+            field: "status".into(),
+            values: vec!["1".into()],
+            occur: Occur::Must,
+        }];
         let q = build_query(&p).unwrap();
         // the tree must contain a Term over "status_key"
-        assert!(query_mentions_field(&q, "status_key"), "WHERE must suffix _key");
+        assert!(
+            query_mentions_field(&q, "status_key"),
+            "WHERE must suffix _key"
+        );
     }
 
     #[test]
@@ -428,13 +591,28 @@ mod tests {
         // IN uses key-field naming: "cat" -> "cat_key"; "id_key" stays "id_key" (already contains it).
         let mut p = params("x");
         p.in_groups = vec![
-            InGroup { field: "cat".into(), values: vec!["1".into()] },
-            InGroup { field: "id_key".into(), values: vec!["2".into()] },
+            InGroup {
+                field: "cat".into(),
+                values: vec!["1".into()],
+            },
+            InGroup {
+                field: "id_key".into(),
+                values: vec!["2".into()],
+            },
         ];
         let q = build_query(&p).unwrap();
-        assert!(query_mentions_field(&q, "cat_key"), "IN must suffix _key when missing");
-        assert!(query_mentions_field(&q, "id_key"), "IN must not duplicate _key");
-        assert!(!query_mentions_field(&q, "id_key_key"), "IN must not duplicate _key");
+        assert!(
+            query_mentions_field(&q, "cat_key"),
+            "IN must suffix _key when missing"
+        );
+        assert!(
+            query_mentions_field(&q, "id_key"),
+            "IN must not duplicate _key"
+        );
+        assert!(
+            !query_mentions_field(&q, "id_key_key"),
+            "IN must not duplicate _key"
+        );
     }
 
     /// corpus to test score normalization: doc0 with high tf and a short field scores
@@ -453,18 +631,32 @@ mod tests {
     fn search_normalizes_top_hit_to_one() {
         // scale parity with ZSL (Lucene.php:982-986): the top hit's score is brought to 1.0
         // and the rest to (0,1). It is monotonic: it does NOT change the order.
-        let q = Query::Term { field: Some("title".into()), text: "vpn".into() };
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
         let hits = search(&score_corpus(), &q, 0.0, 100);
         assert_eq!(hits.len(), 2);
-        assert!((hits[0].score - 1.0).abs() < 1e-6, "top a 1.0, got {}", hits[0].score);
-        assert!(hits[1].score > 0.0 && hits[1].score < 1.0, "resto en (0,1), got {}", hits[1].score);
+        assert!(
+            (hits[0].score - 1.0).abs() < 1e-6,
+            "top a 1.0, got {}",
+            hits[0].score
+        );
+        assert!(
+            hits[1].score > 0.0 && hits[1].score < 1.0,
+            "resto en (0,1), got {}",
+            hits[1].score
+        );
     }
 
     #[test]
     fn search_min_score_filters_on_normalized_scale() {
         // raw scores are small (~0.1); on the normalized [0,1] scale a min_score calibrated
         // to ZSL behaves the same. Without normalization, min_score=0.5 would empty everything.
-        let q = Query::Term { field: Some("title".into()), text: "vpn".into() };
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
         assert!(
             !search(&score_corpus(), &q, 0.5, 100).is_empty(),
             "min_score=0.5 must not empty out on the normalized scale"

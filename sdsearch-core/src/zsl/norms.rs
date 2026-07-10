@@ -1,7 +1,11 @@
 //! Norms reader (.nrm): one norm byte per doc per indexed field.
 use std::collections::HashMap;
 
-pub fn read_norms(nrm: &[u8], indexed_fields: &[String], num_docs: usize) -> HashMap<String, Vec<u8>> {
+pub fn read_norms(
+    nrm: &[u8],
+    indexed_fields: &[String],
+    num_docs: usize,
+) -> HashMap<String, Vec<u8>> {
     let mut out = HashMap::new();
     // header: 'NRM' + 1 format byte
     let mut pos = 4usize;

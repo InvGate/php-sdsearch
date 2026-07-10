@@ -52,7 +52,17 @@ mod tests {
 
     #[test]
     fn roundtrip_boundary_values() {
-        for v in [0u64, 1, 127, 128, 300, 16_383, 16_384, 1_000_000, u32::MAX as u64] {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            16_383,
+            16_384,
+            1_000_000,
+            u32::MAX as u64,
+        ] {
             let mut buf = Vec::new();
             write_vint(&mut buf, v);
             let mut pos = 0;

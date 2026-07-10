@@ -28,11 +28,17 @@ impl CompoundFile {
         let mut entries = Vec::with_capacity(checked_capacity(count, total));
         for i in 0..count {
             let start = raw[i].0 as usize;
-            let end = if i + 1 < count { raw[i + 1].0 as usize } else { total };
+            let end = if i + 1 < count {
+                raw[i + 1].0 as usize
+            } else {
+                total
+            };
             if start > end || end > total {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("cfs sub-file offset out of range: start={start} end={end} total={total}"),
+                    format!(
+                        "cfs sub-file offset out of range: start={start} end={end} total={total}"
+                    ),
                 ));
             }
             entries.push((raw[i].1.clone(), start, end));
@@ -58,7 +64,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_cfs() -> PathBuf {
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index"));
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index"
+        ));
         std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))

@@ -17,7 +17,10 @@ pub fn write_del_file(doc_count: usize, deleted: &BTreeSet<usize>) -> Vec<u8> {
     }
     let mut out = Vec::with_capacity(8 + byte_count);
     write_i32_be(&mut out, doc_count as i32);
-    write_i32_be(&mut out, deleted.iter().filter(|&&id| id < doc_count).count() as i32);
+    write_i32_be(
+        &mut out,
+        deleted.iter().filter(|&&id| id < doc_count).count() as i32,
+    );
     out.extend_from_slice(&bitmap);
     out
 }

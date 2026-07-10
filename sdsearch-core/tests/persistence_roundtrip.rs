@@ -2,7 +2,9 @@
 
 use sdsearch_core::doc::{Document, FieldKind};
 use sdsearch_core::index::MemoryIndex;
-use sdsearch_core::search::{fuzzy_query, multi_term_query, phrase_query, term_query, wildcard_query};
+use sdsearch_core::search::{
+    fuzzy_query, multi_term_query, phrase_query, term_query, wildcard_query,
+};
 use sdsearch_core::segment::Segment;
 
 fn corpus() -> MemoryIndex {
@@ -37,7 +39,12 @@ fn term_and_multiterm_match_between_memory_and_disk() {
     let b = term_query(&seg, "body", "fox", 0.0, 10);
     assert_eq!(ids(&a), ids(&b));
     for (x, y) in a.iter().zip(b.iter()) {
-        assert!((x.score - y.score).abs() < 1e-6, "score mismatch {} vs {}", x.score, y.score);
+        assert!(
+            (x.score - y.score).abs() < 1e-6,
+            "score mismatch {} vs {}",
+            x.score,
+            y.score
+        );
         assert_eq!(x.fields, y.fields);
     }
 

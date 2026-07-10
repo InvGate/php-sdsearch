@@ -135,8 +135,10 @@ impl MemoryIndex {
             let mut builder = fst::MapBuilder::memory();
             for (term, postings) in terms {
                 let offset = postings_bin.len() as u64;
-                let mut docs: Vec<(usize, &Vec<u32>)> =
-                    postings.iter().map(|(d, positions)| (*d, positions)).collect();
+                let mut docs: Vec<(usize, &Vec<u32>)> = postings
+                    .iter()
+                    .map(|(d, positions)| (*d, positions))
+                    .collect();
                 docs.sort_by_key(|(d, _)| *d);
                 write_vint(&mut postings_bin, docs.len() as u64);
                 let mut prev = 0usize;
@@ -166,8 +168,9 @@ impl MemoryIndex {
             }
             lengths.insert(field.clone(), v);
         }
-        let stored: Vec<HashMap<String, String>> =
-            (0..self.num_docs).map(|d| IndexReader::stored_fields(self, d)).collect();
+        let stored: Vec<HashMap<String, String>> = (0..self.num_docs)
+            .map(|d| IndexReader::stored_fields(self, d))
+            .collect();
 
         let meta = SegmentMeta {
             format_version: 2,
@@ -175,9 +178,18 @@ impl MemoryIndex {
             fields: field_names,
         };
         let json_err = |e: serde_json::Error| std::io::Error::other(e);
-        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).map_err(json_err)?)?;
-        std::fs::write(dir.join("lengths.json"), serde_json::to_vec(&lengths).map_err(json_err)?)?;
-        std::fs::write(dir.join("stored.json"), serde_json::to_vec(&stored).map_err(json_err)?)?;
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec(&meta).map_err(json_err)?,
+        )?;
+        std::fs::write(
+            dir.join("lengths.json"),
+            serde_json::to_vec(&lengths).map_err(json_err)?,
+        )?;
+        std::fs::write(
+            dir.join("stored.json"),
+            serde_json::to_vec(&stored).map_err(json_err)?,
+        )?;
         Ok(())
     }
 }
@@ -199,8 +211,10 @@ impl IndexReader for MemoryIndex {
         self.postings
             .get(&(field.to_string(), term.to_string()))
             .map(|p| {
-                let mut v: Vec<(usize, u32)> =
-                    p.iter().map(|(d, positions)| (*d, positions.len() as u32)).collect();
+                let mut v: Vec<(usize, u32)> = p
+                    .iter()
+                    .map(|(d, positions)| (*d, positions.len() as u32))
+                    .collect();
                 v.sort_by_key(|(d, _)| *d);
                 v
             })
@@ -301,6 +315,9 @@ mod tests {
         d.add("title", "hello world", FieldKind::Text);
         d.add("body", "hello", FieldKind::Text);
         idx.add_document(d);
-        assert_eq!(idx.indexed_fields(), vec!["body".to_string(), "title".to_string()]);
+        assert_eq!(
+            idx.indexed_fields(),
+            vec!["body".to_string(), "title".to_string()]
+        );
     }
 }
