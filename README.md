@@ -1,6 +1,7 @@
 # sdsearch
 
-[![build](https://github.com/InvGate/php-sdsearch/actions/workflows/build.yml/badge.svg)](https://github.com/InvGate/php-sdsearch/actions/workflows/build.yml)
+[![CI](https://github.com/InvGate/php-sdsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/InvGate/php-sdsearch/actions/workflows/ci.yml)
+[![coverage](https://raw.githubusercontent.com/InvGate/php-sdsearch/main/docs/coverage.svg)](https://github.com/InvGate/php-sdsearch/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A native Rust engine that reads **and** writes the [Zend Search Lucene](https://framework.zend.com/manual/1.12/en/zend.search.lucene.html)
