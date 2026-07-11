@@ -140,7 +140,12 @@ mod tests {
 
     fn temp_path_named(tag: &str) -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("sdsearch_cfs_{}_{}_{}.tmp", std::process::id(), n, tag))
+        std::env::temp_dir().join(format!(
+            "sdsearch_cfs_{}_{}_{}.tmp",
+            std::process::id(),
+            n,
+            tag
+        ))
     }
 
     #[test]

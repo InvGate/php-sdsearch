@@ -6,8 +6,8 @@
 //! open (excludes another native writer and ZSL).
 
 use super::lock::WriteLock;
-use super::segments::{self, Generation, NewSegment};
 use super::merge;
+use super::segments::{self, Generation, NewSegment};
 use super::{write_segment_cfs, WriterDoc, WriterOpts};
 use crate::index::IndexReader;
 use crate::zsl::deletes::DeletedDocs;
@@ -615,8 +615,12 @@ mod tests {
         assert!(!dir.join("segments_9").exists());
         // current (11 == "b") and immediately-previous (10 == "a") survive: grace window for
         // lock-free concurrent readers that read segments.gen just before the last flip.
-        assert!(dir.join(format!("segments_{}", crate::zsl::segments::to_base36(10))).exists());
-        assert!(dir.join(format!("segments_{}", crate::zsl::segments::to_base36(11))).exists());
+        assert!(dir
+            .join(format!("segments_{}", crate::zsl::segments::to_base36(10)))
+            .exists());
+        assert!(dir
+            .join(format!("segments_{}", crate::zsl::segments::to_base36(11)))
+            .exists());
 
         // segments.gen and the actual segment data (.cfs) are untouched by the pruning.
         assert!(dir.join("segments.gen").exists());
@@ -629,7 +633,7 @@ mod tests {
     #[test]
     fn commit_prunes_using_numeric_not_lexical_order_across_base36_rollover() {
         let dir = temp_kb_full(); // KB: gen 6
-        // enough commits to cross the base36 rollover ("z" = 35 -> "10" = 36), plus margin.
+                                  // enough commits to cross the base36 rollover ("z" = 35 -> "10" = 36), plus margin.
         for i in 0..35 {
             let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
             w.add_document(doc_mark(100 + i)).unwrap();
@@ -678,7 +682,9 @@ mod tests {
         assert!(!dir.join("segments_8").exists());
         // current (10 == "a") and immediately-previous (9) survive.
         assert!(dir.join("segments_9").exists());
-        assert!(dir.join(format!("segments_{}", crate::zsl::segments::to_base36(10))).exists());
+        assert!(dir
+            .join(format!("segments_{}", crate::zsl::segments::to_base36(10)))
+            .exists());
 
         assert!(dir.join("segments.gen").exists());
         let idx = ZslIndex::open(&dir).unwrap();

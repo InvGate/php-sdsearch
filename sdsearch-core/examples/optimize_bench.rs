@@ -88,7 +88,12 @@ fn copy_kb_base(n: usize, cap: usize) -> PathBuf {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/zsl_index_kb"
     ));
-    let dst = std::env::temp_dir().join(format!("sdsearch_optbench_{}_{}_{}", std::process::id(), n, cap));
+    let dst = std::env::temp_dir().join(format!(
+        "sdsearch_optbench_{}_{}_{}",
+        std::process::id(),
+        n,
+        cap
+    ));
     if dst.is_dir() {
         std::fs::remove_dir_all(&dst).ok();
     }
@@ -114,7 +119,11 @@ fn gen_docs(n: usize) -> Vec<WriterDoc> {
     let np = POOL.len();
     (0..n)
         .map(|i| {
-            let title = format!("ticket {i} {} {} issue{i}", POOL[i % np], POOL[(i * 3) % np]);
+            let title = format!(
+                "ticket {i} {} {} issue{i}",
+                POOL[i % np],
+                POOL[(i * 3) % np]
+            );
             let body: String = (0..40)
                 .map(|j| POOL[(i * 7 + j * 5) % np])
                 .collect::<Vec<_>>()
@@ -122,9 +131,24 @@ fn gen_docs(n: usize) -> Vec<WriterDoc> {
             let body = format!("{body} ref{i}");
             WriterDoc {
                 fields: vec![
-                    WriterField { name: "title".into(), value: title, kind: FieldKind::Text, stored: true },
-                    WriterField { name: "body".into(), value: body, kind: FieldKind::Text, stored: true },
-                    WriterField { name: "id".into(), value: format!("REC-{i}"), kind: FieldKind::Keyword, stored: true },
+                    WriterField {
+                        name: "title".into(),
+                        value: title,
+                        kind: FieldKind::Text,
+                        stored: true,
+                    },
+                    WriterField {
+                        name: "body".into(),
+                        value: body,
+                        kind: FieldKind::Text,
+                        stored: true,
+                    },
+                    WriterField {
+                        name: "id".into(),
+                        value: format!("REC-{i}"),
+                        kind: FieldKind::Keyword,
+                        stored: true,
+                    },
                 ],
             }
         })
@@ -151,14 +175,23 @@ fn copy_index(src: &Path, dst: &Path) {
 /// disk-backed scratch, adds `n_extra` tiny docs (cap=1 → one segment each) to force a
 /// multi-segment optimize, then measures optimize() over the whole corpus.
 fn run_existing(args: &[String]) {
-    let src = Path::new(args.get(2).expect("usage: optimize_bench existing <dir> <n_extra> <scratch>"));
+    let src = Path::new(
+        args.get(2)
+            .expect("usage: optimize_bench existing <dir> <n_extra> <scratch>"),
+    );
     let n_extra: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let scratch = Path::new(args.get(4).expect("scratch dir required (use a disk-backed path)"));
+    let scratch = Path::new(
+        args.get(4)
+            .expect("scratch dir required (use a disk-backed path)"),
+    );
 
     copy_index(src, scratch);
 
     {
-        let opts = WriterOpts { max_buffered_docs: 1, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(scratch, opts).expect("open (build) failed");
         for d in gen_docs(n_extra) {
             w.add_document(d).expect("add_document failed");
@@ -198,7 +231,10 @@ fn main() {
 
     // ---- build: stream N docs into a multi-segment index (bounded-memory add path) ----
     {
-        let opts = WriterOpts { max_buffered_docs: cap, ..WriterOpts::default() };
+        let opts = WriterOpts {
+            max_buffered_docs: cap,
+            ..WriterOpts::default()
+        };
         let mut w = IndexWriter::open(&dir, opts).expect("open (build) failed");
         for d in gen_docs(n) {
             w.add_document(d).expect("add_document failed");

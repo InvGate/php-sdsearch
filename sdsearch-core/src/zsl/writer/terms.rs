@@ -426,7 +426,7 @@ mod tests {
 
         // state of the previous term in the .tis
         let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
-        // state of the last sample in the .tii
+                                                              // state of the last sample in the .tii
         let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
         let mut last_index_position: u64 = 24;
 
@@ -519,7 +519,10 @@ mod tests {
     #[test]
     fn stream_writer_matches_batch_writer_byte_for_byte() {
         let terms = multi_field_sample_terms();
-        assert!(terms.len() > 128, "must exceed indexInterval to test .tii sampling + patch");
+        assert!(
+            terms.len() > 128,
+            "must exceed indexInterval to test .tii sampling + patch"
+        );
 
         // Independent oracle: the pre-streaming reference implementation (duplicated from
         // git commit 0654030, before `write_term_dict` became a thin wrapper over

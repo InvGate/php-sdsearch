@@ -700,7 +700,10 @@ mod tests {
         w2.commit().unwrap();
 
         let infos = read_segment_infos(&dir).unwrap();
-        assert!(infos.iter().any(|s| s.del_gen != -1), "scenario (b) needs deletes");
+        assert!(
+            infos.iter().any(|s| s.del_gen != -1),
+            "scenario (b) needs deletes"
+        );
         let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
         assert_streaming_byte_identical(&dir, &refs);
         std::fs::remove_dir_all(&dir).ok();
@@ -782,7 +785,8 @@ mod tests {
 
         let err = merge_segments_streaming(&dir, "_m", &[("_x".to_string(), -1)]).unwrap_err();
         assert!(
-            err.to_string().contains("binary stored field not supported"),
+            err.to_string()
+                .contains("binary stored field not supported"),
             "unexpected error: {err}"
         );
         // partial temp files (if any) are cleaned up even on the error path
@@ -794,8 +798,11 @@ mod tests {
     fn streaming_errors_on_indexed_field_without_prx() {
         // same hand-crafted no-.prx segment as the batch guard test, exercised via streaming.
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("sdsearch_smerge_noprx_{}_{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!(
+            "sdsearch_smerge_noprx_{}_{}",
+            std::process::id(),
+            n
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let fields = vec![FieldMeta {
