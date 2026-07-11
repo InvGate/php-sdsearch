@@ -4,7 +4,7 @@ use crate::zsl::cfs::CompoundFile;
 use crate::zsl::deletes::DeletedDocs;
 use crate::zsl::fields::{read_field_infos, FieldInfo};
 use crate::zsl::norms::{approx_field_len, read_norms};
-use crate::zsl::postings::{read_all_positions, read_freqs, read_positions};
+use crate::zsl::postings::{for_each_posting, read_all_positions, read_freqs, read_positions};
 use crate::zsl::stored::{read_stored_fields, read_stored_raw, StoredRaw};
 use crate::zsl::terms::{TermCursor, TermDict};
 use std::collections::HashMap;
@@ -56,6 +56,27 @@ impl ZslSegment {
     /// all `(field, text)` terms of the segment (to walk them during the merge).
     pub fn all_terms(&self) -> Vec<(String, String)> {
         self.dict.iter_terms()
+    }
+
+    /// Streams a term's LIVE postings (deletes filtered) one local doc at a time, ascending.
+    /// No-op if the term or `.prx` is absent (mirrors `positions_all`'s degradation).
+    pub fn for_each_live_posting(&self, field: &str, term: &str, mut f: impl FnMut(usize, &[u32])) {
+        if self.prx_name.is_empty() {
+            return;
+        }
+        let Some(ti) = self.dict.info(field, term) else {
+            return;
+        };
+        let (Some(frq), Some(prx)) = (self.cfs.sub(&self.frq_name), self.cfs.sub(&self.prx_name))
+        else {
+            return;
+        };
+        // degrade: a corrupt tail stops iteration rather than panicking across FFI
+        let _ = for_each_posting(frq, prx, ti, |d, pos| {
+            if !self.deletes.is_deleted(d) {
+                f(d, pos);
+            }
+        });
     }
 
     /// lazy cursor over every `(field, term)` pair in ZSL canonical order
@@ -368,6 +389,83 @@ mod tests {
             got.push((field.to_string(), term.to_string()));
             cur.advance();
         }
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn for_each_live_posting_matches_positions_all() {
+        let s = seg_kb();
+        let (field, term) = s.all_terms().into_iter().next().unwrap();
+        let mut expected: Vec<(usize, Vec<u32>)> =
+            s.positions_all(&field, &term).into_iter().collect();
+        expected.sort_by_key(|(d, _)| *d);
+
+        let mut got: Vec<(usize, Vec<u32>)> = Vec::new();
+        s.for_each_live_posting(&field, &term, |d, pos| got.push((d, pos.to_vec())));
+        got.sort_by_key(|(d, _)| *d);
+
+        assert_eq!(got, expected);
+    }
+
+    fn seg_multiseg_1() -> ZslSegment {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ));
+        // segment "_1" is the fixture's 2nd commit batch ("gamma vpn tutorial" local doc 0,
+        // "delta backup notes" local doc 1); its "_1_1.del" (del_gen 1) marks local doc 1
+        // deleted. Unlike the KB fixture (no deletes at all), this segment lets a test
+        // actually exercise the delete-filter branch of `for_each_live_posting`.
+        ZslSegment::open_named(&dir, "_1", 1).unwrap()
+    }
+
+    #[test]
+    fn for_each_live_posting_excludes_genuinely_deleted_doc() {
+        let s = seg_multiseg_1();
+
+        // sanity: the fixture really has a deletion here, or the rest of this test is vacuous.
+        assert!(
+            s.is_deleted(1),
+            "fixture local doc 1 (\"delta backup notes\") must be deleted"
+        );
+
+        // "backup" only appears in the deleted doc. Fetch its postings straight from the
+        // .frq via read_freqs (delete-AGNOSTIC — no `deletes.is_deleted` filtering), so this
+        // is an independent source from `positions_all` (which is itself delete-filtered)
+        // and can actually prove `for_each_live_posting` removes something.
+        let field = "title";
+        let term = "backup";
+        let ti = s
+            .dict
+            .info(field, term)
+            .expect("fixture must index title:backup");
+        let raw = read_freqs(s.cfs.sub(&s.frq_name).unwrap(), ti).unwrap();
+        let raw_docs: Vec<usize> = raw.iter().map(|(d, _)| *d).collect();
+        assert!(
+            raw_docs.contains(&1),
+            "delete-agnostic postings must include the deleted doc: {raw_docs:?}"
+        );
+
+        let mut live: Vec<usize> = Vec::new();
+        s.for_each_live_posting(field, term, |d, _pos| live.push(d));
+
+        // the chosen term must have a genuine gap between delete-agnostic and live counts,
+        // otherwise a dropped/inverted filter would not be caught by this test.
+        assert!(
+            raw_docs.len() > live.len(),
+            "term must have delete-agnostic count > live count to be non-vacuous: raw={raw_docs:?} live={live:?}"
+        );
+        assert!(
+            !live.contains(&1),
+            "for_each_live_posting must exclude the deleted doc: live={live:?}"
+        );
+        assert!(live.iter().all(|d| !s.is_deleted(*d)));
+
+        // must also agree with positions_all's doc set (both are delete-filtered).
+        let mut expected: Vec<usize> = s.positions_all(field, term).into_keys().collect();
+        expected.sort();
+        let mut got = live.clone();
+        got.sort();
         assert_eq!(got, expected);
     }
 

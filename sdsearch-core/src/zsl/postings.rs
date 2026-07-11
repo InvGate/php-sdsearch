@@ -64,20 +64,19 @@ pub fn read_positions(
     Ok(Vec::new())
 }
 
-/// Decodes ALL positions of a term in a single pass: doc -> positions.
-/// Avoids re-walking `.frq`/`.prx` from the pointer for each doc (which made phrase O(C·docFreq)).
-pub fn read_all_positions(
+/// Decodes a term's postings one doc at a time, invoking `f(doc, &positions)` in ascending
+/// doc order. A scratch `Vec<u32>` is reused across docs so peak extra RAM is one doc's
+/// positions, not the whole term.
+pub fn for_each_posting(
     frq: &[u8],
     prx: &[u8],
     info: &TermInfo,
-) -> std::io::Result<Vec<(usize, Vec<u32>)>> {
+    mut f: impl FnMut(usize, &[u32]),
+) -> std::io::Result<()> {
     let mut fpos = info.freq_pointer as usize;
     let mut ppos = info.prox_pointer as usize;
     let mut prev = 0usize;
-    let mut out = Vec::with_capacity(checked_capacity(
-        info.doc_freq as usize,
-        frq.len().saturating_sub(fpos),
-    ));
+    let mut positions: Vec<u32> = Vec::new();
     for _ in 0..info.doc_freq {
         let v = read_vint(frq, &mut fpos)?;
         let doc_delta = (v >> 1) as usize;
@@ -87,18 +86,30 @@ pub fn read_all_positions(
             read_vint(frq, &mut fpos)? as u32
         };
         let d = prev + doc_delta;
-        let mut positions = Vec::with_capacity(checked_capacity(
-            freq as usize,
-            prx.len().saturating_sub(ppos),
-        ));
+        positions.clear();
         let mut prev_pos = 0u32;
         for _ in 0..freq {
             prev_pos += read_vint(prx, &mut ppos)? as u32;
             positions.push(prev_pos);
         }
-        out.push((d, positions));
+        f(d, &positions);
         prev = d;
     }
+    Ok(())
+}
+
+/// Decodes ALL positions of a term in a single pass: doc -> positions.
+/// Avoids re-walking `.frq`/`.prx` from the pointer for each doc (which made phrase O(C·docFreq)).
+pub fn read_all_positions(
+    frq: &[u8],
+    prx: &[u8],
+    info: &TermInfo,
+) -> std::io::Result<Vec<(usize, Vec<u32>)>> {
+    let mut out = Vec::with_capacity(checked_capacity(
+        info.doc_freq as usize,
+        frq.len().saturating_sub(info.freq_pointer as usize),
+    ));
+    for_each_posting(frq, prx, info, |d, pos| out.push((d, pos.to_vec())))?;
     Ok(out)
 }
 
@@ -151,5 +162,29 @@ mod tests {
             prox_pointer: 0,
         };
         assert!(read_freqs(&[], &info).is_err());
+    }
+
+    #[test]
+    fn for_each_posting_matches_read_all_positions() {
+        let cf = cfs();
+        let sub = |ext: &str| {
+            cf.sub(&cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap())
+                .unwrap()
+                .to_vec()
+        };
+        let names: Vec<String> = read_field_infos(&sub(".fnm"))
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        let dict = TermDict::read(&sub(".tis"), &names).unwrap();
+        let ti = dict.info("title", "new").unwrap();
+        let frq = sub(".frq");
+        let prx = sub(".prx");
+
+        let expected = read_all_positions(&frq, &prx, ti).unwrap();
+        let mut got: Vec<(usize, Vec<u32>)> = Vec::new();
+        for_each_posting(&frq, &prx, ti, |doc, pos| got.push((doc, pos.to_vec()))).unwrap();
+        assert_eq!(got, expected);
     }
 }

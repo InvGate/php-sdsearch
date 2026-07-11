@@ -19,7 +19,7 @@ use crate::zsl::segment::ZslSegment;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::File;
-use std::io;
+use std::io::{self, BufWriter};
 use std::path::Path;
 
 /// merge result: the bytes of the merged `.cfs` + the number of live docs.
@@ -259,8 +259,13 @@ fn merge_streaming_inner(
     let mut norm_cols: Vec<Vec<u8>> = vec![Vec::new(); fields.len()];
     let mut next_id = 0usize;
 
+    // `.fdt` is append-only and written one doc at a time (`add_doc`): wrap it in a `BufWriter`
+    // so per-doc writes coalesce into few syscalls instead of one `write_all` per doc. The
+    // buffer is a small constant (default 8 KiB), independent of segment size; `finish()` below
+    // flushes it to disk BEFORE the temp file is read back during CFS assembly.
     let mut fdx_buf: Vec<u8> = Vec::new();
-    let mut stored_writer = stored::StoredStreamWriter::new(File::create(fdt_tmp)?, &mut fdx_buf);
+    let mut stored_writer =
+        stored::StoredStreamWriter::new(BufWriter::new(File::create(fdt_tmp)?), &mut fdx_buf);
 
     for seg in &segs {
         let local_fields = seg.field_infos();
@@ -338,11 +343,16 @@ fn merge_streaming_inner(
     // .frq/.prx are the big blocks, streamed to temp files.
     let mut tis_buf = io::Cursor::new(Vec::new());
     let mut tii_buf = io::Cursor::new(Vec::new());
+    // `.frq`/`.prx` are append-only and written one posting at a time (`add_posting`): same
+    // `BufWriter` treatment as `.fdt` above, for the same reason (per-term-size N postings would
+    // otherwise be N unbuffered `write_all` syscalls). `.tis`/`.tii` stay as in-RAM `Cursor`s
+    // (Write+Seek, needed for the term-count back-patch) — they are written per-term, not
+    // per-posting, so they were never the bottleneck.
     let mut dict_writer = terms::TermDictStreamWriter::new(
         &mut tis_buf,
         &mut tii_buf,
-        File::create(frq_tmp)?,
-        File::create(prx_tmp)?,
+        BufWriter::new(File::create(frq_tmp)?),
+        BufWriter::new(File::create(prx_tmp)?),
     )?;
 
     // one cursor per segment; each yields (field, term) ascending. A min-heap (BinaryHeap is a
@@ -380,31 +390,34 @@ fn merge_streaming_inner(
 
         // Contributing segments in ASCENDING index (+ locals ascending within each) => new
         // doc-ids come out ascending, matching merge_segments' BTreeMap<new_id, _> ordering
-        // (dense renumbering assigns lower ids to earlier segments).
+        // (dense renumbering assigns lower ids to earlier segments). `for_each_live_posting`
+        // yields ascending LOCAL doc within a segment, which maps to ascending NEW id (dense
+        // renumbering), and segment ranges are globally ordered — so postings arrive in
+        // ascending new-id order across the whole term without any gather/sort, bounding peak
+        // memory to one posting's positions rather than the whole term's doc list.
         contributing.sort_unstable();
         let mf = field_index[&field];
-        let mut docs: Vec<(usize, Vec<u32>)> = Vec::new();
+        dict_writer.begin_term(mf, &term)?;
         for &si in &contributing {
-            // positions_all ALREADY filters deletes. It may return an unordered HashMap, so sort
-            // locals ascending before remapping so the new ids come out ascending.
-            let mut locals: Vec<(usize, Vec<u32>)> =
-                segs[si].positions_all(&field, &term).into_iter().collect();
-            locals.sort_by_key(|(local, _)| *local);
-            for (local, positions) in locals {
-                if let Some(new_id) = doc_maps[si][local] {
-                    docs.push((new_id, positions));
+            let map = &doc_maps[si];
+            // `for_each_live_posting`'s callback is `FnMut` and can't propagate `?`, so capture
+            // any `add_posting` error here and check it after the segment finishes iterating.
+            let mut posting_err: Option<io::Error> = None;
+            segs[si].for_each_live_posting(&field, &term, |local, positions| {
+                if posting_err.is_some() {
+                    return;
                 }
+                if let Some(new_id) = map[local] {
+                    if let Err(e) = dict_writer.add_posting(new_id, positions) {
+                        posting_err = Some(e);
+                    }
+                }
+            });
+            if let Some(e) = posting_err {
+                return Err(e);
             }
         }
-        // terms with no live docs are dropped (== ZSL / merge_segments).
-        if docs.is_empty() {
-            continue;
-        }
-        dict_writer.add_term(&TermPostings {
-            field_num: mf,
-            text: term,
-            docs,
-        })?;
+        dict_writer.end_term()?; // drops the term if 0 live postings (== ZSL / merge_segments)
     }
     dict_writer.finish()?; // back-patch term counts + close the temp .frq/.prx
 
@@ -827,6 +840,43 @@ mod tests {
             err.to_string().contains("indexed fields but no .prx"),
             "unexpected error: {err}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_matches_batch_with_a_term_in_every_doc() {
+        // multi-segment base (cap=2 → 2 flushed segments) where EVERY added doc's `title`
+        // contains "allofthem" (so it has a posting in every live doc across every segment,
+        // i.e. doc_freq == total live docs — the shape the old gather would have held fully
+        // resident), plus a per-doc unique token so postings differ doc to doc.
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        for i in 0..6 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("allofthem unique{i}"))],
+            })
+            .unwrap();
+        }
+        w.commit().unwrap();
+
+        let infos = read_segment_infos(&dir).unwrap();
+        assert!(
+            infos.len() >= 2,
+            "expected multi-segment base, got {}",
+            infos.len()
+        );
+
+        let before = ZslIndex::open(&dir).unwrap();
+        // KB fixture's 20 docs do NOT contain "allofthem", so doc_freq == exactly the 6 added.
+        assert_eq!(before.doc_freq("title", "allofthem"), 6);
+        drop(before);
+
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        assert_streaming_byte_identical(&dir, &refs);
         std::fs::remove_dir_all(&dir).ok();
     }
 
