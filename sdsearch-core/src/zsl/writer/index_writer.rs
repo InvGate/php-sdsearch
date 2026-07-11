@@ -123,6 +123,48 @@ impl IndexWriter {
         });
         self.next_name_counter += 1;
         self.buffer.clear();
+
+        // Safety-net merge policy: if the live segment count crosses the ceiling, compact the
+        // flushed (new) segments into one. Never touches the base segments. `0` disables it.
+        if self.opts.max_segments != 0
+            && self.base_segments.len() + self.flushed.len() > self.opts.max_segments
+        {
+            self.compact_flushed()?;
+        }
+        Ok(())
+    }
+
+    /// Merges all currently-flushed segments into ONE (bounded memory), replacing `self.flushed`
+    /// with the single merged segment. No-op if fewer than 2 are flushed (nothing to reduce).
+    /// The base segments are never touched. Consumes one name from `next_name_counter` for the
+    /// merged segment; the merged-away `.cfs` files are deleted (orphans, unreferenced by any
+    /// generation).
+    ///
+    /// Cost note: each ceiling crossing re-merges ALL flushed segments (incl. the previously
+    /// merged one), so a batch that crosses the ceiling repeatedly pays super-linear write cost on
+    /// the flushed set. Degenerate case: if `base_segments.len()` alone already exceeds the ceiling
+    /// (a never-optimized index), this fires on every flush from the second onward — O(N²) from the
+    /// start of the batch, not just on giant ones. The operating model (`optimize()` once per batch
+    /// collapses the base to one segment) keeps that out of reach; a tiered v2 policy removes it.
+    fn compact_flushed(&mut self) -> io::Result<()> {
+        if self.flushed.len() < 2 {
+            return Ok(());
+        }
+        // flushed segments are new => no deletes among themselves => del_gen -1.
+        let refs: Vec<(String, i64)> = self.flushed.iter().map(|s| (s.name.clone(), -1)).collect();
+        let merged_name = segments::segment_name(self.next_name_counter);
+        self.next_name_counter += 1;
+
+        let doc_count = merge::merge_segments_streaming(&self.dir, &merged_name, &refs)?;
+
+        // remove the merged-away inputs (now orphaned; not in any generation).
+        for (name, _) in &refs {
+            let _ = std::fs::remove_file(self.dir.join(format!("{name}.cfs")));
+        }
+        self.flushed = vec![NewSegment {
+            name: merged_name,
+            doc_count: doc_count as u32,
+        }];
         Ok(())
     }
 
@@ -264,6 +306,7 @@ impl IndexWriter {
             &self.base,
             &del_gen_overrides,
             &flushed,
+            self.next_name_counter,
         )?;
 
         Ok(CommitReport {
@@ -315,6 +358,33 @@ mod tests {
         WriterDoc {
             fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))],
         }
+    }
+
+    #[test]
+    fn committed_name_counter_equals_writer_high_water_mark() {
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 1, // one segment per doc
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("title", "zqa one")],
+        })
+        .unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("title", "zqb two")],
+        })
+        .unwrap();
+        let hwm = w.next_name_counter; // after flushes, before commit
+        w.commit().unwrap();
+
+        let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
+        assert_eq!(
+            gen.name_counter, hwm,
+            "committed generation name_counter must equal the writer's high-water mark"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -690,6 +760,170 @@ mod tests {
         let idx = ZslIndex::open(&dir).unwrap();
         assert_eq!(idx.num_docs(), 20 + 3);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_segments_caps_flushed_count_and_leaves_base_untouched() {
+        let dir = temp_kb_full();
+        // capture the base segment's bytes to prove compaction never rewrites it.
+        let base_name = {
+            let infos = crate::zsl::segments::read_segment_infos(&dir).unwrap();
+            assert_eq!(infos.len(), 1, "KB fixture is single-segment");
+            infos[0].name.clone()
+        };
+        let base_cfs = dir.join(format!("{base_name}.cfs"));
+        let base_bytes_before = std::fs::read(&base_cfs).unwrap();
+
+        let opts = WriterOpts {
+            max_buffered_docs: 1, // one flush per doc
+            max_segments: 4,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+
+        let mut compaction_seen = false;
+        for i in 0..12 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("zqx doc{i}"))],
+            })
+            .unwrap();
+            // ceiling holds after every add (compaction runs inside flush_segment).
+            let total = w.base_segments.len() + w.flushed.len();
+            assert!(total <= 4, "segment count {total} exceeded max_segments=4");
+            if w.flushed.len() == 1 && i >= 3 {
+                compaction_seen = true; // flushed collapsed back to a single merged segment
+            }
+        }
+        assert!(compaction_seen, "expected at least one compaction to fire");
+
+        // base segment file was never rewritten.
+        assert_eq!(
+            std::fs::read(&base_cfs).unwrap(),
+            base_bytes_before,
+            "compaction must not touch the base segment"
+        );
+        // total docs preserved through the compactions.
+        assert_eq!(w.document_count(), 20 + 12);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compacted_batch_matches_uncompacted() {
+        let docs: Vec<WriterDoc> = (0..25)
+            .map(|i| WriterDoc {
+                fields: vec![
+                    WriterField::text("title", &format!("zqmerge shared unique{i}")),
+                    WriterField::keyword("id", &format!("KB-{i}")),
+                ],
+            })
+            .collect();
+
+        // (live_docs, df_shared, df_unique7, compaction_fired)
+        let run = |max_segments: usize| -> (usize, usize, usize, bool) {
+            let dir = temp_kb_full();
+            let opts = WriterOpts {
+                max_buffered_docs: 1,
+                max_segments,
+                ..WriterOpts::default()
+            };
+            let mut w = IndexWriter::open(&dir, opts).unwrap();
+            let mut compaction_fired = false;
+            for (i, d) in docs.iter().enumerate() {
+                w.add_document(d.clone()).unwrap();
+                if w.flushed.len() == 1 && i >= 3 {
+                    compaction_fired = true; // flushed collapsed back to one merged segment
+                }
+            }
+            w.optimize().unwrap();
+            let idx = ZslIndex::open(&dir).unwrap();
+            let out = (
+                idx.num_docs(),
+                idx.doc_freq("title", "shared"),
+                idx.doc_freq("title", "unique7"),
+                compaction_fired,
+            );
+            std::fs::remove_dir_all(&dir).ok();
+            out
+        };
+
+        let capped = run(4);
+        let disabled = run(0);
+        assert!(
+            capped.3,
+            "capped run must actually trigger intra-batch compaction"
+        );
+        assert!(!disabled.3, "disabled run must never compact");
+        assert_eq!(
+            (capped.0, capped.1, capped.2),
+            (disabled.0, disabled.1, disabled.2),
+            "compacted result must equal uncompacted"
+        );
+        assert_eq!(capped.0, 20 + 25, "20 base + 25 added, all live");
+        assert_eq!(capped.1, 25, "every added doc has 'shared'");
+        assert_eq!(capped.2, 1, "'unique7' appears in exactly one doc");
+    }
+
+    #[test]
+    fn name_counter_stays_monotonic_after_intra_batch_compaction() {
+        // A compacting batch consumes name slots that don't appear in the final flushed list.
+        // Commit WITHOUT optimize (so the intra-batch compacted segment stays referenced) and
+        // assert the committed name_counter equals the writer's true high-water mark. Under the
+        // old bug (base.name_counter + flushed.len()) this is strictly LOWER, so this fails.
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            max_segments: 4,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        let mut compaction_fired = false;
+        for i in 0..12 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("zqx doc{i}"))],
+            })
+            .unwrap();
+            if w.flushed.len() == 1 && i >= 3 {
+                compaction_fired = true;
+            }
+        }
+        assert!(compaction_fired, "test must actually exercise compaction");
+        let hwm = w.next_name_counter; // > base.name_counter + flushed.len() after compaction
+        w.commit().unwrap(); // NO optimize: compacted segment stays live
+
+        let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
+        assert_eq!(
+            gen.name_counter, hwm,
+            "committed name_counter must equal writer high-water mark after compaction"
+        );
+        let next_name = crate::zsl::writer::segments::segment_name(gen.name_counter);
+        assert!(
+            !dir.join(format!("{next_name}.cfs")).exists(),
+            "next segment name {next_name} collides with an existing segment"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_segments_zero_never_compacts() {
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            max_segments: 0, // disabled
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        for i in 0..8 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("zqz d{i}"))],
+            })
+            .unwrap();
+        }
+        // no compaction: every doc produced its own flushed segment, none merged away.
+        assert_eq!(w.flushed.len(), 8, "disabled policy must not compact");
+        w.commit().unwrap();
+        assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 20 + 8);
         std::fs::remove_dir_all(&dir).ok();
     }
 
