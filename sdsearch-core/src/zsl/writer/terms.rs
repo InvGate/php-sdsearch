@@ -52,6 +52,16 @@ where
     idx_prev: Option<PrevTerm>,
     last_index_position: u64,
     term_count: u64,
+
+    // per-term streaming state for `begin_term`/`add_posting`/`end_term`.
+    cur_field: usize,
+    cur_text: String,
+    cur_freq_ptr: u64,
+    cur_prox_ptr: u64,
+    cur_doc_freq: u32,
+    cur_prev_doc: usize,
+    frq_scratch: Vec<u8>,
+    prx_scratch: Vec<u8>,
 }
 
 impl<Tis, Tii, Frq, Prx> TermDictStreamWriter<Tis, Tii, Frq, Prx>
@@ -92,11 +102,27 @@ where
             idx_prev: None,
             last_index_position: 24,
             term_count: 0,
+
+            cur_field: 0,
+            cur_text: String::new(),
+            cur_freq_ptr: 0,
+            cur_prox_ptr: 0,
+            cur_doc_freq: 0,
+            cur_prev_doc: 0,
+            frq_scratch: Vec::new(),
+            prx_scratch: Vec::new(),
         })
     }
 
     /// Appends one term's dictionary entry (`.tis`, and `.tii` every `INDEX_INTERVAL`th
     /// term) plus its postings (`.frq`/`.prx`). Terms must arrive in ZSL canonical order.
+    ///
+    /// Kept independent of `begin_term`/`add_posting`/`end_term`: it computes its own
+    /// `freq_ptr`/`prox_ptr`/`doc_freq` and writes postings in one shot via
+    /// `write_term_postings`, only sharing the `.tis`/`.tii` tail encoding (`dump_tis_entry`)
+    /// with the streaming API. This keeps it a valid independent oracle for the
+    /// byte-identity test in `stream_within_term_matches_add_term_byte_for_byte` — see
+    /// the module docs and the plan's Global Constraints (commit d93b16d).
     pub fn add_term(&mut self, term: &TermPostings) -> io::Result<()> {
         // `write_term_postings` only depends on `term.docs` (it resets its own doc/position
         // deltas per call), so writing into fresh local buffers reproduces the exact same
@@ -110,25 +136,106 @@ where
 
         let doc_freq = term.doc_freq();
 
+        self.dump_tis_entry(term.field_num, &term.text, doc_freq, freq_ptr, prox_ptr)?;
+
+        self.frq.write_all(&frq_buf)?;
+        self.frq_len += frq_buf.len() as u64;
+        self.prx.write_all(&prx_buf)?;
+        self.prx_len += prx_buf.len() as u64;
+
+        Ok(())
+    }
+
+    /// Starts a new term for the stream-within-term API: records the `.frq`/`.prx`
+    /// pointers this term will start at (the running lengths *before* any posting of
+    /// this term is written) and resets the per-term posting state. Writes nothing.
+    pub fn begin_term(&mut self, field_num: usize, text: &str) -> io::Result<()> {
+        self.cur_field = field_num;
+        self.cur_text = text.to_string();
+        self.cur_freq_ptr = self.frq_len;
+        self.cur_prox_ptr = self.prx_len;
+        self.cur_doc_freq = 0;
+        self.cur_prev_doc = 0;
+        Ok(())
+    }
+
+    /// Appends one posting (`new_doc_id`, ascending, plus its ascending positions) to
+    /// the current term started by `begin_term`. Encodes exactly like
+    /// `write_term_postings`'s per-doc loop: `docDelta*2 (+1 if freq==1)`, else
+    /// `docDelta*2` followed by `VInt(freq)`; positions as per-doc deltas in `.prx`.
+    pub fn add_posting(&mut self, new_doc_id: usize, positions: &[u32]) -> io::Result<()> {
+        let doc_delta = (new_doc_id - self.cur_prev_doc) * 2;
+        if positions.len() > 1 {
+            write_vint(&mut self.frq_scratch, doc_delta as u64);
+            write_vint(&mut self.frq_scratch, positions.len() as u64);
+        } else {
+            write_vint(&mut self.frq_scratch, (doc_delta + 1) as u64);
+        }
+
+        let mut prev_pos = 0u32;
+        for &pos in positions {
+            write_vint(&mut self.prx_scratch, (pos - prev_pos) as u64);
+            prev_pos = pos;
+        }
+
+        self.frq.write_all(&self.frq_scratch)?;
+        self.frq_len += self.frq_scratch.len() as u64;
+        self.prx.write_all(&self.prx_scratch)?;
+        self.prx_len += self.prx_scratch.len() as u64;
+        self.frq_scratch.clear();
+        self.prx_scratch.clear();
+
+        self.cur_prev_doc = new_doc_id;
+        self.cur_doc_freq += 1;
+        Ok(())
+    }
+
+    /// Closes the term started by `begin_term`. If no posting was added (`doc_freq ==
+    /// 0`), the term is dropped: no `.tis` entry, no `.tii` sample, no `.frq`/`.prx`
+    /// bytes (matching the merge's "skip empty terms" behavior). Otherwise writes the
+    /// `.tis` entry and the `.tii` sample exactly as `add_term`'s tail does, via the
+    /// shared `dump_tis_entry`.
+    pub fn end_term(&mut self) -> io::Result<()> {
+        if self.cur_doc_freq == 0 {
+            return Ok(());
+        }
+        let field_num = self.cur_field;
+        let text = std::mem::take(&mut self.cur_text);
+        let doc_freq = self.cur_doc_freq;
+        let freq_ptr = self.cur_freq_ptr;
+        let prox_ptr = self.cur_prox_ptr;
+        self.dump_tis_entry(field_num, &text, doc_freq, freq_ptr, prox_ptr)
+    }
+
+    /// Shared `.tis`/`.tii` tail: writes the term-dict entry (prefix-shared vs the
+    /// previous term of the same field), advances the prev-term/term-count state, and
+    /// samples into `.tii` every `INDEX_INTERVAL`th term. Used by both `add_term` and
+    /// `end_term` — this is shared low-level ENCODING, not one path built on top of the
+    /// other: each caller independently computes its own `freq_ptr`/`prox_ptr`/`doc_freq`
+    /// via a different code path (`write_term_postings` vs `add_posting`'s running state).
+    fn dump_tis_entry(
+        &mut self,
+        field_num: usize,
+        text: &str,
+        doc_freq: u32,
+        freq_ptr: u64,
+        prox_ptr: u64,
+    ) -> io::Result<()> {
         let mut tis_entry = Vec::new();
         dump_entry(
             &mut tis_entry,
             self.prev
                 .as_ref()
                 .map(|(t, f, fp, pp)| (t.as_str(), *f, *fp, *pp)),
-            term,
+            field_num,
+            text,
             doc_freq,
             freq_ptr,
             prox_ptr,
         );
         self.tis.write_all(&tis_entry)?;
         self.tis_len += tis_entry.len() as u64;
-        self.prev = Some((term.text.clone(), term.field_num, freq_ptr, prox_ptr));
-
-        self.frq.write_all(&frq_buf)?;
-        self.frq_len += frq_buf.len() as u64;
-        self.prx.write_all(&prx_buf)?;
-        self.prx_len += prx_buf.len() as u64;
+        self.prev = Some((text.to_string(), field_num, freq_ptr, prox_ptr));
 
         self.term_count += 1;
         // sample every indexInterval terms
@@ -139,7 +246,8 @@ where
                 self.idx_prev
                     .as_ref()
                     .map(|(t, f, fp, pp)| (t.as_str(), *f, *fp, *pp)),
-                term,
+                field_num,
+                text,
                 doc_freq,
                 freq_ptr,
                 prox_ptr,
@@ -148,15 +256,14 @@ where
             write_vint(&mut tii_entry, index_position - self.last_index_position);
             self.last_index_position = index_position;
             self.tii.write_all(&tii_entry)?;
-            self.idx_prev = Some((term.text.clone(), term.field_num, freq_ptr, prox_ptr));
+            self.idx_prev = Some((text.to_string(), field_num, freq_ptr, prox_ptr));
         }
 
         Ok(())
     }
 
-    /// Back-patches the 8-byte term counts at offset 4 in `.tis`/`.tii` and flushes all
-    /// four sinks.
-    pub fn finish(mut self) -> io::Result<()> {
+    /// Back-patches the 8-byte term counts at offset 4 in `.tis`/`.tii`.
+    fn backpatch_term_counts(&mut self) -> io::Result<()> {
         let term_count = self.term_count;
         self.tis.seek(SeekFrom::Start(4))?;
         self.tis.write_all(&term_count.to_be_bytes())?;
@@ -164,7 +271,13 @@ where
         let tii_count = (term_count - term_count % INDEX_INTERVAL) / INDEX_INTERVAL + 1;
         self.tii.seek(SeekFrom::Start(4))?;
         self.tii.write_all(&tii_count.to_be_bytes())?;
+        Ok(())
+    }
 
+    /// Back-patches the 8-byte term counts at offset 4 in `.tis`/`.tii` and flushes all
+    /// four sinks.
+    pub fn finish(mut self) -> io::Result<()> {
+        self.backpatch_term_counts()?;
         self.tis.flush()?;
         self.tii.flush()?;
         self.frq.flush()?;
@@ -212,18 +325,19 @@ fn write_header(out: &mut Vec<u8>) {
 fn dump_entry(
     out: &mut Vec<u8>,
     prev: Option<(&str, usize, u64, u64)>,
-    term: &TermPostings,
+    field_num: usize,
+    text: &str,
     doc_freq: u32,
     freq_ptr: u64,
     prox_ptr: u64,
 ) {
     let (prefix_chars, prefix_bytes) = match prev {
-        Some((ptext, pfield, ..)) if pfield == term.field_num => common_prefix(ptext, &term.text),
+        Some((ptext, pfield, ..)) if pfield == field_num => common_prefix(ptext, text),
         _ => (0, 0),
     };
     write_vint(out, prefix_chars as u64);
-    write_modified_utf8(out, &term.text[prefix_bytes..]);
-    write_vint(out, term.field_num as u64);
+    write_modified_utf8(out, &text[prefix_bytes..]);
+    write_vint(out, field_num as u64);
     write_vint(out, doc_freq as u64);
     match prev {
         Some((_, _, pf, pp)) => {
@@ -252,6 +366,34 @@ fn common_prefix(a: &str, b: &str) -> (usize, usize) {
         }
     }
     (chars, bytes)
+}
+
+/// Test-only: a `TermDictStreamWriter` over owned in-memory buffers, and the plain
+/// `(tis, tii, frq, prx)` byte tuple it produces.
+#[cfg(test)]
+type TestStreamWriter =
+    TermDictStreamWriter<io::Cursor<Vec<u8>>, io::Cursor<Vec<u8>>, Vec<u8>, Vec<u8>>;
+#[cfg(test)]
+type TestDictBuffers = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+#[cfg(test)]
+impl TestStreamWriter {
+    /// Test-only: like `finish`, but returns the four finished buffers instead of
+    /// discarding them, so a test can compare bytes across two independently-driven
+    /// writers.
+    fn finish_into_buffers(mut self) -> io::Result<TestDictBuffers> {
+        self.backpatch_term_counts()?;
+        self.tis.flush()?;
+        self.tii.flush()?;
+        self.frq.flush()?;
+        self.prx.flush()?;
+        Ok((
+            self.tis.into_inner(),
+            self.tii.into_inner(),
+            self.frq,
+            self.prx,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +656,70 @@ mod tests {
             }
         }
         (chars, bytes)
+    }
+
+    /// Test-only writer that owns its four sinks as in-memory buffers, so a test can
+    /// build one, drive it, and pull the finished bytes back out without juggling
+    /// external `Cursor`/`Vec` borrows.
+    fn new_stream_writer_over_cursors() -> TestStreamWriter {
+        TermDictStreamWriter::new(
+            io::Cursor::new(Vec::new()),
+            io::Cursor::new(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// Feeds the SAME terms through `add_term` (the existing, unmodified oracle — it
+    /// still computes postings in one shot via `write_term_postings`) and through
+    /// `begin_term`/`add_posting`/`end_term` (the new streaming API, one doc at a time)
+    /// into two INDEPENDENT writers/sinks, then asserts all four output buffers match
+    /// byte-for-byte. `add_term` is not rerouted through the new methods (see module
+    /// docs / Global Constraints), so this is a genuine two-implementation comparison,
+    /// not the subject compared against itself.
+    #[test]
+    fn stream_within_term_matches_add_term_byte_for_byte() {
+        let terms = multi_field_sample_terms();
+        assert!(
+            terms.len() > 128,
+            "must exceed indexInterval to test .tii sampling + patch"
+        );
+
+        let mut a = new_stream_writer_over_cursors();
+        for t in &terms {
+            a.add_term(t).unwrap();
+        }
+        let (a_tis, a_tii, a_frq, a_prx) = a.finish_into_buffers().unwrap();
+
+        let mut b = new_stream_writer_over_cursors();
+        for t in &terms {
+            b.begin_term(t.field_num, &t.text).unwrap();
+            for (doc, pos) in &t.docs {
+                b.add_posting(*doc, pos).unwrap();
+            }
+            b.end_term().unwrap();
+        }
+        let (b_tis, b_tii, b_frq, b_prx) = b.finish_into_buffers().unwrap();
+
+        assert_eq!(a_tis, b_tis, "tis mismatch");
+        assert_eq!(a_tii, b_tii, "tii mismatch");
+        assert_eq!(a_frq, b_frq, "frq mismatch");
+        assert_eq!(a_prx, b_prx, "prx mismatch");
+    }
+
+    #[test]
+    fn zero_posting_term_writes_nothing() {
+        let mut w = new_stream_writer_over_cursors();
+        w.begin_term(0, "ghost").unwrap();
+        w.end_term().unwrap(); // no add_posting: doc_freq stays 0, term is dropped
+
+        let (tis, tii, frq, prx) = w.finish_into_buffers().unwrap();
+        // must be identical to a writer that never saw a term at all (only headers).
+        let empty = new_stream_writer_over_cursors()
+            .finish_into_buffers()
+            .unwrap();
+        assert_eq!((tis, tii, frq, prx), empty);
     }
 
     #[test]
