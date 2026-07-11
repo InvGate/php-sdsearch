@@ -12,6 +12,7 @@
 use super::invert::TermPostings;
 use super::postings::write_term_postings;
 use crate::zsl::bytes::{write_i32_be, write_i64_be, write_modified_utf8, write_vint};
+use std::io::{self, Seek, SeekFrom, Write};
 
 pub const INDEX_INTERVAL: u64 = 128;
 const MARKER: i32 = -3; // 0xFFFFFFFD
@@ -25,55 +26,177 @@ pub struct DictFiles {
     pub prx: Vec<u8>,
 }
 
-pub fn write_term_dict(terms: &[TermPostings]) -> DictFiles {
-    let mut tis = Vec::new();
-    let mut tii = Vec::new();
-    let mut frq = Vec::new();
-    let mut prx = Vec::new();
+/// prev-term state for prefix-sharing + freq/prox pointer deltas: (text, field_num, freq_ptr, prox_ptr).
+/// Owned (unlike the batch loop's `&str` borrow) because a streaming writer only sees one
+/// term at a time and must remember the previous one across calls.
+type PrevTerm = (String, usize, u64, u64);
 
-    write_header(&mut tis);
-    write_header(&mut tii);
+/// Streams the four dict sub-files. Terms MUST be added in ZSL canonical order
+/// (fieldName·\0·text). docFreq is taken per term from `term.docs.len()`. `.tis`/`.tii`
+/// need Seek to back-patch the 8-byte term-count in their headers on `finish`.
+pub struct TermDictStreamWriter<Tis, Tii, Frq, Prx>
+where
+    Tis: Write + Seek,
+    Tii: Write + Seek,
+    Frq: Write,
+    Prx: Write,
+{
+    tis: Tis,
+    tii: Tii,
+    frq: Frq,
+    prx: Prx,
+    tis_len: u64,
+    frq_len: u64,
+    prx_len: u64,
+    prev: Option<PrevTerm>,
+    idx_prev: Option<PrevTerm>,
+    last_index_position: u64,
+    term_count: u64,
+}
 
-    // initial synthetic .tii entry (hand-written, NOT via dump_entry):
-    // the field number is a raw Int 0xFFFFFFFF, not a VInt.
-    write_vint(&mut tii, 0); // prefixChars
-    write_modified_utf8(&mut tii, ""); // empty suffix
-    write_i32_be(&mut tii, -1); // 0xFFFFFFFF
-    tii.push(0x0F);
-    write_vint(&mut tii, 0); // docFreq
-    write_vint(&mut tii, 0); // freqDelta
-    write_vint(&mut tii, 0); // proxDelta
-    write_vint(&mut tii, 24); // IndexDelta
+impl<Tis, Tii, Frq, Prx> TermDictStreamWriter<Tis, Tii, Frq, Prx>
+where
+    Tis: Write + Seek,
+    Tii: Write + Seek,
+    Frq: Write,
+    Prx: Write,
+{
+    pub fn new(mut tis: Tis, mut tii: Tii, frq: Frq, prx: Prx) -> io::Result<Self> {
+        let mut header = Vec::new();
+        write_header(&mut header);
+        tis.write_all(&header)?;
+        tii.write_all(&header)?;
 
-    // state of the previous term in the .tis (borrows term text from `terms`, no clone)
-    let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
-                                                          // state of the last sample in the .tii
-    let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
-    let mut last_index_position: u64 = 24;
+        // initial synthetic .tii entry (hand-written, NOT via dump_entry):
+        // the field number is a raw Int 0xFFFFFFFF, not a VInt.
+        let mut synthetic = Vec::new();
+        write_vint(&mut synthetic, 0); // prefixChars
+        write_modified_utf8(&mut synthetic, ""); // empty suffix
+        write_i32_be(&mut synthetic, -1); // 0xFFFFFFFF
+        synthetic.push(0x0F);
+        write_vint(&mut synthetic, 0); // docFreq
+        write_vint(&mut synthetic, 0); // freqDelta
+        write_vint(&mut synthetic, 0); // proxDelta
+        write_vint(&mut synthetic, 24); // IndexDelta
+        tii.write_all(&synthetic)?;
 
-    for (i, term) in terms.iter().enumerate() {
-        let (freq_ptr, prox_ptr) = write_term_postings(&mut frq, &mut prx, &term.docs);
-        let doc_freq = term.doc_freq();
-
-        dump_entry(&mut tis, prev, term, doc_freq, freq_ptr, prox_ptr);
-        prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
-
-        // sample every indexInterval terms
-        if (i as u64 + 1).is_multiple_of(INDEX_INTERVAL) {
-            dump_entry(&mut tii, idx_prev, term, doc_freq, freq_ptr, prox_ptr);
-            let index_position = tis.len() as u64;
-            write_vint(&mut tii, index_position - last_index_position);
-            last_index_position = index_position;
-            idx_prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
-        }
+        Ok(Self {
+            tis,
+            tii,
+            frq,
+            prx,
+            tis_len: header.len() as u64, // 24: header is already on disk
+            frq_len: 0,
+            prx_len: 0,
+            prev: None,
+            idx_prev: None,
+            last_index_position: 24,
+            term_count: 0,
+        })
     }
 
-    let term_count = terms.len() as u64;
-    patch_long(&mut tis, 4, term_count);
-    let tii_count = (term_count - term_count % INDEX_INTERVAL) / INDEX_INTERVAL + 1;
-    patch_long(&mut tii, 4, tii_count);
+    /// Appends one term's dictionary entry (`.tis`, and `.tii` every `INDEX_INTERVAL`th
+    /// term) plus its postings (`.frq`/`.prx`). Terms must arrive in ZSL canonical order.
+    pub fn add_term(&mut self, term: &TermPostings) -> io::Result<()> {
+        // `write_term_postings` only depends on `term.docs` (it resets its own doc/position
+        // deltas per call), so writing into fresh local buffers reproduces the exact same
+        // bytes as appending into a running `.frq`/`.prx` buffer; the absolute pointers are
+        // then our own running lengths rather than the (always-zero) buffer-local ones.
+        let mut frq_buf = Vec::new();
+        let mut prx_buf = Vec::new();
+        write_term_postings(&mut frq_buf, &mut prx_buf, &term.docs);
+        let freq_ptr = self.frq_len;
+        let prox_ptr = self.prx_len;
 
-    DictFiles { tis, tii, frq, prx }
+        let doc_freq = term.doc_freq();
+
+        let mut tis_entry = Vec::new();
+        dump_entry(
+            &mut tis_entry,
+            self.prev
+                .as_ref()
+                .map(|(t, f, fp, pp)| (t.as_str(), *f, *fp, *pp)),
+            term,
+            doc_freq,
+            freq_ptr,
+            prox_ptr,
+        );
+        self.tis.write_all(&tis_entry)?;
+        self.tis_len += tis_entry.len() as u64;
+        self.prev = Some((term.text.clone(), term.field_num, freq_ptr, prox_ptr));
+
+        self.frq.write_all(&frq_buf)?;
+        self.frq_len += frq_buf.len() as u64;
+        self.prx.write_all(&prx_buf)?;
+        self.prx_len += prx_buf.len() as u64;
+
+        self.term_count += 1;
+        // sample every indexInterval terms
+        if self.term_count.is_multiple_of(INDEX_INTERVAL) {
+            let mut tii_entry = Vec::new();
+            dump_entry(
+                &mut tii_entry,
+                self.idx_prev
+                    .as_ref()
+                    .map(|(t, f, fp, pp)| (t.as_str(), *f, *fp, *pp)),
+                term,
+                doc_freq,
+                freq_ptr,
+                prox_ptr,
+            );
+            let index_position = self.tis_len;
+            write_vint(&mut tii_entry, index_position - self.last_index_position);
+            self.last_index_position = index_position;
+            self.tii.write_all(&tii_entry)?;
+            self.idx_prev = Some((term.text.clone(), term.field_num, freq_ptr, prox_ptr));
+        }
+
+        Ok(())
+    }
+
+    /// Back-patches the 8-byte term counts at offset 4 in `.tis`/`.tii` and flushes all
+    /// four sinks.
+    pub fn finish(mut self) -> io::Result<()> {
+        let term_count = self.term_count;
+        self.tis.seek(SeekFrom::Start(4))?;
+        self.tis.write_all(&term_count.to_be_bytes())?;
+
+        let tii_count = (term_count - term_count % INDEX_INTERVAL) / INDEX_INTERVAL + 1;
+        self.tii.seek(SeekFrom::Start(4))?;
+        self.tii.write_all(&tii_count.to_be_bytes())?;
+
+        self.tis.flush()?;
+        self.tii.flush()?;
+        self.frq.flush()?;
+        self.prx.flush()?;
+        Ok(())
+    }
+}
+
+pub fn write_term_dict(terms: &[TermPostings]) -> DictFiles {
+    let mut tis = io::Cursor::new(Vec::new());
+    let mut tii = io::Cursor::new(Vec::new());
+    let mut frq = Vec::new();
+    let mut prx = Vec::new();
+    {
+        let mut writer = TermDictStreamWriter::new(&mut tis, &mut tii, &mut frq, &mut prx)
+            .expect("writing to an in-memory Vec<u8> cannot fail");
+        for term in terms {
+            writer
+                .add_term(term)
+                .expect("writing to an in-memory Vec<u8> cannot fail");
+        }
+        writer
+            .finish()
+            .expect("writing to an in-memory Vec<u8> cannot fail");
+    }
+
+    DictFiles {
+        tis: tis.into_inner(),
+        tii: tii.into_inner(),
+        frq,
+        prx,
+    }
 }
 
 fn write_header(out: &mut Vec<u8>) {
@@ -82,10 +205,6 @@ fn write_header(out: &mut Vec<u8>) {
     write_i32_be(out, INDEX_INTERVAL as i32);
     write_i32_be(out, SKIP_INTERVAL);
     write_i32_be(out, MAX_SKIP_LEVELS);
-}
-
-fn patch_long(buf: &mut [u8], offset: usize, v: u64) {
-    buf[offset..offset + 8].copy_from_slice(&v.to_be_bytes());
 }
 
 /// Writes a term dict entry. Shares a prefix with `prev` only if it is of the SAME
@@ -235,5 +354,198 @@ mod tests {
         let dict = TermDict::read(&f.tis, &field_names(&inv)).unwrap();
         assert_eq!(dict.info("t", "w0000").unwrap().doc_freq, 1);
         assert_eq!(dict.info("t", "w0299").unwrap().doc_freq, 1);
+    }
+
+    /// Builds a hand-crafted, ZSL-canonically-sorted term list covering: multiple fields,
+    /// shared prefixes within a field, >128 terms (to exercise `.tii` sampling AND the
+    /// term-count back-patch), and multi-doc postings with positions.
+    fn multi_field_sample_terms() -> Vec<TermPostings> {
+        let mut terms = Vec::new();
+
+        // field 0 ("body"): 150 terms sharing the "shared" prefix, sorted ascending, so
+        // consecutive terms within the field share a common prefix. Some have multi-doc
+        // postings with positions to exercise freq/prox deltas.
+        for i in 0..150usize {
+            let text = format!("shared{i:04}");
+            let docs = if i % 10 == 0 {
+                vec![(i, vec![0u32, 3]), (i + 1000, vec![1u32])]
+            } else {
+                vec![(i, vec![0u32])]
+            };
+            terms.push(TermPostings {
+                field_num: 0,
+                text,
+                docs,
+            });
+        }
+
+        // field 1 ("title"): a handful of terms, some sharing prefixes, to make sure
+        // prefix-sharing does NOT leak across fields (field 0's last term is "shared0149").
+        for (text, docs) in [
+            ("alpha".to_string(), vec![(2usize, vec![5u32])]),
+            ("alphabet".to_string(), vec![(3usize, vec![0u32, 1, 2])]),
+            ("beta".to_string(), vec![(4usize, vec![7u32])]),
+        ] {
+            terms.push(TermPostings {
+                field_num: 1,
+                text,
+                docs,
+            });
+        }
+
+        terms
+    }
+
+    // --- independent oracle: the ORIGINAL (pre-streaming, commit 0654030) `write_term_dict`
+    // algorithm, duplicated here under `reference_*` names so it does NOT call into the
+    // current module's `dump_entry`/`common_prefix`/`write_header`/`write_term_dict` — those
+    // are now shared with `TermDictStreamWriter`, so comparing against them would make the
+    // byte-identity test compare the streaming writer against itself (tautological). Only
+    // `write_term_postings` (from `super`) is reused, since it is untouched by the streaming
+    // refactor and doesn't participate in the pointer/prefix-delta logic under test.
+
+    fn reference_write_term_dict(terms: &[TermPostings]) -> DictFiles {
+        let mut tis = Vec::new();
+        let mut tii = Vec::new();
+        let mut frq = Vec::new();
+        let mut prx = Vec::new();
+
+        reference_write_header(&mut tis);
+        reference_write_header(&mut tii);
+
+        // initial synthetic .tii entry (hand-written, NOT via dump_entry):
+        // the field number is a raw Int 0xFFFFFFFF, not a VInt.
+        write_vint(&mut tii, 0); // prefixChars
+        write_modified_utf8(&mut tii, ""); // empty suffix
+        write_i32_be(&mut tii, -1); // 0xFFFFFFFF
+        tii.push(0x0F);
+        write_vint(&mut tii, 0); // docFreq
+        write_vint(&mut tii, 0); // freqDelta
+        write_vint(&mut tii, 0); // proxDelta
+        write_vint(&mut tii, 24); // IndexDelta
+
+        // state of the previous term in the .tis
+        let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
+                                                              // state of the last sample in the .tii
+        let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
+        let mut last_index_position: u64 = 24;
+
+        for (i, term) in terms.iter().enumerate() {
+            let (freq_ptr, prox_ptr) = write_term_postings(&mut frq, &mut prx, &term.docs);
+            let doc_freq = term.doc_freq();
+
+            reference_dump_entry(&mut tis, prev, term, doc_freq, freq_ptr, prox_ptr);
+            prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
+
+            // sample every indexInterval terms
+            if (i as u64 + 1).is_multiple_of(INDEX_INTERVAL) {
+                reference_dump_entry(&mut tii, idx_prev, term, doc_freq, freq_ptr, prox_ptr);
+                let index_position = tis.len() as u64;
+                write_vint(&mut tii, index_position - last_index_position);
+                last_index_position = index_position;
+                idx_prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
+            }
+        }
+
+        let term_count = terms.len() as u64;
+        reference_patch_long(&mut tis, 4, term_count);
+        let tii_count = (term_count - term_count % INDEX_INTERVAL) / INDEX_INTERVAL + 1;
+        reference_patch_long(&mut tii, 4, tii_count);
+
+        DictFiles { tis, tii, frq, prx }
+    }
+
+    fn reference_write_header(out: &mut Vec<u8>) {
+        write_i32_be(out, MARKER);
+        write_i64_be(out, 0); // placeholder termCount (back-patched at offset 4)
+        write_i32_be(out, INDEX_INTERVAL as i32);
+        write_i32_be(out, SKIP_INTERVAL);
+        write_i32_be(out, MAX_SKIP_LEVELS);
+    }
+
+    fn reference_patch_long(buf: &mut [u8], offset: usize, v: u64) {
+        buf[offset..offset + 8].copy_from_slice(&v.to_be_bytes());
+    }
+
+    /// Writes a term dict entry. Shares a prefix with `prev` only if it is of the SAME
+    /// field; writes freq/prox as a delta relative to `prev`, or absolute if `prev` is None.
+    fn reference_dump_entry(
+        out: &mut Vec<u8>,
+        prev: Option<(&str, usize, u64, u64)>,
+        term: &TermPostings,
+        doc_freq: u32,
+        freq_ptr: u64,
+        prox_ptr: u64,
+    ) {
+        let (prefix_chars, prefix_bytes) = match prev {
+            Some((ptext, pfield, ..)) if pfield == term.field_num => {
+                reference_common_prefix(ptext, &term.text)
+            }
+            _ => (0, 0),
+        };
+        write_vint(out, prefix_chars as u64);
+        write_modified_utf8(out, &term.text[prefix_bytes..]);
+        write_vint(out, term.field_num as u64);
+        write_vint(out, doc_freq as u64);
+        match prev {
+            Some((_, _, pf, pp)) => {
+                write_vint(out, freq_ptr - pf);
+                write_vint(out, prox_ptr - pp);
+            }
+            None => {
+                write_vint(out, freq_ptr);
+                write_vint(out, prox_ptr);
+            }
+        }
+        // skipOffset is omitted: docFreq is always < skipInterval.
+    }
+
+    /// Common prefix in (chars, bytes). Matching chars ⟺ matching bytes (UTF-8),
+    /// so counting equal leading chars reproduces ZSL's byte-then-char calculation.
+    fn reference_common_prefix(a: &str, b: &str) -> (usize, usize) {
+        let mut chars = 0usize;
+        let mut bytes = 0usize;
+        for (ca, cb) in a.chars().zip(b.chars()) {
+            if ca == cb {
+                chars += 1;
+                bytes += ca.len_utf8();
+            } else {
+                break;
+            }
+        }
+        (chars, bytes)
+    }
+
+    #[test]
+    fn stream_writer_matches_batch_writer_byte_for_byte() {
+        let terms = multi_field_sample_terms();
+        assert!(
+            terms.len() > 128,
+            "must exceed indexInterval to test .tii sampling + patch"
+        );
+
+        // Independent oracle: the pre-streaming reference implementation (duplicated from
+        // git commit 0654030, before `write_term_dict` became a thin wrapper over
+        // `TermDictStreamWriter`), NOT `write_term_dict` itself (which now shares its code
+        // with the streaming writer under test and would make this comparison tautological).
+        let expected = reference_write_term_dict(&terms);
+
+        let mut tis = std::io::Cursor::new(Vec::new());
+        let mut tii = std::io::Cursor::new(Vec::new());
+        let mut frq = Vec::new();
+        let mut prx = Vec::new();
+        {
+            let mut writer =
+                TermDictStreamWriter::new(&mut tis, &mut tii, &mut frq, &mut prx).unwrap();
+            for term in &terms {
+                writer.add_term(term).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        assert_eq!(tis.into_inner(), expected.tis, "tis mismatch");
+        assert_eq!(tii.into_inner(), expected.tii, "tii mismatch");
+        assert_eq!(frq, expected.frq, "frq mismatch");
+        assert_eq!(prx, expected.prx, "prx mismatch");
     }
 }

@@ -53,6 +53,59 @@ pub fn segment_name(counter: u32) -> String {
     format!("_{}", to_base36(counter as u64))
 }
 
+/// inverse of `to_base36`: parses a lowercase base-36 string to a number. `None` if any
+/// byte isn't a valid base-36 digit or the string is empty — defensive, so a file we don't
+/// recognize is never touched by the generation-manifest pruning below.
+fn from_base36(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for b in s.bytes() {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'z' => b - b'a' + 10,
+            _ => return None,
+        };
+        n = n.checked_mul(36)?.checked_add(digit as u64)?;
+    }
+    Some(n)
+}
+
+/// Best-effort deletion of stale generation manifests: any `segments_<base36>` whose parsed
+/// number is strictly less than `keep_from_gen`. Only ever touches files matching that exact
+/// pattern — never `segments.gen`, never `.cfs`/`.del`/`.sti`/`.tmp`/lock files, never the
+/// legacy no-suffix `segments` (generation 0) file. Comparison is NUMERIC (parsed), not
+/// lexical, so e.g. `segments_10` (36) is correctly treated as newer than `segments_z` (35).
+/// Individual `read_dir`/`remove_file` errors are ignored (mirrors the orphan `.cfs` cleanup
+/// in `IndexWriter::optimize`): this is housekeeping, never load-bearing for correctness.
+///
+/// MUST be called only AFTER `segments.gen` has been durably flipped to the new generation.
+/// Callers pass `keep_from_gen = new_gen - 1` so both the current generation and the
+/// immediately-previous one survive — a grace window for lock-free concurrent readers that
+/// may have read the old `segments.gen` value an instant before the flip and are about to
+/// open the generation manifest it pointed to.
+fn prune_old_generations(index_dir: &Path, keep_from_gen: u64) {
+    let entries = match std::fs::read_dir(index_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix("segments_") else {
+            continue;
+        };
+        let Some(n) = from_base36(suffix) else {
+            continue;
+        };
+        if n < keep_from_gen {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn read_gen_number(index_dir: &Path) -> std::io::Result<u64> {
     let data = std::fs::read(index_dir.join("segments.gen"))?;
     let mut pos = 0usize;
@@ -219,6 +272,9 @@ pub fn write_generation_with_delgens(
     write_i64_be(&mut g, new_gen as i64);
     super::durability::write_atomic(&index_dir.join("segments.gen"), &g)?;
 
+    // best-effort prune of stale generation manifests, only now that the flip is durable.
+    prune_old_generations(index_dir, new_gen.saturating_sub(1));
+
     Ok(new_gen)
 }
 
@@ -262,6 +318,9 @@ pub fn write_optimized_generation(
     write_i64_be(&mut g, new_gen as i64);
     write_i64_be(&mut g, new_gen as i64);
     super::durability::write_atomic(&index_dir.join("segments.gen"), &g)?;
+
+    // best-effort prune of stale generation manifests, only now that the flip is durable.
+    prune_old_generations(index_dir, new_gen.saturating_sub(1));
 
     Ok(new_gen)
 }
@@ -430,6 +489,59 @@ mod tests {
         assert_eq!(reread.generation, new_gen);
         assert_eq!(reread.format, FORMAT_2_3);
         assert_eq!(reread.seg_count, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_generation_with_delgens_prunes_old_manifests_keeps_current_and_previous() {
+        use std::collections::HashMap;
+        let dir = temp_kb_gen(); // KB: segments_6 (gen 6) + segments.gen
+        let mut gen = read_generation(&dir).unwrap();
+        for _ in 0..5 {
+            let new_gen = write_generation_with_delgens(&dir, &gen, &HashMap::new(), &[]).unwrap();
+            gen = read_generation(&dir).unwrap();
+            assert_eq!(gen.generation, new_gen);
+        }
+        // 5 flips from gen 6 -> gen 11.
+        assert_eq!(gen.generation, 11);
+
+        // strictly-older-than-previous manifests are gone (base36: 6,7,8,9 == same digits).
+        assert!(!dir.join("segments_6").exists());
+        assert!(!dir.join("segments_7").exists());
+        assert!(!dir.join("segments_8").exists());
+        assert!(!dir.join("segments_9").exists());
+        // current (11 == "b") and immediately-previous (10 == "a") survive.
+        assert!(dir.join(format!("segments_{}", to_base36(10))).exists());
+        assert!(dir.join(format!("segments_{}", to_base36(11))).exists());
+        // never touch segments.gen.
+        assert!(dir.join("segments.gen").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_uses_numeric_not_lexical_comparison_across_base36_rollover() {
+        use std::collections::HashMap;
+        let dir = temp_kb_gen(); // KB: gen 6
+        let mut gen = read_generation(&dir).unwrap();
+        // advance past the base36 rollover ("z" = 35 -> "10" = 36) with margin.
+        while gen.generation < 40 {
+            write_generation_with_delgens(&dir, &gen, &HashMap::new(), &[]).unwrap();
+            gen = read_generation(&dir).unwrap();
+        }
+        assert_eq!(gen.generation, 40);
+
+        // a lexical-comparison bug would keep "segments_z" forever (the string "z" sorts
+        // after "10"/"13"/etc.); numeric comparison must have pruned it (35 < 40-1).
+        assert!(!dir.join("segments_z").exists());
+        assert!(!dir.join("segments_10").exists()); // 36, also strictly older than 39
+
+        // current (40) and immediately-previous (39) survive.
+        let prev_name = format!("segments_{}", to_base36(39));
+        let cur_name = format!("segments_{}", to_base36(40));
+        assert!(dir.join(&prev_name).exists());
+        assert!(dir.join(&cur_name).exists());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

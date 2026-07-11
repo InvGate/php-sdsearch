@@ -6,7 +6,7 @@ use crate::zsl::fields::{read_field_infos, FieldInfo};
 use crate::zsl::norms::{approx_field_len, read_norms};
 use crate::zsl::postings::{read_all_positions, read_freqs, read_positions};
 use crate::zsl::stored::{read_stored_fields, read_stored_raw, StoredRaw};
-use crate::zsl::terms::TermDict;
+use crate::zsl::terms::{TermCursor, TermDict};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -56,6 +56,14 @@ impl ZslSegment {
     /// all `(field, text)` terms of the segment (to walk them during the merge).
     pub fn all_terms(&self) -> Vec<(String, String)> {
         self.dict.iter_terms()
+    }
+
+    /// lazy cursor over every `(field, term)` pair in ZSL canonical order
+    /// (field names ascending, terms ascending within each field), without
+    /// materializing a `Vec` of all terms like `all_terms` does. Used by the
+    /// bounded-memory k-way streaming merge.
+    pub fn term_cursor(&self) -> TermCursor<'_> {
+        self.dict.cursor()
     }
 
     /// stored fields of a doc in write order (LOCAL field_num + tokenized flag).
@@ -327,6 +335,40 @@ mod tests {
         std::fs::write(dir.join("_x.cfs"), [0x80u8]).unwrap(); // 1-byte garbage .cfs
         assert!(ZslSegment::open(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seg_kb() -> ZslSegment {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        // KB has a single segment "_2" with no deletes (del_gen -1); it spans
+        // several stored/indexed fields, unlike the tiny "zsl_index" fixture.
+        ZslSegment::open_named(&dir, "_2", -1).unwrap()
+    }
+
+    #[test]
+    fn term_cursor_yields_all_terms_in_zsl_canonical_order() {
+        let s = seg_kb();
+        let mut expected = s.all_terms();
+        expected.sort();
+
+        // sanity: the fixture must actually exercise field-name ordering, not
+        // just within-field term ordering.
+        let distinct_fields: std::collections::HashSet<&String> =
+            expected.iter().map(|(f, _)| f).collect();
+        assert!(
+            distinct_fields.len() >= 2,
+            "fixture has too few fields to exercise field ordering: {distinct_fields:?}"
+        );
+
+        let mut got: Vec<(String, String)> = Vec::new();
+        let mut cur = s.term_cursor();
+        while let Some((field, term)) = cur.peek() {
+            got.push((field.to_string(), term.to_string()));
+            cur.advance();
+        }
+        assert_eq!(got, expected);
     }
 
     #[test]

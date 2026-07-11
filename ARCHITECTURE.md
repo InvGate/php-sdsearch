@@ -89,7 +89,11 @@ Key properties:
 
 - **Bounded memory.** Documents are buffered up to a configurable cap and flushed to a
   new segment file before the cap is reached, so indexing a large batch does not require
-  holding the whole inverted index in RAM.
+  holding the whole inverted index in RAM. `optimize()` is bounded too: it merges as a
+  streaming, k-way pass (see below), keeping only a per-term working set plus small
+  O(document-count) bookkeeping resident, so its peak heap does not scale with the corpus's
+  total text volume. (One caveat: a single extremely frequent term still materializes its
+  own full posting list transiently during the merge.)
 - **Segments are invisible until commit.** A flushed segment file exists on disk but is
   not referenced by any generation record until `commit()` writes the new
   `segments_N` listing it. If the process dies mid-batch, the on-disk generation still
@@ -102,7 +106,13 @@ Key properties:
   Recomputing anything from the original text (re-tokenizing, re-scoring norms) would
   reintroduce drift the merge is specifically designed to avoid; the merged segment must
   be indistinguishable, byte-for-byte in content, from what the legacy engine's own
-  merge would have produced.
+  merge would have produced. The merge runs as a single streaming pass: a k-way merge over
+  the input segments' term cursors emits the merged term dictionary in order while the large
+  postings/positions/stored blocks are streamed to temp files
+  (`<merged>.fdt.tmp`/`.frq.tmp`/`.prx.tmp` in the index dir) and assembled into the final
+  compound file — so the whole merged index is never held in RAM. The older in-RAM merge
+  (`merge_segments`) is retained only as the differential-test oracle that pins this
+  streaming path byte-for-byte.
 - **Ordered, crash-safe durability.** `durability.rs` writes new segment/generation data
   and only then atomically flips the pointer that makes it visible (`segments.gen`),
   fsyncing before the flip on the merge path; unreferenced leftovers from an interrupted
