@@ -264,6 +264,7 @@ impl IndexWriter {
             &self.base,
             &del_gen_overrides,
             &flushed,
+            self.next_name_counter,
         )?;
 
         Ok(CommitReport {
@@ -315,6 +316,33 @@ mod tests {
         WriterDoc {
             fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))],
         }
+    }
+
+    #[test]
+    fn committed_name_counter_equals_writer_high_water_mark() {
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 1, // one segment per doc
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("title", "zqa one")],
+        })
+        .unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("title", "zqb two")],
+        })
+        .unwrap();
+        let hwm = w.next_name_counter; // after flushes, before commit
+        w.commit().unwrap();
+
+        let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
+        assert_eq!(
+            gen.name_counter, hwm,
+            "committed generation name_counter must equal the writer's high-water mark"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
