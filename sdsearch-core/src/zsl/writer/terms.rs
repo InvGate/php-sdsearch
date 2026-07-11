@@ -164,6 +164,11 @@ where
     /// `write_term_postings`'s per-doc loop: `docDelta*2 (+1 if freq==1)`, else
     /// `docDelta*2` followed by `VInt(freq)`; positions as per-doc deltas in `.prx`.
     pub fn add_posting(&mut self, new_doc_id: usize, positions: &[u32]) -> io::Result<()> {
+        debug_assert!(
+            self.cur_doc_freq == 0 || new_doc_id > self.cur_prev_doc,
+            "add_posting: doc ids must be strictly ascending within a term (got {new_doc_id} after {})",
+            self.cur_prev_doc
+        );
         let doc_delta = (new_doc_id - self.cur_prev_doc) * 2;
         if positions.len() > 1 {
             write_vint(&mut self.frq_scratch, doc_delta as u64);
@@ -204,6 +209,10 @@ where
         let doc_freq = self.cur_doc_freq;
         let freq_ptr = self.cur_freq_ptr;
         let prox_ptr = self.cur_prox_ptr;
+        // Reset before writing so a stray second `end_term` (without an intervening
+        // `begin_term`) sees `cur_doc_freq == 0` and is dropped above, instead of
+        // re-emitting a duplicate `.tis`/`.tii` entry for the same term.
+        self.cur_doc_freq = 0;
         self.dump_tis_entry(field_num, &text, doc_freq, freq_ptr, prox_ptr)
     }
 
@@ -706,6 +715,16 @@ mod tests {
         assert_eq!(a_tii, b_tii, "tii mismatch");
         assert_eq!(a_frq, b_frq, "frq mismatch");
         assert_eq!(a_prx, b_prx, "prx mismatch");
+    }
+
+    #[test]
+    #[should_panic(expected = "doc ids must be strictly ascending")]
+    #[cfg(debug_assertions)]
+    fn add_posting_panics_on_non_ascending_doc_id() {
+        let mut w = new_stream_writer_over_cursors();
+        w.begin_term(0, "term").unwrap();
+        w.add_posting(5, &[0]).unwrap();
+        w.add_posting(3, &[0]).unwrap(); // not ascending: must panic
     }
 
     #[test]
