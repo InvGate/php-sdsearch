@@ -131,8 +131,66 @@ fn gen_docs(n: usize) -> Vec<WriterDoc> {
         .collect()
 }
 
+/// copies an arbitrary index dir to `dst` (skips lock files and `.sti`). Overwrites `dst`.
+fn copy_index(src: &Path, dst: &Path) {
+    if dst.is_dir() {
+        std::fs::remove_dir_all(dst).ok();
+    }
+    std::fs::create_dir_all(dst).expect("create scratch dir");
+    for entry in std::fs::read_dir(src).expect("read source index") {
+        let p = entry.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        if name.contains("lock") || name.ends_with(".sti") {
+            continue;
+        }
+        std::fs::copy(&p, dst.join(&name)).expect("copy index file");
+    }
+}
+
+/// `optimize_bench existing <index_dir> <n_extra> <scratch_dir>`: copies a REAL index to a
+/// disk-backed scratch, adds `n_extra` tiny docs (cap=1 → one segment each) to force a
+/// multi-segment optimize, then measures optimize() over the whole corpus.
+fn run_existing(args: &[String]) {
+    let src = Path::new(args.get(2).expect("usage: optimize_bench existing <dir> <n_extra> <scratch>"));
+    let n_extra: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let scratch = Path::new(args.get(4).expect("scratch dir required (use a disk-backed path)"));
+
+    copy_index(src, scratch);
+
+    {
+        let opts = WriterOpts { max_buffered_docs: 1, ..WriterOpts::default() };
+        let mut w = IndexWriter::open(scratch, opts).expect("open (build) failed");
+        for d in gen_docs(n_extra) {
+            w.add_document(d).expect("add_document failed");
+        }
+        w.commit().expect("commit failed");
+    }
+
+    let segments_before = sdsearch_core::zsl::segments::read_segment_infos(scratch)
+        .expect("read segment infos")
+        .len();
+
+    reset_peak();
+    let t0 = std::time::Instant::now();
+    let w = IndexWriter::open(scratch, WriterOpts::default()).expect("open (optimize) failed");
+    let report = w.optimize().expect("optimize failed");
+    let optimize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let heap_peak_kb = PEAK.load(Ordering::Relaxed) as u64 / 1024;
+
+    println!(
+        "{{\"source\":\"{}\",\"n_extra\":{},\"segments_before\":{},\"doc_count\":{},\"optimize_ms\":{:.2},\"heap_peak_kb\":{},\"vmhwm_kb\":{}}}",
+        src.display(), n_extra, segments_before, report.doc_count, optimize_ms, heap_peak_kb, vmhwm_kb()
+    );
+
+    std::fs::remove_dir_all(scratch).ok();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("existing") {
+        run_existing(&args);
+        return;
+    }
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
     let cap: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
 
