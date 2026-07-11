@@ -274,6 +274,7 @@ pub fn write_generation_with_new_segments(
         gen,
         &std::collections::HashMap::new(),
         new_segments,
+        gen.name_counter + new_segments.len() as u32,
     )
 }
 
@@ -286,12 +287,13 @@ pub fn write_generation_with_delgens(
     gen: &Generation,
     del_gen_overrides: &std::collections::HashMap<String, i64>,
     new_segments: &[NewSegment],
+    name_counter: u32,
 ) -> std::io::Result<u64> {
     let added = new_segments.len() as u32;
     let mut out = Vec::new();
     write_u32_be(&mut out, gen.format);
     write_i64_be(&mut out, (gen.version + 1) as i64);
-    write_u32_be(&mut out, gen.name_counter + added);
+    write_u32_be(&mut out, name_counter); // high-water mark, not gen.name_counter + added
     write_u32_be(&mut out, gen.seg_count + added);
 
     // existing records verbatim (copy), then in-place delGen patch for the overrides.
@@ -542,7 +544,8 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert("_2".to_string(), 1i64);
 
-        let new_gen = write_generation_with_delgens(&dir, &gen, &overrides, &[]).unwrap();
+        let new_gen =
+            write_generation_with_delgens(&dir, &gen, &overrides, &[], gen.name_counter).unwrap();
         assert_eq!(new_gen, 7);
 
         // the trusted reader sees _2 with delGen bumped to 1, docCount intact
@@ -606,7 +609,9 @@ mod tests {
         let dir = temp_kb_gen(); // KB: segments_6 (gen 6) + segments.gen
         let mut gen = read_generation(&dir).unwrap();
         for _ in 0..5 {
-            let new_gen = write_generation_with_delgens(&dir, &gen, &HashMap::new(), &[]).unwrap();
+            let new_gen =
+                write_generation_with_delgens(&dir, &gen, &HashMap::new(), &[], gen.name_counter)
+                    .unwrap();
             gen = read_generation(&dir).unwrap();
             assert_eq!(gen.generation, new_gen);
         }
@@ -634,7 +639,8 @@ mod tests {
         let mut gen = read_generation(&dir).unwrap();
         // advance past the base36 rollover ("z" = 35 -> "10" = 36) with margin.
         while gen.generation < 40 {
-            write_generation_with_delgens(&dir, &gen, &HashMap::new(), &[]).unwrap();
+            write_generation_with_delgens(&dir, &gen, &HashMap::new(), &[], gen.name_counter)
+                .unwrap();
             gen = read_generation(&dir).unwrap();
         }
         assert_eq!(gen.generation, 40);
