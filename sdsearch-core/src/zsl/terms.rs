@@ -30,6 +30,15 @@ impl FieldTerms {
     fn term(&self, i: usize) -> &[u8] {
         &self.text[self.offsets[i] as usize..self.offsets[i + 1] as usize]
     }
+    /// zero-copy `&str` view of term `i`. `text` is built exclusively from
+    /// `String`s (`read_modified_utf8` decodes into a real `String`, never raw
+    /// bytes) and `offsets` only ever land on whole-term boundaries, so every
+    /// slice is guaranteed valid UTF-8 — no lossy/alloc path needed here,
+    /// unlike `iter_terms`'s owned `String::from_utf8_lossy`.
+    fn term_str(&self, i: usize) -> &str {
+        std::str::from_utf8(self.term(i))
+            .expect("FieldTerms invariant violated: term bytes are valid UTF-8")
+    }
 }
 
 pub struct TermDict {
@@ -138,6 +147,14 @@ impl TermDict {
         out
     }
 
+    /// lazy cursor over every `(field, term)` pair in ZSL canonical order
+    /// (`fieldName · \0 · text`, i.e. field names ascending, terms ascending
+    /// within each field). Unlike `iter_terms`, never materializes a `Vec` of
+    /// all terms up front — the k-way streaming merge walks this instead.
+    pub fn cursor(&self) -> TermCursor<'_> {
+        TermCursor::new(self)
+    }
+
     /// Enumerates ALL terms as `(field, text)`. Order not guaranteed (grouped by
     /// field, each field ascending). Used by the merge to walk each source segment's
     /// terms and copy their postings via `positions_all(field, text)`.
@@ -152,6 +169,60 @@ impl TermDict {
             }
         }
         out
+    }
+}
+
+/// Lazy cursor over all `(field, term)` pairs of a `TermDict`, in ZSL
+/// canonical order (field names sorted ascending, terms ascending within each
+/// field — equivalent to sorting `(fieldName, text)` tuples since `\0` is the
+/// minimum byte and never appears inside a field name or term). Backed
+/// directly by each field's already-sorted `FieldTerms` buffer: no `Vec` of
+/// all terms is built up front, so memory stays bounded regardless of how
+/// many terms the segment holds.
+pub struct TermCursor<'a> {
+    dict: &'a TermDict,
+    fields: Vec<&'a str>,
+    field_idx: usize,
+    term_idx: usize,
+}
+
+impl<'a> TermCursor<'a> {
+    fn new(dict: &'a TermDict) -> TermCursor<'a> {
+        let mut fields: Vec<&str> = dict.by_field.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        TermCursor {
+            dict,
+            fields,
+            field_idx: 0,
+            term_idx: 0,
+        }
+    }
+
+    /// current `(field, term)` pair, or `None` once every field is exhausted.
+    pub fn peek(&self) -> Option<(&str, &str)> {
+        let field = *self.fields.get(self.field_idx)?;
+        let ft = self
+            .dict
+            .by_field
+            .get(field)
+            .expect("field came from this dict's own key set");
+        Some((field, ft.term_str(self.term_idx)))
+    }
+
+    /// moves to the next pair in canonical order. No-op once exhausted.
+    pub fn advance(&mut self) {
+        if self.field_idx >= self.fields.len() {
+            return;
+        }
+        self.term_idx += 1;
+        // `by_field` only ever holds fields with >=1 term (a field is inserted
+        // lazily, on its first term, while reading `.tis`), so the next field
+        // (if any) is guaranteed non-empty — no need to loop-skip empties.
+        let current_len = self.dict.by_field[self.fields[self.field_idx]].len();
+        if self.term_idx >= current_len {
+            self.field_idx += 1;
+            self.term_idx = 0;
+        }
     }
 }
 
