@@ -803,6 +803,80 @@ mod tests {
     }
 
     #[test]
+    fn compacted_batch_matches_uncompacted_and_keeps_names_monotonic() {
+        // Build the SAME docs two ways: with a small ceiling (forces compaction) and with the
+        // policy disabled (max_segments = 0). After commit + optimize both must yield the same
+        // live doc count and the same query results.
+        let docs: Vec<WriterDoc> = (0..25)
+            .map(|i| WriterDoc {
+                fields: vec![
+                    WriterField::text("title", &format!("zqmerge shared unique{i}")),
+                    WriterField::keyword("id", &format!("KB-{i}")),
+                ],
+            })
+            .collect();
+
+        let run = |max_segments: usize| -> (usize, usize, usize) {
+            let dir = temp_kb_full();
+            let opts = WriterOpts {
+                max_buffered_docs: 1,
+                max_segments,
+                ..WriterOpts::default()
+            };
+            let mut w = IndexWriter::open(&dir, opts).unwrap();
+            for d in &docs {
+                w.add_document(d.clone()).unwrap();
+            }
+            w.optimize().unwrap(); // end-of-batch optimize, unchanged
+
+            // after optimize the index is a single segment; name_counter must be >= every used name.
+            let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
+            let next = crate::zsl::writer::segments::segment_name(gen.name_counter);
+            assert!(
+                !dir.join(format!("{next}.cfs")).exists(),
+                "name_counter {} collides with an existing segment file",
+                gen.name_counter
+            );
+
+            let idx = ZslIndex::open(&dir).unwrap();
+            let n = idx.num_docs();
+            let df_shared = idx.doc_freq("title", "shared");
+            let df_unique = idx.doc_freq("title", "unique7");
+            std::fs::remove_dir_all(&dir).ok();
+            (n, df_shared, df_unique)
+        };
+
+        let capped = run(4); // forces several compactions
+        let disabled = run(0); // no intra-batch compaction
+        assert_eq!(capped, disabled, "compacted result must equal uncompacted");
+        assert_eq!(capped.0, 20 + 25, "20 base + 25 added, all live");
+        assert_eq!(capped.1, 25, "every added doc has 'shared'");
+        assert_eq!(capped.2, 1, "'unique7' appears in exactly one doc");
+    }
+
+    #[test]
+    fn max_segments_zero_never_compacts() {
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            max_segments: 0, // disabled
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        for i in 0..8 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("zqz d{i}"))],
+            })
+            .unwrap();
+        }
+        // no compaction: every doc produced its own flushed segment, none merged away.
+        assert_eq!(w.flushed.len(), 8, "disabled policy must not compact");
+        w.commit().unwrap();
+        assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 20 + 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn empty_commit_is_a_noop() {
         let dir = temp_kb_full();
         let w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
