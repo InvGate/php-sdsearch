@@ -595,6 +595,99 @@ mod tests {
     }
 
     #[test]
+    fn commit_prunes_old_generation_manifests_keeping_current_and_previous() {
+        let dir = temp_kb_full(); // KB: gen 6 (segments_6)
+        assert!(dir.join("segments_6").exists());
+
+        for i in 0..5 {
+            let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+            w.add_document(doc_mark(i)).unwrap();
+            w.commit().unwrap();
+        }
+        // 5 commits: gen 6 -> 11 (7,8,9,10,11).
+        let gen = segments::read_generation(&dir).unwrap();
+        assert_eq!(gen.generation, 11);
+
+        // strictly-older-than-previous manifests are gone.
+        assert!(!dir.join("segments_6").exists());
+        assert!(!dir.join("segments_7").exists());
+        assert!(!dir.join("segments_8").exists());
+        assert!(!dir.join("segments_9").exists());
+        // current (11 == "b") and immediately-previous (10 == "a") survive: grace window for
+        // lock-free concurrent readers that read segments.gen just before the last flip.
+        assert!(dir.join(format!("segments_{}", crate::zsl::segments::to_base36(10))).exists());
+        assert!(dir.join(format!("segments_{}", crate::zsl::segments::to_base36(11))).exists());
+
+        // segments.gen and the actual segment data (.cfs) are untouched by the pruning.
+        assert!(dir.join("segments.gen").exists());
+        let idx = ZslIndex::open(&dir).unwrap();
+        assert_eq!(idx.num_docs(), 20 + 5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_prunes_using_numeric_not_lexical_order_across_base36_rollover() {
+        let dir = temp_kb_full(); // KB: gen 6
+        // enough commits to cross the base36 rollover ("z" = 35 -> "10" = 36), plus margin.
+        for i in 0..35 {
+            let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+            w.add_document(doc_mark(100 + i)).unwrap();
+            w.commit().unwrap();
+        }
+        let gen = segments::read_generation(&dir).unwrap();
+        assert_eq!(gen.generation, 41); // 6 + 35
+
+        // a lexical-comparison bug would keep "segments_z" (35) forever (the string "z"
+        // sorts after two-digit base36 names); numeric comparison must have pruned it.
+        assert!(!dir.join("segments_z").exists());
+        assert!(!dir.join("segments_10").exists()); // 36, also strictly older than 40
+
+        // current (41) and immediately-previous (40) survive.
+        let prev_name = format!("segments_{}", crate::zsl::segments::to_base36(40));
+        let cur_name = format!("segments_{}", crate::zsl::segments::to_base36(41));
+        assert!(dir.join(&prev_name).exists());
+        assert!(dir.join(&cur_name).exists());
+
+        assert!(dir.join("segments.gen").exists());
+        let idx = ZslIndex::open(&dir).unwrap();
+        assert_eq!(idx.num_docs(), 20 + 35);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn optimize_prunes_old_generation_manifests_too() {
+        let dir = temp_kb_full(); // KB: gen 6
+        for i in 0..3 {
+            let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+            w.add_document(doc_mark(i)).unwrap();
+            w.commit().unwrap();
+        }
+        let before = segments::read_generation(&dir).unwrap();
+        assert_eq!(before.generation, 9); // 6 + 3
+        assert!(dir.join("segments_9").exists());
+
+        let w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        let rep = w.optimize().unwrap();
+        assert_eq!(rep.generation, 10); // one flip: merge only (commit_inner was a no-op)
+
+        // everything strictly older than the previous gen (9) is gone.
+        assert!(!dir.join("segments_6").exists());
+        assert!(!dir.join("segments_7").exists());
+        assert!(!dir.join("segments_8").exists());
+        // current (10 == "a") and immediately-previous (9) survive.
+        assert!(dir.join("segments_9").exists());
+        assert!(dir.join(format!("segments_{}", crate::zsl::segments::to_base36(10))).exists());
+
+        assert!(dir.join("segments.gen").exists());
+        let idx = ZslIndex::open(&dir).unwrap();
+        assert_eq!(idx.num_docs(), 20 + 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn empty_commit_is_a_noop() {
         let dir = temp_kb_full();
         let w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
