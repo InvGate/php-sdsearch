@@ -87,6 +87,10 @@ pub struct WriterOpts {
     /// docs buffered before flushing a segment. Default 1000 (vs ZSL's 10);
     /// bounds the streaming writer's RAM. Ignored by `append_documents` (batch).
     pub max_buffered_docs: usize,
+    /// Ceiling on live segments during a batch. If a flush would make
+    /// `base_segments.len() + flushed.len()` exceed this, the flushed segments
+    /// are compacted into one first. `0` = disabled (no ceiling). Default 256.
+    pub max_segments: usize,
 }
 
 impl Default for WriterOpts {
@@ -94,6 +98,7 @@ impl Default for WriterOpts {
         Self {
             doc_boost: 1.0,
             max_buffered_docs: 1000,
+            max_segments: 256,
         }
     }
 }
@@ -258,5 +263,15 @@ mod tests {
         assert_eq!(stored.get("id").unwrap(), "KB-9001");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod opts_tests {
+    use super::*;
+
+    #[test]
+    fn default_max_segments_is_256() {
+        assert_eq!(WriterOpts::default().max_segments, 256);
     }
 }
