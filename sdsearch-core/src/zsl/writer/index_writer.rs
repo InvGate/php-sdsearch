@@ -139,6 +139,13 @@ impl IndexWriter {
     /// The base segments are never touched. Consumes one name from `next_name_counter` for the
     /// merged segment; the merged-away `.cfs` files are deleted (orphans, unreferenced by any
     /// generation).
+    ///
+    /// Cost note: each ceiling crossing re-merges ALL flushed segments (incl. the previously
+    /// merged one), so a batch that crosses the ceiling repeatedly pays super-linear write cost on
+    /// the flushed set. Degenerate case: if `base_segments.len()` alone already exceeds the ceiling
+    /// (a never-optimized index), this fires on every flush from the second onward — O(N²) from the
+    /// start of the batch, not just on giant ones. The operating model (`optimize()` once per batch
+    /// collapses the base to one segment) keeps that out of reach; a tiered v2 policy removes it.
     fn compact_flushed(&mut self) -> io::Result<()> {
         if self.flushed.len() < 2 {
             return Ok(());
