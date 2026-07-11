@@ -11,11 +11,14 @@
 //!      sorts by new doc-id; drops terms with no live docs.
 //!   4. serializes reusing the `write_segment_cfs` primitives (norms COPIED verbatim via write_norms_raw).
 
+use super::cfs::{write_cfs_streaming, CfsSource};
 use super::invert::{FieldMeta, StoredField, TermPostings};
 use super::{assemble_cfs, fnm, norms, stored, terms};
 use crate::index::IndexReader;
 use crate::zsl::segment::ZslSegment;
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -178,6 +181,255 @@ pub fn merge_segments(
         cfs_bytes,
         doc_count,
     })
+}
+
+/// Streaming, bounded-memory counterpart of [`merge_segments`]. Reproduces its 4 phases EXACTLY
+/// (byte-identical `.cfs`) but streams the big blocks (`.fdt`/`.frq`/`.prx`) through temp files
+/// under `index_dir` instead of building them fully in RAM, and writes the merged `.cfs` durably
+/// (fsync) to `index_dir/{merged_name}.cfs` itself before returning. Returns the live `doc_count`.
+///
+/// Only the small per-field/index blocks stay in RAM (`.fnm`/`.fdx`/`.nrm`/`.tis`/`.tii` +
+/// `doc_maps`/`norm_cols`), so peak heap is independent of total text volume. The term merge is a
+/// k-way merge across each segment's [`ZslSegment::term_cursor`] (already in ZSL canonical order),
+/// so terms are fed to the streaming dict writer in the SAME order the batch path sorts them into.
+///
+/// Temp files (`{merged_name}.fdt.tmp` / `.frq.tmp` / `.prx.tmp`) are removed on BOTH the success
+/// and error paths.
+pub fn merge_segments_streaming(
+    index_dir: &Path,
+    merged_name: &str,
+    segments: &[(String, i64)],
+) -> io::Result<usize> {
+    let fdt_tmp = index_dir.join(format!("{merged_name}.fdt.tmp"));
+    let frq_tmp = index_dir.join(format!("{merged_name}.frq.tmp"));
+    let prx_tmp = index_dir.join(format!("{merged_name}.prx.tmp"));
+
+    let result = merge_streaming_inner(
+        index_dir,
+        merged_name,
+        segments,
+        &fdt_tmp,
+        &frq_tmp,
+        &prx_tmp,
+    );
+
+    // Clean up temp files on BOTH the success and error paths (best-effort).
+    let _ = std::fs::remove_file(&fdt_tmp);
+    let _ = std::fs::remove_file(&frq_tmp);
+    let _ = std::fs::remove_file(&prx_tmp);
+
+    result
+}
+
+fn merge_streaming_inner(
+    index_dir: &Path,
+    merged_name: &str,
+    segments: &[(String, i64)],
+    fdt_tmp: &Path,
+    frq_tmp: &Path,
+    prx_tmp: &Path,
+) -> io::Result<usize> {
+    let segs: Vec<ZslSegment> = segments
+        .iter()
+        .map(|(name, dg)| ZslSegment::open_named(index_dir, name, *dg))
+        .collect::<io::Result<_>>()?;
+
+    // ---- phase 1: field union by first-seen (identical to merge_segments) ----
+    let mut field_index: HashMap<String, usize> = HashMap::new();
+    let mut fields: Vec<FieldMeta> = Vec::new();
+    for seg in &segs {
+        for fi in seg.field_infos() {
+            let idx = *field_index.entry(fi.name.clone()).or_insert_with(|| {
+                fields.push(FieldMeta {
+                    name: fi.name.clone(),
+                    indexed: false,
+                });
+                fields.len() - 1
+            });
+            fields[idx].indexed |= fi.is_indexed;
+        }
+    }
+
+    // ---- phase 2: dense renumbering; stream stored to a temp .fdt (fdx kept in RAM), norms in RAM ----
+    let mut doc_maps: Vec<Vec<Option<usize>>> = Vec::with_capacity(segs.len());
+    let mut norm_cols: Vec<Vec<u8>> = vec![Vec::new(); fields.len()];
+    let mut next_id = 0usize;
+
+    let mut fdx_buf: Vec<u8> = Vec::new();
+    let mut stored_writer = stored::StoredStreamWriter::new(File::create(fdt_tmp)?, &mut fdx_buf);
+
+    for seg in &segs {
+        let local_fields = seg.field_infos();
+        let mut map = vec![None; seg.max_doc()];
+        // `local` is a semantic doc-id (indexes is_deleted/stored_raw/norm_bytes and feeds
+        // doc_maps), not a mere iteration index: hence the range loop, not an iter.
+        #[allow(clippy::needless_range_loop)]
+        for local in 0..seg.max_doc() {
+            if seg.is_deleted(local) {
+                continue;
+            }
+            map[local] = Some(next_id);
+
+            // stored: stream in order, remapping field_num local -> merged.
+            let raw = seg.stored_raw(local)?;
+            let mut remapped: Vec<StoredField> = Vec::with_capacity(raw.len());
+            for r in raw {
+                if r.is_binary {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "merge: binary stored field not supported (local field_num {})",
+                            r.field_num
+                        ),
+                    ));
+                }
+                let name = &local_fields
+                    .get(r.field_num)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("merge: stored field_num {} out of range", r.field_num),
+                        )
+                    })?
+                    .name;
+                remapped.push(StoredField {
+                    field_num: field_index[name],
+                    value: r.value,
+                    tokenized: r.tokenized,
+                });
+            }
+            stored_writer.add_doc(&remapped)?;
+
+            // norms: for each indexed merged field, copy the segment's raw byte (255 if absent).
+            for (mf, field) in fields.iter().enumerate() {
+                if !field.indexed {
+                    continue;
+                }
+                let byte = seg
+                    .norm_bytes(&field.name)
+                    .and_then(|col| col.get(local).copied())
+                    .unwrap_or(255);
+                norm_cols[mf].push(byte);
+            }
+            next_id += 1;
+        }
+        doc_maps.push(map);
+    }
+    let doc_count = next_id;
+    stored_writer.finish()?; // flush + close the temp .fdt; fdx_buf is now complete
+
+    // ---- phase 3 guard: a segment with indexed fields MUST have .prx (identical to merge_segments) ----
+    for seg in &segs {
+        let has_indexed = seg.field_infos().iter().any(|fi| fi.is_indexed);
+        if has_indexed && !seg.has_prx() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "merge: segment with indexed fields but no .prx — positions unavailable",
+            ));
+        }
+    }
+
+    // ---- phase 3: k-way term merge → streamed to temp .frq/.prx, .tis/.tii kept in RAM ----
+    // .tis/.tii are Write+Seek (Cursor over a Vec, so the header term-counts can be back-patched);
+    // .frq/.prx are the big blocks, streamed to temp files.
+    let mut tis_buf = io::Cursor::new(Vec::new());
+    let mut tii_buf = io::Cursor::new(Vec::new());
+    let mut dict_writer = terms::TermDictStreamWriter::new(
+        &mut tis_buf,
+        &mut tii_buf,
+        File::create(frq_tmp)?,
+        File::create(prx_tmp)?,
+    )?;
+
+    // one cursor per segment; each yields (field, term) ascending. A min-heap (BinaryHeap is a
+    // max-heap, so keys are wrapped in Reverse) drives the k-way merge. Keys are cloned into the
+    // heap (bounded: at most one small (field, term) per segment at a time) because the cursors'
+    // borrows end at each `peek`, so we cannot hold `&str` across an `advance`.
+    let mut cursors: Vec<_> = segs.iter().map(|s| s.term_cursor()).collect();
+    let mut heap: BinaryHeap<Reverse<(String, String, usize)>> = BinaryHeap::new();
+    for (si, cur) in cursors.iter().enumerate() {
+        if let Some((f, t)) = cur.peek() {
+            heap.push(Reverse((f.to_string(), t.to_string(), si)));
+        }
+    }
+
+    while let Some(Reverse((field, term, first_si))) = heap.pop() {
+        // gather EVERY segment currently positioned at this exact (field, term). Advancing a
+        // cursor and re-pushing its next (strictly greater) term keeps the heap in sync.
+        let mut contributing: Vec<usize> = vec![first_si];
+        cursors[first_si].advance();
+        if let Some((f, t)) = cursors[first_si].peek() {
+            heap.push(Reverse((f.to_string(), t.to_string(), first_si)));
+        }
+        loop {
+            let same = matches!(heap.peek(), Some(Reverse((f, t, _))) if *f == field && *t == term);
+            if !same {
+                break;
+            }
+            let Reverse((_, _, si)) = heap.pop().unwrap();
+            contributing.push(si);
+            cursors[si].advance();
+            if let Some((f, t)) = cursors[si].peek() {
+                heap.push(Reverse((f.to_string(), t.to_string(), si)));
+            }
+        }
+
+        // Contributing segments in ASCENDING index (+ locals ascending within each) => new
+        // doc-ids come out ascending, matching merge_segments' BTreeMap<new_id, _> ordering
+        // (dense renumbering assigns lower ids to earlier segments).
+        contributing.sort_unstable();
+        let mf = field_index[&field];
+        let mut docs: Vec<(usize, Vec<u32>)> = Vec::new();
+        for &si in &contributing {
+            // positions_all ALREADY filters deletes. It may return an unordered HashMap, so sort
+            // locals ascending before remapping so the new ids come out ascending.
+            let mut locals: Vec<(usize, Vec<u32>)> =
+                segs[si].positions_all(&field, &term).into_iter().collect();
+            locals.sort_by_key(|(local, _)| *local);
+            for (local, positions) in locals {
+                if let Some(new_id) = doc_maps[si][local] {
+                    docs.push((new_id, positions));
+                }
+            }
+        }
+        // terms with no live docs are dropped (== ZSL / merge_segments).
+        if docs.is_empty() {
+            continue;
+        }
+        dict_writer.add_term(&TermPostings {
+            field_num: mf,
+            text: term,
+            docs,
+        })?;
+    }
+    dict_writer.finish()?; // back-patch term counts + close the temp .frq/.prx
+
+    // ---- phase 4: assemble the .cfs (small blocks from RAM, big ones streamed from temp files) ----
+    let fnm_bytes = fnm::write_fnm(&fields);
+    let nrm = norms::write_norms_raw(&norm_cols);
+    let tis_bytes = tis_buf.into_inner();
+    let tii_bytes = tii_buf.into_inner();
+
+    // Same file order as `assemble_cfs`: .fdx .fdt .fnm .nrm .tis .tii .frq .prx.
+    let files: Vec<(&str, CfsSource)> = vec![
+        (".fdx", CfsSource::Mem(&fdx_buf)),
+        (".fdt", CfsSource::Path(fdt_tmp)),
+        (".fnm", CfsSource::Mem(&fnm_bytes)),
+        (".nrm", CfsSource::Mem(&nrm)),
+        (".tis", CfsSource::Mem(&tis_bytes)),
+        (".tii", CfsSource::Mem(&tii_bytes)),
+        (".frq", CfsSource::Path(frq_tmp)),
+        (".prx", CfsSource::Path(prx_tmp)),
+    ];
+
+    // Write the merged .cfs durably: stream it into the file, then fsync BEFORE returning so the
+    // generation flip in optimize() only references a durable .cfs.
+    let cfs_path = index_dir.join(format!("{merged_name}.cfs"));
+    let mut cfs_file = File::create(&cfs_path)?;
+    write_cfs_streaming(&mut cfs_file, merged_name, &files)?;
+    cfs_file.sync_all()?;
+
+    Ok(doc_count)
 }
 
 #[cfg(test)]
@@ -376,6 +628,160 @@ mod tests {
         drop(seg);
 
         merge_segments(&dir, "_m", &[("_x".to_string(), -1)]).unwrap();
+    }
+
+    // ---- differential gate: streaming merge must be byte-identical to the batch oracle ----
+
+    /// Runs BOTH the batch oracle (`merge_segments`, bytes captured in RAM) and
+    /// `merge_segments_streaming` (writes `_m.cfs`) over the SAME `merged_name` and asserts the
+    /// resulting `.cfs` bytes are identical. The name must match: the CFS sub-file directory
+    /// embeds `{name}{ext}`, so different names would differ trivially. Also asserts the temp
+    /// files were cleaned up.
+    fn assert_streaming_byte_identical(dir: &std::path::Path, refs: &[(String, i64)]) {
+        let oracle = merge_segments(dir, "_m", refs).unwrap(); // RAM only; does NOT write
+        let doc_count = merge_segments_streaming(dir, "_m", refs).unwrap(); // writes _m.cfs (fsync)
+        assert_eq!(doc_count, oracle.doc_count, "doc_count mismatch");
+        let streamed = std::fs::read(dir.join("_m.cfs")).unwrap();
+        assert_eq!(
+            streamed, oracle.cfs_bytes,
+            "merged .cfs bytes differ (streaming vs batch)"
+        );
+        // temp files removed on the success path
+        assert!(!dir.join("_m.fdt.tmp").exists());
+        assert!(!dir.join("_m.frq.tmp").exists());
+        assert!(!dir.join("_m.prx.tmp").exists());
+    }
+
+    #[test]
+    fn streaming_matches_batch_multi_segment_no_deletes() {
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        for i in 0..4 {
+            w.add_document(doc_mark(i)).unwrap();
+        }
+        w.commit().unwrap();
+
+        let infos = read_segment_infos(&dir).unwrap();
+        assert!(infos.len() >= 2, "expected multi-segment base");
+        assert!(
+            infos.iter().all(|s| s.del_gen == -1),
+            "scenario (a) must have NO deletes"
+        );
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        assert_streaming_byte_identical(&dir, &refs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_matches_batch_deletes_across_two_base_segments() {
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        for i in 0..4 {
+            w.add_document(doc_mark(i)).unwrap();
+        }
+        w.commit().unwrap();
+
+        // delete a doc in _2 (gid 0) and the first doc of _3 (gid 20), in one commit.
+        let mut w2 = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        w2.delete_document(0);
+        w2.delete_document(20);
+        w2.commit().unwrap();
+
+        let infos = read_segment_infos(&dir).unwrap();
+        assert!(infos.iter().any(|s| s.del_gen != -1), "scenario (b) needs deletes");
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        assert_streaming_byte_identical(&dir, &refs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_matches_batch_single_segment_with_deletes() {
+        let dir = temp_kb_full();
+        let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        w.delete_document(5);
+        w.commit().unwrap();
+
+        let infos = read_segment_infos(&dir).unwrap();
+        assert_eq!(infos.len(), 1, "scenario (c) is single-segment");
+        assert_ne!(infos[0].del_gen, -1, "must have a .del");
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        assert_streaming_byte_identical(&dir, &refs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_errors_on_binary_stored_field() {
+        // same hand-crafted binary-flagged segment as the batch guard test, but exercised via the
+        // streaming path (which returns an Err rather than panicking through an unwrap).
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("sdsearch_smerge_bin_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fields = vec![FieldMeta {
+            name: "bin_field".to_string(),
+            indexed: false,
+        }];
+        let fnm_bytes = fnm::write_fnm(&fields);
+        let payload = b"binpayload";
+        let mut fdt = vec![0x01u8, 0x00u8, 0x02u8];
+        crate::zsl::bytes::write_vint(&mut fdt, payload.len() as u64);
+        fdt.extend_from_slice(payload);
+        let fdx = vec![0u8; 8];
+        let nrm = norms::write_norms_raw(&[Vec::new()]);
+        let dict = terms::write_term_dict(&[]);
+        let cfs_bytes = assemble_cfs("_x", &fnm_bytes, &fdt, &fdx, &nrm, &dict);
+        std::fs::write(dir.join("_x.cfs"), &cfs_bytes).unwrap();
+
+        let err = merge_segments_streaming(&dir, "_m", &[("_x".to_string(), -1)]).unwrap_err();
+        assert!(
+            err.to_string().contains("binary stored field not supported"),
+            "unexpected error: {err}"
+        );
+        // partial temp files (if any) are cleaned up even on the error path
+        assert!(!dir.join("_m.fdt.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_errors_on_indexed_field_without_prx() {
+        // same hand-crafted no-.prx segment as the batch guard test, exercised via streaming.
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("sdsearch_smerge_noprx_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fields = vec![FieldMeta {
+            name: "body".to_string(),
+            indexed: true,
+        }];
+        let fnm_bytes = fnm::write_fnm(&fields);
+        let (fdt, fdx) = stored::write_stored(&[Vec::new()]);
+        let dict = terms::write_term_dict(&[]);
+        let files: Vec<(&str, &[u8])> = vec![
+            (".fdx", &fdx),
+            (".fdt", &fdt),
+            (".fnm", &fnm_bytes),
+            (".tis", &dict.tis),
+            (".frq", &dict.frq),
+        ];
+        let cfs_bytes = crate::zsl::writer::cfs::write_cfs("_x", &files);
+        std::fs::write(dir.join("_x.cfs"), &cfs_bytes).unwrap();
+
+        let err = merge_segments_streaming(&dir, "_m", &[("_x".to_string(), -1)]).unwrap_err();
+        assert!(
+            err.to_string().contains("indexed fields but no .prx"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

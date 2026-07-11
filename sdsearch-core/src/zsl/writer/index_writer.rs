@@ -7,7 +7,7 @@
 
 use super::lock::WriteLock;
 use super::segments::{self, Generation, NewSegment};
-use super::{durability, merge};
+use super::merge;
 use super::{write_segment_cfs, WriterDoc, WriterOpts};
 use crate::index::IndexReader;
 use crate::zsl::deletes::DeletedDocs;
@@ -154,26 +154,18 @@ impl IndexWriter {
             });
         }
 
-        // 3) merge -> bytes of the merged .cfs. Name = next from name_counter.
+        // 3+4) stream the merge straight to a DURABLE {merged_name}.cfs (fsync happens inside).
+        // Peak heap is bounded — postings/positions/stored are streamed through temp files — and
+        // the bytes are identical to merge_segments. mmaps are dropped on return, so on Windows
+        // the old .cfs can be unlinked afterwards. Name = next from name_counter.
         let gen = segments::read_generation(&self.dir)?;
         let merged_name = segments::segment_name(gen.name_counter);
         let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
-        let result = merge::merge_segments(&self.dir, &merged_name, &refs)?;
-        // (merge_segments dropped its mmaps on return => on Windows the old ones can be unlinked)
-
-        // 4) write the merged .cfs DURABLE (fsync). Not yet referenced by any generation.
-        durability::write_durable(
-            &self.dir.join(format!("{merged_name}.cfs")),
-            &result.cfs_bytes,
-        )?;
+        let doc_count = merge::merge_segments_streaming(&self.dir, &merged_name, &refs)?;
 
         // 5) write segments_{N+1} (fsync) + atomic flip of segments.gen.
-        let new_gen = segments::write_optimized_generation(
-            &self.dir,
-            &gen,
-            &merged_name,
-            result.doc_count as u32,
-        )?;
+        let new_gen =
+            segments::write_optimized_generation(&self.dir, &gen, &merged_name, doc_count as u32)?;
 
         // 6) orphan cleanup POST-flip (best-effort): .cfs/.del/.sti of the old segments.
         //    Never before the flip (crash-safety invariant: the merged segment is referenced only
@@ -198,7 +190,7 @@ impl IndexWriter {
         Ok(CommitReport {
             generation: new_gen,
             segments: vec![merged_name],
-            doc_count: result.doc_count,
+            doc_count,
         })
     }
 
