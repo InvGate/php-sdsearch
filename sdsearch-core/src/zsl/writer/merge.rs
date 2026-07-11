@@ -207,6 +207,10 @@ pub fn merge_segments_streaming(
     let fdt_tmp = index_dir.join(format!("{merged_name}.fdt.tmp"));
     let frq_tmp = index_dir.join(format!("{merged_name}.frq.tmp"));
     let prx_tmp = index_dir.join(format!("{merged_name}.prx.tmp"));
+    // The final `.cfs` is assembled into this staging file and only renamed onto the real
+    // `{merged_name}.cfs` once fully written + fsynced, so a mid-write I/O error can never leave
+    // a partial FINAL `.cfs` on disk — only this `.cfs.tmp`, which is cleaned up below.
+    let cfs_tmp = index_dir.join(format!("{merged_name}.cfs.tmp"));
 
     let result = merge_streaming_inner(
         index_dir,
@@ -215,12 +219,15 @@ pub fn merge_segments_streaming(
         &fdt_tmp,
         &frq_tmp,
         &prx_tmp,
+        &cfs_tmp,
     );
 
-    // Clean up temp files on BOTH the success and error paths (best-effort).
+    // Clean up staging files on BOTH the success and error paths (best-effort). `.cfs.tmp` is
+    // included so a failed assembly (or a failed rename) never leaks a partial staging file.
     let _ = std::fs::remove_file(&fdt_tmp);
     let _ = std::fs::remove_file(&frq_tmp);
     let _ = std::fs::remove_file(&prx_tmp);
+    let _ = std::fs::remove_file(&cfs_tmp);
 
     result
 }
@@ -232,6 +239,7 @@ fn merge_streaming_inner(
     fdt_tmp: &Path,
     frq_tmp: &Path,
     prx_tmp: &Path,
+    cfs_tmp: &Path,
 ) -> io::Result<usize> {
     let segs: Vec<ZslSegment> = segments
         .iter()
@@ -439,12 +447,19 @@ fn merge_streaming_inner(
         (".prx", CfsSource::Path(prx_tmp)),
     ];
 
-    // Write the merged .cfs durably: stream it into the file, then fsync BEFORE returning so the
-    // generation flip in optimize() only references a durable .cfs.
+    // Write the merged .cfs durably and ATOMICALLY: stream it into `{merged_name}.cfs.tmp`, fsync
+    // the content, then rename it onto the real `{merged_name}.cfs`. The staging + rename means a
+    // failure partway through `write_cfs_streaming` (disk full, I/O error) can only leave the
+    // `.cfs.tmp` (cleaned up by the caller), never a truncated FINAL `.cfs`. The directory fsync
+    // makes the rename durable so the generation flip in optimize() only references a durable .cfs.
     let cfs_path = index_dir.join(format!("{merged_name}.cfs"));
-    let mut cfs_file = File::create(&cfs_path)?;
-    write_cfs_streaming(&mut cfs_file, merged_name, &files)?;
-    cfs_file.sync_all()?;
+    {
+        let mut cfs_file = File::create(cfs_tmp)?;
+        write_cfs_streaming(&mut cfs_file, merged_name, &files)?;
+        cfs_file.sync_all()?;
+    }
+    std::fs::rename(cfs_tmp, &cfs_path)?;
+    super::durability::sync_dir(index_dir);
 
     Ok(doc_count)
 }
@@ -667,6 +682,8 @@ mod tests {
         assert!(!dir.join("_m.fdt.tmp").exists());
         assert!(!dir.join("_m.frq.tmp").exists());
         assert!(!dir.join("_m.prx.tmp").exists());
+        // the .cfs staging file was renamed onto the final .cfs, not left behind.
+        assert!(!dir.join("_m.cfs.tmp").exists());
     }
 
     #[test]
@@ -690,6 +707,35 @@ mod tests {
         );
         let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
         assert_streaming_byte_identical(&dir, &refs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_merge_cleans_staging_and_leaves_no_partial_cfs_when_final_rename_fails() {
+        // Regression lock for the atomic-.cfs write: a pre-existing directory at the final
+        // `_m.cfs` path makes the rename of the fully-written `.cfs.tmp` staging file fail. The
+        // merge must return Err, must NOT leak any staging file (`.cfs.tmp` / `.fdt/.frq/.prx.tmp`),
+        // and must never leave a truncated FINAL `.cfs` (the blocking directory stays untouched).
+        let dir = temp_kb_full();
+        let infos = read_segment_infos(&dir).unwrap();
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+
+        std::fs::create_dir(dir.join("_m.cfs")).unwrap(); // blocks the final rename target
+
+        let result = merge_segments_streaming(&dir, "_m", &refs);
+        assert!(
+            result.is_err(),
+            "merge must fail when the final rename is blocked"
+        );
+
+        // no staging file leaked (cleaned on the error path)...
+        assert!(!dir.join("_m.cfs.tmp").exists());
+        assert!(!dir.join("_m.fdt.tmp").exists());
+        assert!(!dir.join("_m.frq.tmp").exists());
+        assert!(!dir.join("_m.prx.tmp").exists());
+        // ...and the final path is still the blocking directory, never a truncated .cfs file.
+        assert!(dir.join("_m.cfs").is_dir());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
