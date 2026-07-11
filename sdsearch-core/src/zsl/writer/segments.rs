@@ -106,6 +106,65 @@ fn prune_old_generations(index_dir: &Path, keep_from_gen: u64) {
     }
 }
 
+/// Name of the deferred-deletion sidecar. Not a `segments_*` manifest, `.cfs`, or `.del`, so it
+/// is invisible to `prune_old_generations`, to readers, and to segment enumeration.
+const PENDING_DELETIONS_FILE: &str = "pending_deletions";
+
+/// Best-effort, one-generation-DEFERRED reclamation of segment data files (`_<name>.cfs/.sti/
+/// .del`) superseded by a merge. `optimize()` cannot delete the old segments immediately: the
+/// flip keeps the previous generation's manifest as a grace window for lock-free readers, and
+/// that manifest still references the old files — deleting them now would leave such a reader
+/// with dangling references (and on Windows the unlink of a file still mapped by a reader fails
+/// silently, leaking it). So each flip instead does two things. First, it deletes the files
+/// recorded by the PREVIOUS flip — whose referencing manifest this flip's `prune_old_generations`
+/// has just removed, so they are now safe — retrying/carrying forward any that still fail (e.g. a
+/// Windows reader still holds the mapping). Second, it records `new_superseded` (this flip's
+/// just-superseded files, still referenced by the kept previous manifest) for the NEXT flip.
+///
+/// Because every flip advances the generation by exactly one, a file recorded here is always
+/// referenced solely by manifests the next prune removes. The ONLY failure mode of a bug here is
+/// a disk leak — it NEVER deletes a file that is still referenced (it only ever lists already-
+/// superseded files). Must be called AFTER the durable flip + prune. Best-effort: all errors
+/// (missing sidecar, unreadable, unwritable) are ignored.
+///
+/// `new_superseded` are file NAMES relative to `index_dir` (e.g. `"_2.cfs"`), not paths.
+pub(crate) fn process_pending_deletions(index_dir: &Path, new_superseded: &[String]) {
+    let sidecar = index_dir.join(PENDING_DELETIONS_FILE);
+
+    // 1) reclaim the previous round's files; carry forward any that could not be deleted yet.
+    let mut carry: Vec<String> = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(&sidecar) {
+        for name in contents.lines() {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let path = index_dir.join(name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // already gone (deleted earlier / never existed): treat as reclaimed.
+                Err(_) if !path.exists() => {}
+                // still present but unlink failed (e.g. Windows: mapped by a reader) → retry next flip.
+                Err(_) => carry.push(name.to_string()),
+            }
+        }
+    }
+
+    // 2) next round's list = carried-forward failures + this flip's newly-superseded files.
+    let mut next = carry;
+    for f in new_superseded {
+        if !next.contains(f) {
+            next.push(f.clone());
+        }
+    }
+
+    if next.is_empty() {
+        let _ = std::fs::remove_file(&sidecar);
+    } else {
+        let _ = std::fs::write(&sidecar, next.join("\n"));
+    }
+}
+
 fn read_gen_number(index_dir: &Path) -> std::io::Result<u64> {
     let data = std::fs::read(index_dir.join("segments.gen"))?;
     let mut pos = 0usize;
@@ -351,6 +410,50 @@ mod tests {
             std::fs::copy(src.join(f), dir.join(f)).unwrap();
         }
         dir
+    }
+
+    fn temp_empty_dir(tag: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("sdsearch_pd_{tag}_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn process_pending_deletions_deletes_listed_and_records_new() {
+        let dir = temp_empty_dir("rec");
+        // previous round's file, listed in the sidecar, is now safe to delete.
+        std::fs::write(dir.join("_old.cfs"), b"x").unwrap();
+        std::fs::write(dir.join(PENDING_DELETIONS_FILE), "_old.cfs").unwrap();
+        // this round's just-superseded file, still referenced by the kept manifest.
+        std::fs::write(dir.join("_new.cfs"), b"y").unwrap();
+
+        process_pending_deletions(&dir, &["_new.cfs".to_string()]);
+
+        // the previously-listed file is reclaimed...
+        assert!(!dir.join("_old.cfs").exists());
+        // ...the new superseded file is recorded for the NEXT flip, NOT deleted now...
+        assert!(dir.join("_new.cfs").exists());
+        let sidecar = std::fs::read_to_string(dir.join(PENDING_DELETIONS_FILE)).unwrap();
+        assert_eq!(sidecar.trim(), "_new.cfs");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_pending_deletions_removes_sidecar_when_nothing_pending() {
+        let dir = temp_empty_dir("empty");
+        std::fs::write(dir.join("_old.cfs"), b"x").unwrap();
+        std::fs::write(dir.join(PENDING_DELETIONS_FILE), "_old.cfs").unwrap();
+
+        process_pending_deletions(&dir, &[]); // no new superseded files
+
+        assert!(!dir.join("_old.cfs").exists());
+        // nothing left to defer → the sidecar file itself is removed (no empty-file litter).
+        assert!(!dir.join(PENDING_DELETIONS_FILE).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
