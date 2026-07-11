@@ -52,6 +52,20 @@ echo sdsearch_version(); // "0.1.0" — also a smoke test that the extension loa
 `commit()` and `optimize()` consume the writer: after either, the object is closed and any
 further method throws "writer not open". Create a fresh `Writer` for the next batch.
 
+**When to call `optimize()`.** Each `commit()` adds one or more segments; the segment count
+only shrinks when you `optimize()` (there is no automatic merge policy). A read (search) opens
+every live segment, so an index that is committed many times without optimizing gets slower
+and heavier to open. The recommended pattern for a bulk feed is **open once → `add_document`
+per doc → `optimize()` once at the end** (rather than open/commit per document), which keeps
+the index compacted to a single segment.
+
+**`optimize()` resource profile.** The merge is streaming and bounded-memory: peak heap is a
+per-term working set plus small per-document bookkeeping, independent of the corpus text
+volume (on a ~135k-doc index, ~0.1 GB peak heap). While it runs it writes temporary files
+(`<segment>.fdt.tmp` / `.frq.tmp` / `.prx.tmp`) into the index directory sized in aggregate
+close to the final segment, so provision disk accordingly. Stale generation manifests
+(`segments_N`) are pruned automatically after each commit/optimize.
+
 ## Indexing (write path)
 
 ```php

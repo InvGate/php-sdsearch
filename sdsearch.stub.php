@@ -164,6 +164,13 @@ namespace SdSearch {
          * Commits, then merges all live segments (plus pending deletes) into a single
          * compacted segment. **Consumes** the writer, like {@see Writer::commit()}.
          *
+         * The merge is streaming and bounded-memory: peak heap is a per-term working set
+         * plus small per-document bookkeeping, independent of the index's total text volume
+         * (so optimizing a large index does not risk an OOM). While running it writes
+         * temporary files (`<segment>.fdt.tmp`/`.frq.tmp`/`.prx.tmp`) into the index dir.
+         * Prefer "open once → add_document* → optimize() once" per feed; the segment count
+         * only shrinks on optimize (no automatic merge policy).
+         *
          * @return int The document count the index will have after the optimize.
          * @throws \Exception if the writer is not open, or on error.
          */

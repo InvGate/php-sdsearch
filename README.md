@@ -99,6 +99,10 @@ Order-of-magnitude numbers from local benchmarking against the legacy PHP engine
 - **Indexing throughput:** the native streaming writer indexed the same document batches
   **~95–150× faster** than ZSL's PHP writer, with peak RSS bounded by a configurable
   buffered-docs cap rather than growing with the batch size.
+- **Optimize (merge) memory:** `optimize()` uses a streaming, k-way merge whose peak heap is
+  bounded by a per-term working set plus small per-document bookkeeping, *not* by the corpus
+  size. On the same ~135k-document index this cut optimize's peak heap from **~3.2 GB to
+  ~0.1 GB** (and it ran faster), so compacting a large index no longer risks an OOM.
 
 These are single-machine, order-of-magnitude measurements, not precise benchmarks — treat
 them as a shape-of-the-win indicator, not a guarantee.
