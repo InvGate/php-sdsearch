@@ -48,12 +48,29 @@ impl<'a> CfsSource<'a> {
         }
     }
 
-    fn write_to<W: Write>(&self, out: &mut W) -> io::Result<()> {
+    /// Writes this source's bytes to `out`. `expected_len` must be the exact value that `len()`
+    /// returned for this same source and that was used to compute its CFS directory offset. If
+    /// the number of bytes actually copied differs (e.g. the underlying file was truncated or
+    /// replaced between the `len()` call and this write — a TOCTOU race), this returns an
+    /// `io::Error` instead of silently emitting a `.cfs` whose directory offsets don't match the
+    /// data actually written.
+    fn write_to<W: Write>(&self, out: &mut W, expected_len: u64) -> io::Result<()> {
         match self {
             CfsSource::Mem(data) => out.write_all(data),
             CfsSource::Path(path) => {
                 let mut f = std::fs::File::open(path)?;
-                io::copy(&mut f, out)?;
+                let copied = io::copy(&mut f, out)?;
+                if copied != expected_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cfs source {}: expected {expected_len} bytes (length used to \
+                             compute the directory offset) but copied {copied}; file changed \
+                             size between measurement and write",
+                            path.display()
+                        ),
+                    ));
+                }
                 Ok(())
             }
         }
@@ -66,7 +83,14 @@ impl<'a> CfsSource<'a> {
 /// the directory is written to `out` once — no back-patch into `out` is needed (the small
 /// in-RAM directory buffer is patched before anything is written). Each data block is then
 /// streamed into `out` in turn; `Path` sources are copied via `std::io::copy` and never loaded
-/// fully into memory.
+/// fully into memory. Each `Path` source's length is measured once and that same value is used
+/// both for its directory offset and to verify the number of bytes actually copied, so a source
+/// that changes size between the two (e.g. a truncated temp file) is caught as an error rather
+/// than silently producing a `.cfs` with offsets that don't match its data.
+///
+/// On `Err`, `out` may already contain a partial write (directory and/or some data blocks
+/// written before the failing source was reached); callers must discard it and must not treat it
+/// as a valid, committable `.cfs`.
 pub fn write_cfs_streaming<W: Write>(
     out: &mut W,
     segment_name: &str,
@@ -86,14 +110,17 @@ pub fn write_cfs_streaming<W: Write>(
     }
 
     let mut offset = dir.len() as u64;
+    let mut lengths = Vec::with_capacity(files.len());
     for (i, (_, src)) in files.iter().enumerate() {
+        let len = src.len()?;
         dir[ptr_positions[i]..ptr_positions[i] + 8].copy_from_slice(&offset.to_be_bytes());
-        offset += src.len()?;
+        offset += len;
+        lengths.push(len);
     }
 
     out.write_all(&dir)?;
-    for (_, src) in files {
-        src.write_to(out)?;
+    for ((_, src), len) in files.iter().zip(lengths.iter()) {
+        src.write_to(out, *len)?;
     }
     Ok(())
 }
@@ -161,6 +188,44 @@ mod tests {
         std::fs::remove_file(&tis_path).ok();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn write_to_errors_when_path_source_shrinks_after_len_was_measured() {
+        let path = temp_path_named("toctou");
+        std::fs::write(&path, b"this file starts out long enough to matter").unwrap();
+
+        let src = CfsSource::Path(&path);
+        // Same call `write_cfs_streaming` makes to compute the CFS directory offset.
+        let measured_len = src.len().unwrap();
+
+        // Simulate a TOCTOU race: the file is truncated/replaced by something else between the
+        // `len()` call used for the directory offset and the actual data write.
+        std::fs::write(&path, b"short").unwrap();
+
+        let mut out = Vec::new();
+        let err = src.write_to(&mut out, measured_len).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_to_succeeds_when_expected_len_matches_actual_file_size() {
+        // Guard against the fix spuriously erroring on a legitimate full copy.
+        let path = temp_path_named("full_copy");
+        let data = b"a normal file that is not touched after measurement".to_vec();
+        std::fs::write(&path, &data).unwrap();
+
+        let src = CfsSource::Path(&path);
+        let measured_len = src.len().unwrap();
+        assert_eq!(measured_len, data.len() as u64);
+
+        let mut out = Vec::new();
+        src.write_to(&mut out, measured_len).unwrap();
+        assert_eq!(out, data);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
