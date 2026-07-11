@@ -30,6 +30,10 @@ pub struct MergeResult {
 
 /// Merges `segments` (name, del_gen) — in `segments_N` order — into a `.cfs` named
 /// `merged_name`. See the module doc.
+///
+/// Retained as the differential-test oracle (see `assert_streaming_byte_identical` below) and
+/// as a potential future small-index fallback; it is NOT on the production `optimize()` path,
+/// which uses [`merge_segments_streaming`].
 pub fn merge_segments(
     index_dir: &Path,
     merged_name: &str,
@@ -713,6 +717,41 @@ mod tests {
         assert_eq!(infos.len(), 1, "scenario (c) is single-segment");
         assert_ne!(infos[0].del_gen, -1, "must have a .del");
         let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        assert_streaming_byte_identical(&dir, &refs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_matches_batch_all_docs_deleted_zero_live_docs() {
+        // Empty-merge scenario: delete EVERY doc in the single-segment KB fixture (all 20,
+        // global ids 0..20 — the KB fixture is exactly one segment, `_2`, with `max_doc() ==
+        // 20`, see `sdsearch-core/src/zsl/segment.rs`), so the merge input has ZERO live docs.
+        // This exercises phase 2/3 with empty `stored`/`term_map` (empty `.fdt`/`.fdx`, no
+        // terms survive the "drop terms with no live docs" filter) — the smallest possible
+        // merge input, not covered by the other differential scenarios (which all retain >=1
+        // live doc).
+        let dir = temp_kb_full();
+        let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        for gid in 0..20 {
+            w.delete_document(gid);
+        }
+        w.commit().unwrap();
+
+        let infos = read_segment_infos(&dir).unwrap();
+        assert_eq!(infos.len(), 1, "scenario is single-segment, fully deleted");
+        assert_eq!(
+            ZslIndex::open(&dir).unwrap().num_docs(),
+            0,
+            "all docs must be deleted"
+        );
+
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+        let oracle = merge_segments(&dir, "_m", &refs).unwrap();
+        assert_eq!(
+            oracle.doc_count, 0,
+            "merge of a fully-deleted segment has 0 live docs"
+        );
+
         assert_streaming_byte_identical(&dir, &refs);
         std::fs::remove_dir_all(&dir).ok();
     }

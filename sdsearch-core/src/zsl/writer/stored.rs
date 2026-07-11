@@ -111,10 +111,39 @@ mod tests {
         ]
     }
 
+    // --- independent oracle: the ORIGINAL (pre-streaming, commit 583e39b) `write_stored`
+    // algorithm, duplicated here under a `reference_*` name so it does NOT call into
+    // `StoredStreamWriter`/`write_stored` (the current module's real writer, now a thin wrapper
+    // over the streaming writer) — comparing against those would make the byte-identity test
+    // compare the streaming writer against itself (tautological). `write_vint`/`write_modified_utf8`
+    // are reused from `crate::zsl::bytes` since they are untouched by the streaming refactor;
+    // `write_i64_be` (only used here) is imported locally for the same reason.
+
+    fn reference_write_stored(docs_stored: &[Vec<StoredField>]) -> (Vec<u8>, Vec<u8>) {
+        use crate::zsl::bytes::write_i64_be;
+        let mut fdt = Vec::new();
+        let mut fdx = Vec::new();
+        for fields in docs_stored {
+            write_i64_be(&mut fdx, fdt.len() as i64); // offset of this doc's block in .fdt
+            write_vint(&mut fdt, fields.len() as u64);
+            for sf in fields {
+                write_vint(&mut fdt, sf.field_num as u64);
+                fdt.push(if sf.tokenized { 0x01 } else { 0x00 }); // never binary here
+                write_modified_utf8(&mut fdt, &sf.value);
+            }
+        }
+        (fdt, fdx)
+    }
+
     #[test]
     fn stream_writer_matches_batch_writer_byte_for_byte() {
         let docs = sample_docs();
-        let (expected_fdt, expected_fdx) = write_stored(&docs);
+
+        // Independent oracle: the pre-streaming reference implementation (duplicated from git
+        // commit 583e39b, before `write_stored` became a thin wrapper over
+        // `StoredStreamWriter`), NOT `write_stored` itself (which now shares its code with the
+        // streaming writer under test and would make this comparison tautological).
+        let (expected_fdt, expected_fdx) = reference_write_stored(&docs);
 
         let mut fdt_buf = Vec::new();
         let mut fdx_buf = Vec::new();
@@ -126,8 +155,8 @@ mod tests {
             writer.finish().unwrap();
         }
 
-        assert_eq!(fdt_buf, expected_fdt);
-        assert_eq!(fdx_buf, expected_fdx);
+        assert_eq!(fdt_buf, expected_fdt, "fdt mismatch");
+        assert_eq!(fdx_buf, expected_fdx, "fdx mismatch");
     }
 
     #[test]
