@@ -19,7 +19,7 @@ use crate::zsl::segment::ZslSegment;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::File;
-use std::io;
+use std::io::{self, BufWriter};
 use std::path::Path;
 
 /// merge result: the bytes of the merged `.cfs` + the number of live docs.
@@ -259,8 +259,13 @@ fn merge_streaming_inner(
     let mut norm_cols: Vec<Vec<u8>> = vec![Vec::new(); fields.len()];
     let mut next_id = 0usize;
 
+    // `.fdt` is append-only and written one doc at a time (`add_doc`): wrap it in a `BufWriter`
+    // so per-doc writes coalesce into few syscalls instead of one `write_all` per doc. The
+    // buffer is a small constant (default 8 KiB), independent of segment size; `finish()` below
+    // flushes it to disk BEFORE the temp file is read back during CFS assembly.
     let mut fdx_buf: Vec<u8> = Vec::new();
-    let mut stored_writer = stored::StoredStreamWriter::new(File::create(fdt_tmp)?, &mut fdx_buf);
+    let mut stored_writer =
+        stored::StoredStreamWriter::new(BufWriter::new(File::create(fdt_tmp)?), &mut fdx_buf);
 
     for seg in &segs {
         let local_fields = seg.field_infos();
@@ -338,11 +343,16 @@ fn merge_streaming_inner(
     // .frq/.prx are the big blocks, streamed to temp files.
     let mut tis_buf = io::Cursor::new(Vec::new());
     let mut tii_buf = io::Cursor::new(Vec::new());
+    // `.frq`/`.prx` are append-only and written one posting at a time (`add_posting`): same
+    // `BufWriter` treatment as `.fdt` above, for the same reason (per-term-size N postings would
+    // otherwise be N unbuffered `write_all` syscalls). `.tis`/`.tii` stay as in-RAM `Cursor`s
+    // (Write+Seek, needed for the term-count back-patch) — they are written per-term, not
+    // per-posting, so they were never the bottleneck.
     let mut dict_writer = terms::TermDictStreamWriter::new(
         &mut tis_buf,
         &mut tii_buf,
-        File::create(frq_tmp)?,
-        File::create(prx_tmp)?,
+        BufWriter::new(File::create(frq_tmp)?),
+        BufWriter::new(File::create(prx_tmp)?),
     )?;
 
     // one cursor per segment; each yields (field, term) ascending. A min-heap (BinaryHeap is a
