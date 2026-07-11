@@ -123,6 +123,41 @@ impl IndexWriter {
         });
         self.next_name_counter += 1;
         self.buffer.clear();
+
+        // Safety-net merge policy: if the live segment count crosses the ceiling, compact the
+        // flushed (new) segments into one. Never touches the base segments. `0` disables it.
+        if self.opts.max_segments != 0
+            && self.base_segments.len() + self.flushed.len() > self.opts.max_segments
+        {
+            self.compact_flushed()?;
+        }
+        Ok(())
+    }
+
+    /// Merges all currently-flushed segments into ONE (bounded memory), replacing `self.flushed`
+    /// with the single merged segment. No-op if fewer than 2 are flushed (nothing to reduce).
+    /// The base segments are never touched. Consumes one name from `next_name_counter` for the
+    /// merged segment; the merged-away `.cfs` files are deleted (orphans, unreferenced by any
+    /// generation).
+    fn compact_flushed(&mut self) -> io::Result<()> {
+        if self.flushed.len() < 2 {
+            return Ok(());
+        }
+        // flushed segments are new => no deletes among themselves => del_gen -1.
+        let refs: Vec<(String, i64)> = self.flushed.iter().map(|s| (s.name.clone(), -1)).collect();
+        let merged_name = segments::segment_name(self.next_name_counter);
+        self.next_name_counter += 1;
+
+        let doc_count = merge::merge_segments_streaming(&self.dir, &merged_name, &refs)?;
+
+        // remove the merged-away inputs (now orphaned; not in any generation).
+        for (name, _) in &refs {
+            let _ = std::fs::remove_file(self.dir.join(format!("{name}.cfs")));
+        }
+        self.flushed = vec![NewSegment {
+            name: merged_name,
+            doc_count: doc_count as u32,
+        }];
         Ok(())
     }
 
@@ -717,6 +752,52 @@ mod tests {
         assert!(dir.join("segments.gen").exists());
         let idx = ZslIndex::open(&dir).unwrap();
         assert_eq!(idx.num_docs(), 20 + 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_segments_caps_flushed_count_and_leaves_base_untouched() {
+        let dir = temp_kb_full();
+        // capture the base segment's bytes to prove compaction never rewrites it.
+        let base_name = {
+            let infos = crate::zsl::segments::read_segment_infos(&dir).unwrap();
+            assert_eq!(infos.len(), 1, "KB fixture is single-segment");
+            infos[0].name.clone()
+        };
+        let base_cfs = dir.join(format!("{base_name}.cfs"));
+        let base_bytes_before = std::fs::read(&base_cfs).unwrap();
+
+        let opts = WriterOpts {
+            max_buffered_docs: 1, // one flush per doc
+            max_segments: 4,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+
+        let mut compaction_seen = false;
+        for i in 0..12 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("zqx doc{i}"))],
+            })
+            .unwrap();
+            // ceiling holds after every add (compaction runs inside flush_segment).
+            let total = w.base_segments.len() + w.flushed.len();
+            assert!(total <= 4, "segment count {total} exceeded max_segments=4");
+            if w.flushed.len() == 1 && i >= 3 {
+                compaction_seen = true; // flushed collapsed back to a single merged segment
+            }
+        }
+        assert!(compaction_seen, "expected at least one compaction to fire");
+
+        // base segment file was never rewritten.
+        assert_eq!(
+            std::fs::read(&base_cfs).unwrap(),
+            base_bytes_before,
+            "compaction must not touch the base segment"
+        );
+        // total docs preserved through the compactions.
+        assert_eq!(w.document_count(), 20 + 12);
 
         std::fs::remove_dir_all(&dir).ok();
     }
