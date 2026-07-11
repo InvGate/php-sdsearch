@@ -123,8 +123,11 @@ mod tests {
     #[test]
     fn sync_dir_on_nonexistent_path_is_a_noop() {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let missing =
-            std::env::temp_dir().join(format!("sdsearch_syncd_missing_{}_{}", std::process::id(), n));
+        let missing = std::env::temp_dir().join(format!(
+            "sdsearch_syncd_missing_{}_{}",
+            std::process::id(),
+            n
+        ));
         // must not panic even though the path does not exist (errors are ignored).
         sync_dir(&missing);
     }
