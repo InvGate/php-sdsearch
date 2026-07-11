@@ -803,10 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn compacted_batch_matches_uncompacted_and_keeps_names_monotonic() {
-        // Build the SAME docs two ways: with a small ceiling (forces compaction) and with the
-        // policy disabled (max_segments = 0). After commit + optimize both must yield the same
-        // live doc count and the same query results.
+    fn compacted_batch_matches_uncompacted() {
         let docs: Vec<WriterDoc> = (0..25)
             .map(|i| WriterDoc {
                 fields: vec![
@@ -816,7 +813,8 @@ mod tests {
             })
             .collect();
 
-        let run = |max_segments: usize| -> (usize, usize, usize) {
+        // (live_docs, df_shared, df_unique7, compaction_fired)
+        let run = |max_segments: usize| -> (usize, usize, usize, bool) {
             let dir = temp_kb_full();
             let opts = WriterOpts {
                 max_buffered_docs: 1,
@@ -824,34 +822,80 @@ mod tests {
                 ..WriterOpts::default()
             };
             let mut w = IndexWriter::open(&dir, opts).unwrap();
-            for d in &docs {
+            let mut compaction_fired = false;
+            for (i, d) in docs.iter().enumerate() {
                 w.add_document(d.clone()).unwrap();
+                if w.flushed.len() == 1 && i >= 3 {
+                    compaction_fired = true; // flushed collapsed back to one merged segment
+                }
             }
-            w.optimize().unwrap(); // end-of-batch optimize, unchanged
-
-            // after optimize the index is a single segment; name_counter must be >= every used name.
-            let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
-            let next = crate::zsl::writer::segments::segment_name(gen.name_counter);
-            assert!(
-                !dir.join(format!("{next}.cfs")).exists(),
-                "name_counter {} collides with an existing segment file",
-                gen.name_counter
-            );
-
+            w.optimize().unwrap();
             let idx = ZslIndex::open(&dir).unwrap();
-            let n = idx.num_docs();
-            let df_shared = idx.doc_freq("title", "shared");
-            let df_unique = idx.doc_freq("title", "unique7");
+            let out = (
+                idx.num_docs(),
+                idx.doc_freq("title", "shared"),
+                idx.doc_freq("title", "unique7"),
+                compaction_fired,
+            );
             std::fs::remove_dir_all(&dir).ok();
-            (n, df_shared, df_unique)
+            out
         };
 
-        let capped = run(4); // forces several compactions
-        let disabled = run(0); // no intra-batch compaction
-        assert_eq!(capped, disabled, "compacted result must equal uncompacted");
+        let capped = run(4);
+        let disabled = run(0);
+        assert!(
+            capped.3,
+            "capped run must actually trigger intra-batch compaction"
+        );
+        assert!(!disabled.3, "disabled run must never compact");
+        assert_eq!(
+            (capped.0, capped.1, capped.2),
+            (disabled.0, disabled.1, disabled.2),
+            "compacted result must equal uncompacted"
+        );
         assert_eq!(capped.0, 20 + 25, "20 base + 25 added, all live");
         assert_eq!(capped.1, 25, "every added doc has 'shared'");
         assert_eq!(capped.2, 1, "'unique7' appears in exactly one doc");
+    }
+
+    #[test]
+    fn name_counter_stays_monotonic_after_intra_batch_compaction() {
+        // A compacting batch consumes name slots that don't appear in the final flushed list.
+        // Commit WITHOUT optimize (so the intra-batch compacted segment stays referenced) and
+        // assert the committed name_counter equals the writer's true high-water mark. Under the
+        // old bug (base.name_counter + flushed.len()) this is strictly LOWER, so this fails.
+        let dir = temp_kb_full();
+        let opts = WriterOpts {
+            max_buffered_docs: 1,
+            max_segments: 4,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        let mut compaction_fired = false;
+        for i in 0..12 {
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::text("title", &format!("zqx doc{i}"))],
+            })
+            .unwrap();
+            if w.flushed.len() == 1 && i >= 3 {
+                compaction_fired = true;
+            }
+        }
+        assert!(compaction_fired, "test must actually exercise compaction");
+        let hwm = w.next_name_counter; // > base.name_counter + flushed.len() after compaction
+        w.commit().unwrap(); // NO optimize: compacted segment stays live
+
+        let gen = crate::zsl::writer::segments::read_generation(&dir).unwrap();
+        assert_eq!(
+            gen.name_counter, hwm,
+            "committed name_counter must equal writer high-water mark after compaction"
+        );
+        let next_name = crate::zsl::writer::segments::segment_name(gen.name_counter);
+        assert!(
+            !dir.join(format!("{next_name}.cfs")).exists(),
+            "next segment name {next_name} collides with an existing segment"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
