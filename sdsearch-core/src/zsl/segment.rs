@@ -407,6 +407,68 @@ mod tests {
         assert_eq!(got, expected);
     }
 
+    fn seg_multiseg_1() -> ZslSegment {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ));
+        // segment "_1" is the fixture's 2nd commit batch ("gamma vpn tutorial" local doc 0,
+        // "delta backup notes" local doc 1); its "_1_1.del" (del_gen 1) marks local doc 1
+        // deleted. Unlike the KB fixture (no deletes at all), this segment lets a test
+        // actually exercise the delete-filter branch of `for_each_live_posting`.
+        ZslSegment::open_named(&dir, "_1", 1).unwrap()
+    }
+
+    #[test]
+    fn for_each_live_posting_excludes_genuinely_deleted_doc() {
+        let s = seg_multiseg_1();
+
+        // sanity: the fixture really has a deletion here, or the rest of this test is vacuous.
+        assert!(
+            s.is_deleted(1),
+            "fixture local doc 1 (\"delta backup notes\") must be deleted"
+        );
+
+        // "backup" only appears in the deleted doc. Fetch its postings straight from the
+        // .frq via read_freqs (delete-AGNOSTIC — no `deletes.is_deleted` filtering), so this
+        // is an independent source from `positions_all` (which is itself delete-filtered)
+        // and can actually prove `for_each_live_posting` removes something.
+        let field = "title";
+        let term = "backup";
+        let ti = s
+            .dict
+            .info(field, term)
+            .expect("fixture must index title:backup");
+        let raw = read_freqs(s.cfs.sub(&s.frq_name).unwrap(), ti).unwrap();
+        let raw_docs: Vec<usize> = raw.iter().map(|(d, _)| *d).collect();
+        assert!(
+            raw_docs.contains(&1),
+            "delete-agnostic postings must include the deleted doc: {raw_docs:?}"
+        );
+
+        let mut live: Vec<usize> = Vec::new();
+        s.for_each_live_posting(field, term, |d, _pos| live.push(d));
+
+        // the chosen term must have a genuine gap between delete-agnostic and live counts,
+        // otherwise a dropped/inverted filter would not be caught by this test.
+        assert!(
+            raw_docs.len() > live.len(),
+            "term must have delete-agnostic count > live count to be non-vacuous: raw={raw_docs:?} live={live:?}"
+        );
+        assert!(
+            !live.contains(&1),
+            "for_each_live_posting must exclude the deleted doc: live={live:?}"
+        );
+        assert!(live.iter().all(|d| !s.is_deleted(*d)));
+
+        // must also agree with positions_all's doc set (both are delete-filtered).
+        let mut expected: Vec<usize> = s.positions_all(field, term).into_keys().collect();
+        expected.sort();
+        let mut got = live.clone();
+        got.sort();
+        assert_eq!(got, expected);
+    }
+
     #[test]
     fn merge_accessors_expose_fields_deletes_norms_terms_stored() {
         let s = seg(); // incidents fixture, 4 docs, no deletes
