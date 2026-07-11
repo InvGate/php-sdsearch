@@ -22,10 +22,27 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes `bytes` to `<path>.tmp`, does `fsync` (`File::sync_all`) and renames to `path`
-/// (atomic replace). fsync + rename guarantees that, after a crash, `path` holds either the old
-/// content or the new content COMPLETE and durable — never a partial write. `std`-only
+/// Best-effort `fsync` of a directory, to make durable the directory ENTRIES (names) of files
+/// created or renamed inside it. On POSIX, fsync of a file makes its content durable but does
+/// NOT make its directory entry or a `rename` durable — that needs an fsync of the containing
+/// directory. On Unix, opening a directory as a `File` and calling `sync_all` flushes the
+/// dirents; on Windows, `File::open` on a directory fails, so this is a harmless no-op (NTFS
+/// relies on metadata journaling for the same guarantee). Portable WITHOUT `cfg`: errors are
+/// ignored, since this is a best-effort durability improvement, never load-bearing for
+/// correctness on this path.
+pub(crate) fn sync_dir(dir: &Path) {
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+}
+
+/// Writes `bytes` to `<path>.tmp`, does `fsync` (`File::sync_all`), renames to `path` (atomic
+/// replace), then best-effort fsyncs the parent directory via [`sync_dir`]. The file fsync makes
+/// the CONTENT durable; the directory fsync makes the renamed directory ENTRY durable, so after
+/// a crash `path` holds either the old content or the new content COMPLETE. `std`-only
 /// (Windows-safe: `File::sync_all` == `FlushFileBuffers`, `rename` == `MoveFileEx`).
+///
+/// Durability caveat: the parent-directory fsync is a real fsync on Unix but a no-op on Windows
+/// (there is no portable std API to fsync a directory), where the cross-crash durability of the
+/// directory entry relies on NTFS metadata journaling — so the guarantee is platform-dependent.
 /// A single writer holds the write-lock, so the `.tmp` suffix never collides.
 pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let file_name = path
@@ -38,6 +55,9 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?; // fsync: the bytes are on disk before the rename
     }
     std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent); // make the renamed directory entry durable (best-effort)
+    }
     Ok(())
 }
 
@@ -85,5 +105,27 @@ mod tests {
         write_durable(&target, b"payload-2-longer").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"payload-2-longer");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_dir_on_existing_directory_does_not_panic_and_keeps_contents() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sdsearch_syncd_{}_{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"contents").unwrap();
+
+        sync_dir(&dir); // best-effort: real dir-fsync on Unix, no-op on Windows; must not panic
+
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"contents");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_dir_on_nonexistent_path_is_a_noop() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let missing =
+            std::env::temp_dir().join(format!("sdsearch_syncd_missing_{}_{}", std::process::id(), n));
+        // must not panic even though the path does not exist (errors are ignored).
+        sync_dir(&missing);
     }
 }

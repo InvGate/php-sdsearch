@@ -318,6 +318,11 @@ pub fn write_optimized_generation(
     write_i64_be(&mut g, new_gen as i64);
     write_i64_be(&mut g, new_gen as i64);
     super::durability::write_atomic(&index_dir.join("segments.gen"), &g)?;
+    // Make the segments.gen rename durable at the directory level (best-effort; real fsync on
+    // Unix, no-op on Windows). write_durable already fsync'd the segments_{N+1} dirent; the
+    // segments.gen flip goes through write_atomic (no fsync), so sync the directory here so the
+    // optimize() durability promise also covers the generation pointer's rename.
+    super::durability::sync_dir(index_dir);
 
     // best-effort prune of stale generation manifests, only now that the flip is durable.
     prune_old_generations(index_dir, new_gen.saturating_sub(1));
