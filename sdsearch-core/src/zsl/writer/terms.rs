@@ -396,12 +396,136 @@ mod tests {
         terms
     }
 
+    // --- independent oracle: the ORIGINAL (pre-streaming, commit 0654030) `write_term_dict`
+    // algorithm, duplicated here under `reference_*` names so it does NOT call into the
+    // current module's `dump_entry`/`common_prefix`/`write_header`/`write_term_dict` — those
+    // are now shared with `TermDictStreamWriter`, so comparing against them would make the
+    // byte-identity test compare the streaming writer against itself (tautological). Only
+    // `write_term_postings` (from `super`) is reused, since it is untouched by the streaming
+    // refactor and doesn't participate in the pointer/prefix-delta logic under test.
+
+    fn reference_write_term_dict(terms: &[TermPostings]) -> DictFiles {
+        let mut tis = Vec::new();
+        let mut tii = Vec::new();
+        let mut frq = Vec::new();
+        let mut prx = Vec::new();
+
+        reference_write_header(&mut tis);
+        reference_write_header(&mut tii);
+
+        // initial synthetic .tii entry (hand-written, NOT via dump_entry):
+        // the field number is a raw Int 0xFFFFFFFF, not a VInt.
+        write_vint(&mut tii, 0); // prefixChars
+        write_modified_utf8(&mut tii, ""); // empty suffix
+        write_i32_be(&mut tii, -1); // 0xFFFFFFFF
+        tii.push(0x0F);
+        write_vint(&mut tii, 0); // docFreq
+        write_vint(&mut tii, 0); // freqDelta
+        write_vint(&mut tii, 0); // proxDelta
+        write_vint(&mut tii, 24); // IndexDelta
+
+        // state of the previous term in the .tis
+        let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
+        // state of the last sample in the .tii
+        let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
+        let mut last_index_position: u64 = 24;
+
+        for (i, term) in terms.iter().enumerate() {
+            let (freq_ptr, prox_ptr) = write_term_postings(&mut frq, &mut prx, &term.docs);
+            let doc_freq = term.doc_freq();
+
+            reference_dump_entry(&mut tis, prev, term, doc_freq, freq_ptr, prox_ptr);
+            prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
+
+            // sample every indexInterval terms
+            if (i as u64 + 1).is_multiple_of(INDEX_INTERVAL) {
+                reference_dump_entry(&mut tii, idx_prev, term, doc_freq, freq_ptr, prox_ptr);
+                let index_position = tis.len() as u64;
+                write_vint(&mut tii, index_position - last_index_position);
+                last_index_position = index_position;
+                idx_prev = Some((term.text.as_str(), term.field_num, freq_ptr, prox_ptr));
+            }
+        }
+
+        let term_count = terms.len() as u64;
+        reference_patch_long(&mut tis, 4, term_count);
+        let tii_count = (term_count - term_count % INDEX_INTERVAL) / INDEX_INTERVAL + 1;
+        reference_patch_long(&mut tii, 4, tii_count);
+
+        DictFiles { tis, tii, frq, prx }
+    }
+
+    fn reference_write_header(out: &mut Vec<u8>) {
+        write_i32_be(out, MARKER);
+        write_i64_be(out, 0); // placeholder termCount (back-patched at offset 4)
+        write_i32_be(out, INDEX_INTERVAL as i32);
+        write_i32_be(out, SKIP_INTERVAL);
+        write_i32_be(out, MAX_SKIP_LEVELS);
+    }
+
+    fn reference_patch_long(buf: &mut [u8], offset: usize, v: u64) {
+        buf[offset..offset + 8].copy_from_slice(&v.to_be_bytes());
+    }
+
+    /// Writes a term dict entry. Shares a prefix with `prev` only if it is of the SAME
+    /// field; writes freq/prox as a delta relative to `prev`, or absolute if `prev` is None.
+    fn reference_dump_entry(
+        out: &mut Vec<u8>,
+        prev: Option<(&str, usize, u64, u64)>,
+        term: &TermPostings,
+        doc_freq: u32,
+        freq_ptr: u64,
+        prox_ptr: u64,
+    ) {
+        let (prefix_chars, prefix_bytes) = match prev {
+            Some((ptext, pfield, ..)) if pfield == term.field_num => {
+                reference_common_prefix(ptext, &term.text)
+            }
+            _ => (0, 0),
+        };
+        write_vint(out, prefix_chars as u64);
+        write_modified_utf8(out, &term.text[prefix_bytes..]);
+        write_vint(out, term.field_num as u64);
+        write_vint(out, doc_freq as u64);
+        match prev {
+            Some((_, _, pf, pp)) => {
+                write_vint(out, freq_ptr - pf);
+                write_vint(out, prox_ptr - pp);
+            }
+            None => {
+                write_vint(out, freq_ptr);
+                write_vint(out, prox_ptr);
+            }
+        }
+        // skipOffset is omitted: docFreq is always < skipInterval.
+    }
+
+    /// Common prefix in (chars, bytes). Matching chars ⟺ matching bytes (UTF-8),
+    /// so counting equal leading chars reproduces ZSL's byte-then-char calculation.
+    fn reference_common_prefix(a: &str, b: &str) -> (usize, usize) {
+        let mut chars = 0usize;
+        let mut bytes = 0usize;
+        for (ca, cb) in a.chars().zip(b.chars()) {
+            if ca == cb {
+                chars += 1;
+                bytes += ca.len_utf8();
+            } else {
+                break;
+            }
+        }
+        (chars, bytes)
+    }
+
     #[test]
     fn stream_writer_matches_batch_writer_byte_for_byte() {
         let terms = multi_field_sample_terms();
         assert!(terms.len() > 128, "must exceed indexInterval to test .tii sampling + patch");
 
-        let expected = write_term_dict(&terms);
+        // Independent oracle: the pre-streaming reference implementation (duplicated from
+        // git commit 0654030, before `write_term_dict` became a thin wrapper over
+        // `TermDictStreamWriter`), NOT `write_term_dict` itself (which now shares its code
+        // with the streaming writer under test and would make this comparison tautological).
+        let expected = reference_write_term_dict(&terms);
 
         let mut tis = std::io::Cursor::new(Vec::new());
         let mut tii = std::io::Cursor::new(Vec::new());
