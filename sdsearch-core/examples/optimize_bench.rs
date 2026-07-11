@@ -16,6 +16,10 @@
 //!     N   number of docs to add on top of the base (default 2000)
 //!     cap max_buffered_docs while building (default 1000 → ceil(N/cap) flushed segments)
 //!
+//!   cargo run -p sdsearch-core --release --example optimize_bench -- hot <N> [cap]
+//!     same shape, but every doc shares one "stopword" token (doc_freq == N), to check that
+//!     `heap_peak_kb` no longer spikes proportionally to N for a term present in every doc.
+//!
 //! Prints ONE JSON line: {"n":..,"cap":..,"segments_before":..,"doc_count":..,
 //!                        "optimize_ms":..,"heap_peak_kb":..,"vmhwm_kb":..}
 
@@ -155,6 +159,55 @@ fn gen_docs(n: usize) -> Vec<WriterDoc> {
         .collect()
 }
 
+/// N deterministic docs whose `body` starts with the SAME token ("stopword") repeated once,
+/// plus the same per-doc unique tokens as `gen_docs` — so "stopword" gets `doc_freq == n` (a
+/// synthetic near-stopword term), letting `--hot-term` isolate the per-term posting-list spike
+/// the streaming merge (Task 3) is meant to bound.
+fn gen_docs_hot(n: usize) -> Vec<WriterDoc> {
+    const POOL: &[&str] = &[
+        "printer", "network", "vpn", "login", "email", "server", "crash", "slow", "reset",
+        "password", "access", "error", "update", "install", "config", "backup", "restore",
+        "timeout", "license", "upgrade", "firewall", "router", "disk", "memory", "cpu",
+    ];
+    let np = POOL.len();
+    (0..n)
+        .map(|i| {
+            let title = format!(
+                "ticket {i} stopword {} {} issue{i}",
+                POOL[i % np],
+                POOL[(i * 3) % np]
+            );
+            let body: String = (0..40)
+                .map(|j| POOL[(i * 7 + j * 5) % np])
+                .collect::<Vec<_>>()
+                .join(" ");
+            let body = format!("stopword {body} ref{i}");
+            WriterDoc {
+                fields: vec![
+                    WriterField {
+                        name: "title".into(),
+                        value: title,
+                        kind: FieldKind::Text,
+                        stored: true,
+                    },
+                    WriterField {
+                        name: "body".into(),
+                        value: body,
+                        kind: FieldKind::Text,
+                        stored: true,
+                    },
+                    WriterField {
+                        name: "id".into(),
+                        value: format!("REC-{i}"),
+                        kind: FieldKind::Keyword,
+                        stored: true,
+                    },
+                ],
+            }
+        })
+        .collect()
+}
+
 /// copies an arbitrary index dir to `dst` (skips lock files and `.sti`). Overwrites `dst`.
 fn copy_index(src: &Path, dst: &Path) {
     if dst.is_dir() {
@@ -218,10 +271,55 @@ fn run_existing(args: &[String]) {
     std::fs::remove_dir_all(scratch).ok();
 }
 
+/// `optimize_bench hot <N> [cap]`: same shape as the default run, but every doc's `title` and
+/// `body` carry the shared "stopword" token (so it has `doc_freq == N`), to empirically check
+/// that the streaming merge's `heap_peak_kb` no longer spikes proportionally to N for a term
+/// that is in every doc (the near-stopword case the streaming per-posting merge bounds).
+fn run_hot(args: &[String]) {
+    let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let cap: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
+
+    let dir = copy_kb_base(n, cap);
+
+    {
+        let opts = WriterOpts {
+            max_buffered_docs: cap,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).expect("open (build) failed");
+        for d in gen_docs_hot(n) {
+            w.add_document(d).expect("add_document failed");
+        }
+        w.commit().expect("commit failed");
+    }
+
+    let segments_before = sdsearch_core::zsl::segments::read_segment_infos(&dir)
+        .expect("read segment infos")
+        .len();
+
+    reset_peak();
+    let t0 = std::time::Instant::now();
+    let w = IndexWriter::open(&dir, WriterOpts::default()).expect("open (optimize) failed");
+    let report = w.optimize().expect("optimize failed");
+    let optimize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let heap_peak_kb = PEAK.load(Ordering::Relaxed) as u64 / 1024;
+
+    println!(
+        "{{\"mode\":\"hot\",\"n\":{},\"cap\":{},\"segments_before\":{},\"doc_count\":{},\"optimize_ms\":{:.2},\"heap_peak_kb\":{},\"vmhwm_kb\":{}}}",
+        n, cap, segments_before, report.doc_count, optimize_ms, heap_peak_kb, vmhwm_kb()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("existing") {
         run_existing(&args);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("hot") {
+        run_hot(&args);
         return;
     }
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
