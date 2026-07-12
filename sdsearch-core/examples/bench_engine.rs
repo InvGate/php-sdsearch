@@ -87,7 +87,9 @@ unsafe impl GlobalAlloc for TrackingAlloc {
 /// `BENCH_TRACK_HEAP` (default: on). Startup allocations before this are minimal and precede any
 /// `reset_peak`, so LIVE accounting stays consistent for the whole measured region.
 fn init_track() -> bool {
-    let on = std::env::var("BENCH_TRACK_HEAP").map(|v| v != "0").unwrap_or(true);
+    let on = std::env::var("BENCH_TRACK_HEAP")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     TRACK.store(on, Ordering::Relaxed);
     on
 }
@@ -109,7 +111,11 @@ fn heap_peak_kb() -> u64 {
 /// "heap" when the tracking allocator is on (heap number is accurate, ms is taxed), "time"
 /// otherwise (ms is honest, heap is meaningless). The report keys native rows on this.
 fn pass_label() -> &'static str {
-    if TRACK.load(Ordering::Relaxed) { "heap" } else { "time" }
+    if TRACK.load(Ordering::Relaxed) {
+        "heap"
+    } else {
+        "time"
+    }
 }
 
 /// process peak RSS (VmHWM from /proc/self/status), in KB; 0 if unavailable.
@@ -139,9 +145,9 @@ const MISSING: &str = "absenttoken";
 const RARE_K: usize = 5;
 
 const POOL: &[&str] = &[
-    "printer", "network", "vpn", "login", "email", "server", "crash", "slow", "reset",
-    "password", "access", "error", "update", "install", "config", "backup", "restore",
-    "timeout", "license", "upgrade", "firewall", "router", "disk", "memory", "cpu",
+    "printer", "network", "vpn", "login", "email", "server", "crash", "slow", "reset", "password",
+    "access", "error", "update", "install", "config", "backup", "restore", "timeout", "license",
+    "upgrade", "firewall", "router", "disk", "memory", "cpu",
 ];
 
 /// True when doc `i` of an N-doc batch should carry the RARE token, spread over the batch so
@@ -160,7 +166,12 @@ fn gen_one(i: usize, n: usize, id_prefix: &str) -> WriterDoc {
     // title/body draw ONLY from the fixed POOL (bounded vocabulary, like real text) — no unique
     // per-doc token, so the term dictionary stays realistic. The only unique-per-doc term is the
     // `id` keyword (as a real index of N records has N ids).
-    let title = format!("ticket {} {} {}", POOL[i % np], POOL[(i * 3) % np], POOL[(i * 7) % np]);
+    let title = format!(
+        "ticket {} {} {}",
+        POOL[i % np],
+        POOL[(i * 3) % np],
+        POOL[(i * 7) % np]
+    );
     let mut body: String = (0..40)
         .map(|j| POOL[(i * 7 + j * 5) % np])
         .collect::<Vec<_>>()
@@ -173,16 +184,34 @@ fn gen_one(i: usize, n: usize, id_prefix: &str) -> WriterDoc {
     }
     WriterDoc {
         fields: vec![
-            WriterField { name: "title".into(), value: title, kind: FieldKind::Text, stored: true },
-            WriterField { name: "body".into(), value: body, kind: FieldKind::Text, stored: true },
-            WriterField { name: "id".into(), value: format!("{id_prefix}-{i}"), kind: FieldKind::Keyword, stored: true },
+            WriterField {
+                name: "title".into(),
+                value: title,
+                kind: FieldKind::Text,
+                stored: true,
+            },
+            WriterField {
+                name: "body".into(),
+                value: body,
+                kind: FieldKind::Text,
+                stored: true,
+            },
+            WriterField {
+                name: "id".into(),
+                value: format!("{id_prefix}-{i}"),
+                kind: FieldKind::Keyword,
+                stored: true,
+            },
         ],
     }
 }
 
 /// copies the committed KB fixture to a fresh temp dir (skips locks and `.sti`), returns it.
 fn copy_kb_base(tag: &str) -> PathBuf {
-    let src = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zsl_index_kb"));
+    let src = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/zsl_index_kb"
+    ));
     let dst = std::env::temp_dir().join(format!("sdsearch_bench_{}_{}", std::process::id(), tag));
     if dst.is_dir() {
         std::fs::remove_dir_all(&dst).ok();
@@ -203,10 +232,14 @@ fn copy_kb_base(tag: &str) -> PathBuf {
 /// (production shape — the host runs `optimize()` per batch). Unmeasured setup for churn/search.
 fn build_index(n: usize, cap: usize, tag: &str) -> PathBuf {
     let dir = copy_kb_base(tag);
-    let opts = WriterOpts { max_buffered_docs: cap, ..WriterOpts::default() };
+    let opts = WriterOpts {
+        max_buffered_docs: cap,
+        ..WriterOpts::default()
+    };
     let mut w = IndexWriter::open(&dir, opts).expect("open (build) failed");
     for i in 0..n {
-        w.add_document(gen_one(i, n, "REC")).expect("add_document failed");
+        w.add_document(gen_one(i, n, "REC"))
+            .expect("add_document failed");
     }
     w.optimize().expect("optimize failed");
     dir
@@ -219,10 +252,14 @@ fn run_rebuild(n: usize, cap: usize) {
     let dir = copy_kb_base("rebuild");
     reset_peak();
     let t0 = std::time::Instant::now();
-    let opts = WriterOpts { max_buffered_docs: cap, ..WriterOpts::default() };
+    let opts = WriterOpts {
+        max_buffered_docs: cap,
+        ..WriterOpts::default()
+    };
     let mut w = IndexWriter::open(&dir, opts).expect("open (build) failed");
     for i in 0..n {
-        w.add_document(gen_one(i, n, "REC")).expect("add_document failed");
+        w.add_document(gen_one(i, n, "REC"))
+            .expect("add_document failed");
     }
     w.optimize().expect("optimize failed");
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -245,13 +282,17 @@ fn run_churn(n: usize, cap: usize) {
 
     reset_peak();
     let t0 = std::time::Instant::now();
-    let opts = WriterOpts { max_buffered_docs: cap, ..WriterOpts::default() };
+    let opts = WriterOpts {
+        max_buffered_docs: cap,
+        ..WriterOpts::default()
+    };
     let mut w = IndexWriter::open(&dir, opts).expect("open (churn) failed");
     for gid in 0..one_pct {
         w.delete_document(gid);
     }
     for i in 0..one_pct {
-        w.add_document(gen_one(i, n, "CHURN")).expect("add_document failed");
+        w.add_document(gen_one(i, n, "CHURN"))
+            .expect("add_document failed");
     }
     w.commit().expect("commit failed");
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
