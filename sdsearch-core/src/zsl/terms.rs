@@ -100,7 +100,7 @@ impl TermDict {
     }
 
     /// Looks up (field, term) by binary search over the field's compact buffer.
-    pub fn info(&self, field: &str, term: &str) -> Option<&TermInfo> {
+    pub fn info(&self, field: &str, term: &str) -> Option<TermInfo> {
         let ft = self.by_field.get(field)?;
         let target = term.as_bytes();
         let (mut lo, mut hi) = (0usize, ft.len());
@@ -109,7 +109,7 @@ impl TermDict {
             match ft.term(mid).cmp(target) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(&ft.infos[mid]),
+                std::cmp::Ordering::Equal => return Some(ft.infos[mid].clone()),
             }
         }
         None
@@ -184,23 +184,25 @@ pub struct IndexEntry {
 
 /// Lazily-queryable term dictionary: holds the raw `.tis` bytes uninterpreted
 /// and only the SPARSE `.tii` index parsed up front (a small fraction of the
-/// terms). Unlike the eager `TermDict`, opening this does not walk every `.tis`
-/// entry — full term lookups/iteration (Tasks 2-4) will scan `.tis` starting
-/// from the nearest `IndexEntry`.
-// `tis`/`by_field`/`field_names` are scaffolding for now: this task only builds
-// and stores them (`open` + the test-only `index_by_field` accessor); the
-// query/iteration ops that read `tis`/`field_names` land in Tasks 2-4.
-#[allow(dead_code)]
+/// terms), as a single GLOBAL list (not grouped by field). Unlike the eager
+/// `TermDict`, opening this does not walk every `.tis` entry — `info` seeks to
+/// the nearest `IndexEntry` and scans forward from there.
+///
+/// `.tis`/`.tii` are physically ordered by the composite key `(field_name
+/// ascending, text ascending)` (the eager `TermCursor` / writer guarantee
+/// this), so `index` is already sorted by that key and can be binary-searched
+/// with `partition_point`. `index[0]` is a synthetic anchor `("", "")` — see
+/// `open` — so every real target has a well-defined predecessor entry.
 pub struct LazyTermDict {
     tis: Vec<u8>,
-    by_field: std::collections::HashMap<String, Vec<IndexEntry>>,
+    index: Vec<IndexEntry>,
     field_names: Vec<String>,
 }
 
 impl LazyTermDict {
     /// Decodes the `.tii` sparse index (mirrors `TermDict::read`'s header handling,
     /// plus the synthetic first entry ZSL always writes — see `zsl/writer/terms.rs`)
-    /// and stashes a copy of `.tis` for later on-demand decoding (Tasks 2-4).
+    /// and stashes a copy of `.tis` for later on-demand decoding by `info`.
     ///
     /// `.tii` layout: 24-byte header (same shape as `.tis`) + one synthetic entry
     /// (VInt prefix=0, empty String suffix, RAW Int32 field=0xFFFFFFFF, literal byte
@@ -209,12 +211,16 @@ impl LazyTermDict {
     /// N real entries, each like a `.tis` entry but with an extra trailing
     /// VInt IndexDelta.
     ///
-    /// The IndexDelta is a delta of the `.tis` byte offset from which sequential
-    /// scanning must resume to reach the NEXT indexed term (not necessarily that
-    /// term's own start offset when several un-indexed terms lie in between) —
-    /// this mirrors the writer's `last_index_position`/`index_position` bookkeeping
-    /// in `TermDictStreamWriter::dump_tis_entry`. The synthetic entry's IndexDelta
-    /// (24) seeds this accumulator for the first real entry.
+    /// CRITICAL: per `zsl/writer/terms.rs::dump_tis_entry`, each entry's IndexDelta
+    /// is captured from `index_position = self.tis_len` AFTER the sampled term's
+    /// `.tis` entry was written — so an accumulated `tis_offset` points to the
+    /// `.tis` byte position IMMEDIATELY AFTER the indexed term (the start of
+    /// whatever term follows it), not the indexed term's own start. `info` relies on
+    /// this: after an exact hit on an index entry it can only resume decoding from
+    /// `tis_offset`, seeded with that entry's own text/pointers as predecessor state.
+    /// `INDEX_INTERVAL` also counts GLOBALLY across all fields, so a field's first
+    /// term may have no preceding `.tii` sample of its own — the synthetic anchor
+    /// (`tis_offset = 24`, the first real `.tis` term's start) covers that case.
     pub fn open(tis: &[u8], tii: &[u8], field_names: &[String]) -> std::io::Result<LazyTermDict> {
         let mut pos = 0usize;
         // header (same 24 bytes as .tis)
@@ -237,12 +243,24 @@ impl LazyTermDict {
         let _df = read_vint(tii, &mut pos)?;
         let _fd = read_vint(tii, &mut pos)?;
         let _pd = read_vint(tii, &mut pos)?;
-        let mut tis_offset = read_vint(tii, &mut pos)? as usize; // = 24 (first .tis term)
+        let _synthetic_index_delta = read_vint(tii, &mut pos)? as usize; // = 24
 
-        // real index entries, prefix/pointers accumulate across entries.
-        let mut by_field: std::collections::HashMap<String, Vec<IndexEntry>> = Default::default();
+        // synthetic anchor: ("", "") sorts before every real (field, text), and its
+        // tis_offset (24) is the .tis byte position of the first real term, right
+        // after the 24-byte header.
+        let mut index = vec![IndexEntry {
+            field: String::new(),
+            text: String::new(),
+            info: TermInfo {
+                doc_freq: 0,
+                freq_pointer: 0,
+                prox_pointer: 0,
+            },
+            tis_offset: 24,
+        }];
         let mut prev_text = String::new();
         let (mut freq_ptr, mut prox_ptr) = (0u64, 0u64);
+        let mut running = 24usize; // synthetic IndexDelta already consumed above == 24
         while pos < tii.len() {
             let shared = read_vint(tii, &mut pos)? as usize;
             let suffix = read_modified_utf8(tii, &mut pos)?;
@@ -254,7 +272,9 @@ impl LazyTermDict {
             let prefix: String = prev_text.chars().take(shared).collect();
             let text = format!("{prefix}{suffix}");
             let field = field_names.get(field_num).cloned().unwrap_or_default();
-            by_field.entry(field.clone()).or_default().push(IndexEntry {
+            running = running.wrapping_add(index_delta); // ADD FIRST …
+            index.push(IndexEntry {
+                // … THEN assign tis_offset = running
                 field,
                 text: text.clone(),
                 info: TermInfo {
@@ -262,23 +282,88 @@ impl LazyTermDict {
                     freq_pointer: freq_ptr,
                     prox_pointer: prox_ptr,
                 },
-                tis_offset,
+                tis_offset: running,
             });
             prev_text = text;
-            tis_offset = tis_offset.wrapping_add(index_delta);
         }
-        // within a field, index entries are ascending by construction (.tis order); keep as-is.
         Ok(LazyTermDict {
             tis: tis.to_vec(),
-            by_field,
+            index,
             field_names: field_names.to_vec(),
         })
     }
 
-    #[cfg(test)]
-    pub fn index_by_field(&self) -> &std::collections::HashMap<String, Vec<IndexEntry>> {
-        &self.by_field
+    /// Looks up `(field, term)` by seeking to the nearest `.tii` index entry
+    /// at or before it (composite key `(field, text)`) and, unless that's an
+    /// exact hit, forward-decoding `.tis` from there until the target is found,
+    /// passed, or the file ends.
+    pub fn info(&self, field: &str, term: &str) -> Option<TermInfo> {
+        let key = (field, term);
+        // largest index entry with (field, text) <= key. index[0] is the synthetic ("","") anchor,
+        // so partition_point is always >= 1.
+        let gt = self
+            .index
+            .partition_point(|e| (e.field.as_str(), e.text.as_str()) <= key);
+        let anchor = &self.index[gt - 1];
+        if !anchor.text.is_empty() && anchor.field == field && anchor.text == term {
+            return Some(anchor.info.clone()); // exact hit on an index term (no .tis scan)
+        }
+        // scan forward from the anchor's tis_offset (already PAST the anchor's own term), seeded
+        // with the anchor's text/pointers as the predecessor state.
+        let mut pos = anchor.tis_offset;
+        let mut prev = anchor.text.clone();
+        let (mut fp, mut pp) = (anchor.info.freq_pointer, anchor.info.prox_pointer);
+        while pos < self.tis.len() {
+            let (f, t, ti) = decode_entry(
+                &self.tis,
+                &mut pos,
+                &prev,
+                &mut fp,
+                &mut pp,
+                &self.field_names,
+            )
+            .ok()?;
+            match (f.as_str(), t.as_str()).cmp(&key) {
+                std::cmp::Ordering::Equal => return Some(ti),
+                std::cmp::Ordering::Greater => return None, // passed the key in canonical order ⇒ absent
+                std::cmp::Ordering::Less => prev = t,
+            }
+        }
+        None
     }
+}
+
+/// Decodes a single `.tis` entry starting at `*pos`, advancing it past the entry.
+/// Mirrors `TermDict::read`'s per-entry decoding (shared prefix taken over the
+/// previous TEXT only, never across field boundaries — see that function's doc
+/// comment) but for exactly one entry, so `LazyTermDict::info` can resume a scan
+/// from any `.tii`-indexed offset instead of decoding the whole `.tis`.
+fn decode_entry(
+    tis: &[u8],
+    pos: &mut usize,
+    prev_text: &str,
+    freq_ptr: &mut u64,
+    prox_ptr: &mut u64,
+    field_names: &[String],
+) -> std::io::Result<(String, String, TermInfo)> {
+    let shared = read_vint(tis, pos)? as usize;
+    let suffix = read_modified_utf8(tis, pos)?;
+    let field_num = read_vint(tis, pos)? as usize;
+    let doc_freq = read_vint(tis, pos)? as u32;
+    *freq_ptr = freq_ptr.wrapping_add(read_vint(tis, pos)?);
+    *prox_ptr = prox_ptr.wrapping_add(read_vint(tis, pos)?);
+    let prefix: String = prev_text.chars().take(shared).collect();
+    let text = format!("{prefix}{suffix}");
+    let field = field_names.get(field_num).cloned().unwrap_or_default();
+    Ok((
+        field,
+        text,
+        TermInfo {
+            doc_freq,
+            freq_pointer: *freq_ptr,
+            prox_pointer: *prox_ptr,
+        },
+    ))
 }
 
 /// Lazy cursor over all `(field, term)` pairs of a `TermDict`, in ZSL
@@ -443,28 +528,47 @@ mod tests {
         )
     }
 
+    #[cfg(test)]
+    fn fixture_dict_bytes_multiseg() -> (Vec<u8>, Vec<u8>, Vec<String>) {
+        use crate::zsl::cfs::CompoundFile;
+        use crate::zsl::fields::read_field_infos;
+        let dir = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ));
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .unwrap();
+        let cf = CompoundFile::open(&path).unwrap();
+        let find = |ext: &str| cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap();
+        let names: Vec<String> = read_field_infos(cf.sub(&find(".fnm")).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        (
+            cf.sub(&find(".tis")).unwrap().to_vec(),
+            cf.sub(&find(".tii")).unwrap().to_vec(),
+            names,
+        )
+    }
+
     #[test]
-    fn tii_index_terms_are_a_correct_sparse_subset_of_tis() {
-        // KB fixture has few terms → sparse index may hold only field-firsts; use the assertions
-        // that hold regardless of size. (A larger differential is exercised in Task 2.)
-        let (tis, tii, names) = fixture_dict_bytes(); // helper added below
-        let lazy = LazyTermDict::open(&tis, &tii, &names).unwrap();
-        let eager = TermDict::read(&tis, &names).unwrap();
-        // every sparse index entry must be a real term of the eager dict with identical TermInfo,
-        // and its recorded tis_offset must decode (in Task 2) to that same term.
-        for (field, entries) in lazy.index_by_field() {
-            for e in entries {
-                let ti = eager
-                    .info(field, &e.text)
-                    .unwrap_or_else(|| panic!("index term {field}:{} absent in eager", e.text));
-                assert_eq!(*ti, e.info, "TermInfo mismatch for {field}:{}", e.text);
+    fn lazy_info_matches_eager_for_every_term_and_absentees() {
+        for (tis, tii, names) in [fixture_dict_bytes(), fixture_dict_bytes_multiseg()] {
+            let eager = TermDict::read(&tis, &names).unwrap();
+            let lazy = LazyTermDict::open(&tis, &tii, &names).unwrap();
+            for (field, text) in eager.iter_terms() {
+                assert_eq!(
+                    lazy.info(&field, &text),
+                    eager.info(&field, &text),
+                    "mismatch at {field}:{text}"
+                );
             }
+            assert_eq!(lazy.info("title", "definitelymissing"), None);
+            assert_eq!(lazy.info("no_such_field", "x"), None);
         }
-        // the synthetic sentinel (empty text, field 0xFFFFFFFF) must NOT appear as an index entry.
-        assert!(lazy
-            .index_by_field()
-            .values()
-            .flatten()
-            .all(|e| !e.text.is_empty()));
     }
 }

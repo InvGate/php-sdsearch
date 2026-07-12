@@ -72,7 +72,7 @@ impl ZslSegment {
             return;
         };
         // degrade: a corrupt tail stops iteration rather than panicking across FFI
-        let _ = for_each_posting(frq, prx, ti, |d, pos| {
+        let _ = for_each_posting(frq, prx, &ti, |d, pos| {
             if !self.deletes.is_deleted(d) {
                 f(d, pos);
             }
@@ -207,7 +207,7 @@ impl IndexReader for ZslSegment {
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
         match self.dict.info(field, term) {
             // degrade: a corrupt .frq yields no postings rather than a panic across FFI
-            Some(ti) => read_freqs(self.cfs.sub(&self.frq_name).unwrap(), ti)
+            Some(ti) => read_freqs(self.cfs.sub(&self.frq_name).unwrap(), &ti)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|(d, _)| !self.deletes.is_deleted(*d))
@@ -251,7 +251,7 @@ impl IndexReader for ZslSegment {
             Some(ti) => read_positions(
                 self.cfs.sub(&self.frq_name).unwrap(),
                 self.cfs.sub(&self.prx_name).unwrap(),
-                ti,
+                &ti,
                 doc_id,
             )
             .unwrap_or_default(),
@@ -266,7 +266,7 @@ impl IndexReader for ZslSegment {
             Some(ti) if !self.prx_name.is_empty() => read_all_positions(
                 self.cfs.sub(&self.frq_name).unwrap(),
                 self.cfs.sub(&self.prx_name).unwrap(),
-                ti,
+                &ti,
             )
             .unwrap_or_default()
             .into_iter()
@@ -439,7 +439,7 @@ mod tests {
             .dict
             .info(field, term)
             .expect("fixture must index title:backup");
-        let raw = read_freqs(s.cfs.sub(&s.frq_name).unwrap(), ti).unwrap();
+        let raw = read_freqs(s.cfs.sub(&s.frq_name).unwrap(), &ti).unwrap();
         let raw_docs: Vec<usize> = raw.iter().map(|(d, _)| *d).collect();
         assert!(
             raw_docs.contains(&1),

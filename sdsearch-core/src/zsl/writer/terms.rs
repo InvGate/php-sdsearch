@@ -443,11 +443,11 @@ mod tests {
         assert_eq!(dict.info("title", "done").unwrap().doc_freq, 1);
 
         let body_new = dict.info("body", "new").unwrap();
-        assert_eq!(read_freqs(&f.frq, body_new).unwrap(), vec![(0, 2)]);
+        assert_eq!(read_freqs(&f.frq, &body_new).unwrap(), vec![(0, 2)]);
 
         let title_wf = dict.info("title", "workflow").unwrap();
         assert_eq!(
-            read_all_positions(&f.frq, &f.prx, title_wf).unwrap(),
+            read_all_positions(&f.frq, &f.prx, &title_wf).unwrap(),
             vec![(0, vec![2]), (1, vec![1])]
         );
     }

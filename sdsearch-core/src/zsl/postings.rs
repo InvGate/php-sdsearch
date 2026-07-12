@@ -149,7 +149,7 @@ mod tests {
             .collect();
         let dict = TermDict::read(&sub(".tis"), &names).unwrap();
         let info = dict.info("title", "new").unwrap();
-        let freqs = read_freqs(&sub(".frq"), info).unwrap();
+        let freqs = read_freqs(&sub(".frq"), &info).unwrap();
         // "new" is in all 4 docs (all "New workflow"), freq 1 each
         assert_eq!(freqs, vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
     }
