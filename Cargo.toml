@@ -16,3 +16,58 @@ members = ["sdsearch-core", "sdsearch-php"]
 strip = "symbols"   # drop the symbol table: smaller binary, no internal-name leakage
 lto = "fat"         # whole-program LTO: maximum optimization (build time is not a concern)
 codegen-units = 1   # let the optimizer work across the whole crate
+
+# Workspace-wide lint policy, inherited by each member via `[lints] workspace = true`.
+# CI runs `cargo clippy --all-targets -- -D warnings`, so every `warn` here is effectively a
+# hard gate. Levels are curated to be high-signal on THIS codebase (an FFI extension with
+# unsafe + heavy hand-rolled byte parsing), not the full pedantic firehose.
+[workspace.lints.rust]
+# In an `unsafe fn`, still require an explicit `unsafe {}` around each unsafe op — the FFI /
+# mmap / GlobalAlloc code is exactly where a silently-unsafe body hides a real hazard.
+unsafe_op_in_unsafe_fn = "deny"
+# `pub` items not actually reachable from the crate's public API should be `pub(crate)`.
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# pedantic as a baseline (priority -1 so the specific `allow`s below win over it), then opt OUT
+# of the pedantic lints that are noise on THIS codebase instead of fixing hundreds of call sites.
+pedantic = { level = "warn", priority = -1 }
+
+# Intentional narrowing/among-format casts. This crate hand-decodes a binary index format where
+# `read_vint(...) as usize`, `len as u32`, etc. are deliberate and bounds-are-checked elsewhere;
+# rewriting every one as TryFrom would bloat and slow the hot parse paths for no real safety win.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+
+# Doc-prose nags with high false-positive rates on our comments (bare `.tis`, `ZSL`, `TermInfo`,
+# etc. flagged as needing backticks; every fallible/panicking internal fn asked for a section).
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# Structural nags that fight the existing (deliberate) style of this codebase.
+too_many_lines = "allow"
+similar_names = "allow"
+items_after_statements = "allow"
+implicit_hasher = "allow"
+
+# Exact float compares live only in tests asserting known table values (encode_norm, length_norm,
+# a zero score) — an exact `==` is precisely what those want.
+float_cmp = "allow"
+# Segment file extensions are always written lowercase by our own writer, so the case-sensitive
+# `ends_with(".tis")` comparisons are correct and intentional.
+case_sensitive_file_extension_comparisons = "allow"
+# Consumer/builder APIs (e.g. `IndexReader::add_document(self, doc: Document)`) deliberately take
+# ownership even when the current body doesn't move every field — that is the intended contract.
+needless_pass_by_value = "allow"
+# `&Option<T>` is a fine signature for an internal helper; not worth rippling through call sites.
+ref_option = "allow"
+# JSON usage examples in doc comments (`{"fields":[...]}`) trip the intra-doc-link heuristic.
+doc_link_with_quotes = "allow"
+
+# leftover debugging that must never reach a release.
+todo = "warn"
+dbg_macro = "warn"

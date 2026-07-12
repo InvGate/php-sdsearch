@@ -9,6 +9,9 @@ authors = ["InvGate"]
 keywords = ["lucene", "search", "zend", "php", "index"]
 categories = ["text-processing"]
 
+[lints]
+workspace = true
+
 [lib]
 name = "sdsearch"
 crate-type = ["cdylib"]
