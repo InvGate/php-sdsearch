@@ -5,3 +5,5 @@
 /.remember/
 /.claude/
 /coverage
+/benches/results.jsonl
+/benches/run_full.log

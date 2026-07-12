@@ -107,6 +107,11 @@ Order-of-magnitude numbers from local benchmarking against the legacy PHP engine
 These are single-machine, order-of-magnitude measurements, not precise benchmarks — treat
 them as a shape-of-the-win indicator, not a guarantee.
 
+For a reproducible, self-contained benchmark suite — rebuild / churn / search across
+1k–500k-document indexes, comparing the PHP extension against Zend Search Lucene on an
+identical deterministic corpus, with per-operation Rust heap and process RSS — see
+[`benches/`](benches/README.md) (`./benches/run.sh`).
+
 ## Continuous integration
 
 The pipeline in `.github/workflows/ci.yml` runs on every push/PR:
