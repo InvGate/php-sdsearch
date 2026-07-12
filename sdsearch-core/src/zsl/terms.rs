@@ -172,6 +172,115 @@ impl TermDict {
     }
 }
 
+/// One sampled entry of the sparse `.tii` index: a full term (text + `TermInfo`)
+/// plus the `.tis` byte offset from which sequential scanning must resume to
+/// reach it (see `LazyTermDict::open`'s module-level accumulation note).
+pub struct IndexEntry {
+    pub field: String,
+    pub text: String,
+    pub info: TermInfo,
+    pub tis_offset: usize,
+}
+
+/// Lazily-queryable term dictionary: holds the raw `.tis` bytes uninterpreted
+/// and only the SPARSE `.tii` index parsed up front (a small fraction of the
+/// terms). Unlike the eager `TermDict`, opening this does not walk every `.tis`
+/// entry — full term lookups/iteration (Tasks 2-4) will scan `.tis` starting
+/// from the nearest `IndexEntry`.
+// `tis`/`by_field`/`field_names` are scaffolding for now: this task only builds
+// and stores them (`open` + the test-only `index_by_field` accessor); the
+// query/iteration ops that read `tis`/`field_names` land in Tasks 2-4.
+#[allow(dead_code)]
+pub struct LazyTermDict {
+    tis: Vec<u8>,
+    by_field: std::collections::HashMap<String, Vec<IndexEntry>>,
+    field_names: Vec<String>,
+}
+
+impl LazyTermDict {
+    /// Decodes the `.tii` sparse index (mirrors `TermDict::read`'s header handling,
+    /// plus the synthetic first entry ZSL always writes — see `zsl/writer/terms.rs`)
+    /// and stashes a copy of `.tis` for later on-demand decoding (Tasks 2-4).
+    ///
+    /// `.tii` layout: 24-byte header (same shape as `.tis`) + one synthetic entry
+    /// (VInt prefix=0, empty String suffix, RAW Int32 field=0xFFFFFFFF, literal byte
+    /// 0x0F, VInt docFreq=0, VInt freqDelta=0, VInt proxDelta=0, VInt IndexDelta=24 —
+    /// the `.tis` offset of the first real term, right after its 24-byte header) +
+    /// N real entries, each like a `.tis` entry but with an extra trailing
+    /// VInt IndexDelta.
+    ///
+    /// The IndexDelta is a delta of the `.tis` byte offset from which sequential
+    /// scanning must resume to reach the NEXT indexed term (not necessarily that
+    /// term's own start offset when several un-indexed terms lie in between) —
+    /// this mirrors the writer's `last_index_position`/`index_position` bookkeeping
+    /// in `TermDictStreamWriter::dump_tis_entry`. The synthetic entry's IndexDelta
+    /// (24) seeds this accumulator for the first real entry.
+    pub fn open(tis: &[u8], tii: &[u8], field_names: &[String]) -> std::io::Result<LazyTermDict> {
+        let mut pos = 0usize;
+        // header (same 24 bytes as .tis)
+        let _marker = read_i32_be(tii, &mut pos)?;
+        let _index_count = read_u64_be(tii, &mut pos)?;
+        let _index_interval = read_i32_be(tii, &mut pos)?;
+        let _skip_interval = read_i32_be(tii, &mut pos)?;
+        let _max_skip_levels = read_i32_be(tii, &mut pos)?;
+
+        // synthetic first entry: VInt prefix, String suffix, RAW Int32 field (0xFFFFFFFF),
+        // literal byte 0x0F, VInt docFreq, VInt freqDelta, VInt proxDelta, VInt IndexDelta.
+        let _pfx = read_vint(tii, &mut pos)?;
+        let _suf = read_modified_utf8(tii, &mut pos)?;
+        let _raw_field = read_i32_be(tii, &mut pos)?; // raw Int, not VInt
+                                                      // consume the literal 0x0F marker byte:
+        if pos >= tii.len() {
+            return Err(std::io::Error::other("tii: truncated synthetic entry"));
+        }
+        pos += 1;
+        let _df = read_vint(tii, &mut pos)?;
+        let _fd = read_vint(tii, &mut pos)?;
+        let _pd = read_vint(tii, &mut pos)?;
+        let mut tis_offset = read_vint(tii, &mut pos)? as usize; // = 24 (first .tis term)
+
+        // real index entries, prefix/pointers accumulate across entries.
+        let mut by_field: std::collections::HashMap<String, Vec<IndexEntry>> = Default::default();
+        let mut prev_text = String::new();
+        let (mut freq_ptr, mut prox_ptr) = (0u64, 0u64);
+        while pos < tii.len() {
+            let shared = read_vint(tii, &mut pos)? as usize;
+            let suffix = read_modified_utf8(tii, &mut pos)?;
+            let field_num = read_vint(tii, &mut pos)? as usize;
+            let doc_freq = read_vint(tii, &mut pos)? as u32;
+            freq_ptr = freq_ptr.wrapping_add(read_vint(tii, &mut pos)?);
+            prox_ptr = prox_ptr.wrapping_add(read_vint(tii, &mut pos)?);
+            let index_delta = read_vint(tii, &mut pos)? as usize;
+            let prefix: String = prev_text.chars().take(shared).collect();
+            let text = format!("{prefix}{suffix}");
+            let field = field_names.get(field_num).cloned().unwrap_or_default();
+            by_field.entry(field.clone()).or_default().push(IndexEntry {
+                field,
+                text: text.clone(),
+                info: TermInfo {
+                    doc_freq,
+                    freq_pointer: freq_ptr,
+                    prox_pointer: prox_ptr,
+                },
+                tis_offset,
+            });
+            prev_text = text;
+            tis_offset = tis_offset.wrapping_add(index_delta);
+        }
+        // within a field, index entries are ascending by construction (.tis order); keep as-is.
+        Ok(LazyTermDict {
+            tis: tis.to_vec(),
+            by_field,
+            field_names: field_names.to_vec(),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn index_by_field(&self) -> &std::collections::HashMap<String, Vec<IndexEntry>> {
+        &self.by_field
+    }
+}
+
 /// Lazy cursor over all `(field, term)` pairs of a `TermDict`, in ZSL
 /// canonical order (field names sorted ascending, terms ascending within each
 /// field — equivalent to sorting `(fieldName, text)` tuples since `\0` is the
@@ -305,5 +414,57 @@ mod tests {
         );
         // total count = sum of terms per field (non-empty)
         assert!(!got.is_empty());
+    }
+
+    #[cfg(test)]
+    fn fixture_dict_bytes() -> (Vec<u8>, Vec<u8>, Vec<String>) {
+        use crate::zsl::cfs::CompoundFile;
+        use crate::zsl::fields::read_field_infos;
+        let dir = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index"
+        ));
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .unwrap();
+        let cf = CompoundFile::open(&path).unwrap();
+        let find = |ext: &str| cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap();
+        let names: Vec<String> = read_field_infos(cf.sub(&find(".fnm")).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        (
+            cf.sub(&find(".tis")).unwrap().to_vec(),
+            cf.sub(&find(".tii")).unwrap().to_vec(),
+            names,
+        )
+    }
+
+    #[test]
+    fn tii_index_terms_are_a_correct_sparse_subset_of_tis() {
+        // KB fixture has few terms → sparse index may hold only field-firsts; use the assertions
+        // that hold regardless of size. (A larger differential is exercised in Task 2.)
+        let (tis, tii, names) = fixture_dict_bytes(); // helper added below
+        let lazy = LazyTermDict::open(&tis, &tii, &names).unwrap();
+        let eager = TermDict::read(&tis, &names).unwrap();
+        // every sparse index entry must be a real term of the eager dict with identical TermInfo,
+        // and its recorded tis_offset must decode (in Task 2) to that same term.
+        for (field, entries) in lazy.index_by_field() {
+            for e in entries {
+                let ti = eager
+                    .info(field, &e.text)
+                    .unwrap_or_else(|| panic!("index term {field}:{} absent in eager", e.text));
+                assert_eq!(*ti, e.info, "TermInfo mismatch for {field}:{}", e.text);
+            }
+        }
+        // the synthetic sentinel (empty text, field 0xFFFFFFFF) must NOT appear as an index entry.
+        assert!(lazy
+            .index_by_field()
+            .values()
+            .flatten()
+            .all(|e| !e.text.is_empty()));
     }
 }
