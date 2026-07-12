@@ -413,7 +413,7 @@ impl TermDict {
     /// per-field grouping needed, unlike the eager `EagerTermDict::iter_terms`
     /// (which enumerates a `HashMap` and so has no ordering guarantee of its
     /// own). Used by both `iter_terms` and `cursor`.
-    fn decode_all(&self) -> Vec<(String, String)> {
+    fn decode_all(&self) -> Vec<(String, String, TermInfo)> {
         let mut pos = 24usize; // past the header
         let mut prev = String::new();
         let (mut fp, mut pp) = (0u64, 0u64);
@@ -427,9 +427,9 @@ impl TermDict {
                 &mut pp,
                 &self.field_names,
             ) {
-                Ok((f, t, _)) => {
+                Ok((f, t, ti)) => {
                     prev = t.clone();
-                    out.push((f, t));
+                    out.push((f, t, ti));
                 }
                 Err(_) => break,
             }
@@ -442,6 +442,9 @@ impl TermDict {
     /// and copy their postings via `positions_all(field, text)`.
     pub fn iter_terms(&self) -> Vec<(String, String)> {
         self.decode_all()
+            .into_iter()
+            .map(|(f, t, _)| (f, t))
+            .collect()
     }
 
     /// Cursor over every `(field, term)` pair in ZSL canonical order,
@@ -461,9 +464,11 @@ impl TermDict {
 /// Owned cursor over a `TermDict`'s terms in canonical order (see
 /// `TermDict::cursor`). Pre-decoded at construction time since the merge
 /// reads every entry anyway, so there's no benefit to decoding lazily on
-/// `advance`.
+/// `advance`. Each entry keeps the term's decoded `TermInfo` alongside its
+/// `(field, text)` so the streaming merge can read that term's postings
+/// WITHOUT a second `TermDict::info` seek — see `peek_info`.
 pub struct TermCursor {
-    terms: Vec<(String, String)>,
+    terms: Vec<(String, String, TermInfo)>,
     i: usize,
 }
 
@@ -472,7 +477,15 @@ impl TermCursor {
     pub fn peek(&self) -> Option<(&str, &str)> {
         self.terms
             .get(self.i)
-            .map(|(f, t)| (f.as_str(), t.as_str()))
+            .map(|(f, t, _)| (f.as_str(), t.as_str()))
+    }
+
+    /// `TermInfo` of the current term (the one `peek` returns), or `None` once
+    /// exhausted. The streaming merge captures this at the moment it pops a
+    /// term from its k-way heap — BEFORE `advance` moves the cursor on — so it
+    /// can read the term's postings directly instead of re-seeking the dict.
+    pub fn peek_info(&self) -> Option<&TermInfo> {
+        self.terms.get(self.i).map(|(_, _, ti)| ti)
     }
 
     /// moves to the next pair in canonical order. No-op once exhausted.

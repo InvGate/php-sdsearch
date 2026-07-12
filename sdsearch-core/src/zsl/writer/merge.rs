@@ -16,6 +16,7 @@ use super::invert::{FieldMeta, StoredField, TermPostings};
 use super::{assemble_cfs, fnm, norms, stored, terms};
 use crate::index::IndexReader;
 use crate::zsl::segment::ZslSegment;
+use crate::zsl::terms::TermInfo;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::File;
@@ -378,7 +379,18 @@ fn merge_streaming_inner(
     while let Some(Reverse((field, term, first_si))) = heap.pop() {
         // gather EVERY segment currently positioned at this exact (field, term). Advancing a
         // cursor and re-pushing its next (strictly greater) term keeps the heap in sync.
-        let mut contributing: Vec<usize> = vec![first_si];
+        //
+        // GOTCHA: each contributing cursor's `TermInfo` is captured HERE, at pop time, BEFORE
+        // `advance()` moves it past this term. A segment has at most one key on the heap at a
+        // time, pushed by a `peek()` that did NOT advance the cursor — so when that key is
+        // popped, `cursors[si]` is still positioned exactly at `(field, term)` and `peek_info()`
+        // is this term's info. After `advance()` it would be the NEXT term's, which is why we
+        // must not read it at posting-copy time below.
+        let first_ti = cursors[first_si]
+            .peek_info()
+            .expect("a cursor whose key is on the heap is positioned at that term")
+            .clone();
+        let mut contributing: Vec<(usize, TermInfo)> = vec![(first_si, first_ti)];
         cursors[first_si].advance();
         if let Some((f, t)) = cursors[first_si].peek() {
             heap.push(Reverse((f.to_string(), t.to_string(), first_si)));
@@ -389,7 +401,11 @@ fn merge_streaming_inner(
                 break;
             }
             let Reverse((_, _, si)) = heap.pop().unwrap();
-            contributing.push(si);
+            let ti = cursors[si]
+                .peek_info()
+                .expect("a cursor whose key is on the heap is positioned at that term")
+                .clone();
+            contributing.push((si, ti));
             cursors[si].advance();
             if let Some((f, t)) = cursors[si].peek() {
                 heap.push(Reverse((f.to_string(), t.to_string(), si)));
@@ -398,20 +414,21 @@ fn merge_streaming_inner(
 
         // Contributing segments in ASCENDING index (+ locals ascending within each) => new
         // doc-ids come out ascending, matching merge_segments' BTreeMap<new_id, _> ordering
-        // (dense renumbering assigns lower ids to earlier segments). `for_each_live_posting`
+        // (dense renumbering assigns lower ids to earlier segments). `for_each_live_posting_ti`
         // yields ascending LOCAL doc within a segment, which maps to ascending NEW id (dense
         // renumbering), and segment ranges are globally ordered — so postings arrive in
         // ascending new-id order across the whole term without any gather/sort, bounding peak
         // memory to one posting's positions rather than the whole term's doc list.
-        contributing.sort_unstable();
+        contributing.sort_unstable_by_key(|(si, _)| *si);
         let mf = field_index[&field];
         dict_writer.begin_term(mf, &term)?;
-        for &si in &contributing {
+        for (si, ti) in &contributing {
+            let si = *si;
             let map = &doc_maps[si];
-            // `for_each_live_posting`'s callback is `FnMut` and can't propagate `?`, so capture
+            // `for_each_live_posting_ti`'s callback is `FnMut` and can't propagate `?`, so capture
             // any `add_posting` error here and check it after the segment finishes iterating.
             let mut posting_err: Option<io::Error> = None;
-            segs[si].for_each_live_posting(&field, &term, |local, positions| {
+            segs[si].for_each_live_posting_ti(ti, |local, positions| {
                 if posting_err.is_some() {
                     return;
                 }

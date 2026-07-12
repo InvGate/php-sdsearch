@@ -6,7 +6,7 @@ use crate::zsl::fields::{read_field_infos, FieldInfo};
 use crate::zsl::norms::{approx_field_len, read_norms};
 use crate::zsl::postings::{for_each_posting, read_all_positions, read_freqs, read_positions};
 use crate::zsl::stored::{read_stored_fields, read_stored_raw, StoredRaw};
-use crate::zsl::terms::{TermCursor, TermDict};
+use crate::zsl::terms::{TermCursor, TermDict, TermInfo};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -73,6 +73,32 @@ impl ZslSegment {
         };
         // degrade: a corrupt tail stops iteration rather than panicking across FFI
         let _ = for_each_posting(frq, prx, &ti, |d, pos| {
+            if !self.deletes.is_deleted(d) {
+                f(d, pos);
+            }
+        });
+    }
+
+    /// Like [`for_each_live_posting`](Self::for_each_live_posting) but takes a `TermInfo`
+    /// the caller already has (captured from a [`TermCursor::peek_info`] during the merge)
+    /// instead of resolving it via `self.dict.info(field, term)`. Semantics are otherwise
+    /// identical: no-op if `.prx` is absent, deletes filtered, a corrupt tail stops iteration
+    /// rather than panicking across FFI.
+    ///
+    /// This is the merge's fast path: the lazy `TermDict::info` forward-decodes up to
+    /// `INDEX_INTERVAL` (128) `.tis` entries per call, so re-looking-up every term during a
+    /// full-index merge is O(term_count × 128); the cursor already decoded each `TermInfo`
+    /// while walking `.tis` once, so threading it through here avoids all the re-seeking.
+    pub fn for_each_live_posting_ti(&self, term_info: &TermInfo, mut f: impl FnMut(usize, &[u32])) {
+        if self.prx_name.is_empty() {
+            return;
+        }
+        let (Some(frq), Some(prx)) = (self.cfs.sub(&self.frq_name), self.cfs.sub(&self.prx_name))
+        else {
+            return;
+        };
+        // degrade: a corrupt tail stops iteration rather than panicking across FFI
+        let _ = for_each_posting(frq, prx, term_info, |d, pos| {
             if !self.deletes.is_deleted(d) {
                 f(d, pos);
             }
