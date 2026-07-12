@@ -118,7 +118,7 @@ mod tests {
     use super::*;
     use crate::zsl::cfs::CompoundFile;
     use crate::zsl::fields::read_field_infos;
-    use crate::zsl::terms::TermDict;
+    use crate::zsl::terms::EagerTermDict;
     use std::path::PathBuf;
 
     fn cfs() -> CompoundFile {
@@ -147,7 +147,7 @@ mod tests {
             .into_iter()
             .map(|f| f.name)
             .collect();
-        let dict = TermDict::read(&sub(".tis"), &names).unwrap();
+        let dict = EagerTermDict::read(&sub(".tis"), &names).unwrap();
         let info = dict.info("title", "new").unwrap();
         let freqs = read_freqs(&sub(".frq"), &info).unwrap();
         // "new" is in all 4 docs (all "New workflow"), freq 1 each

@@ -13,8 +13,13 @@ pub struct TermInfo {
 /// with parallel arrays of offsets and infos. Cuts RAM sharply (less allocator
 /// overhead) while keeping O(log N) binary search. ZSL writes terms grouped by field
 /// and sorted by text, so the buffer stays sorted.
+///
+/// `#[cfg(test)]`: the eager full-parse dictionary is kept ONLY as the
+/// differential oracle for the lazy production `TermDict` (see module tests);
+/// production never compiles it.
+#[cfg(test)]
 #[derive(Default)]
-struct FieldTerms {
+struct EagerFieldTerms {
     /// term texts concatenated, in ascending order.
     text: Vec<u8>,
     /// n+1 offsets: term i is `text[offsets[i]..offsets[i+1]]`.
@@ -23,7 +28,8 @@ struct FieldTerms {
     infos: Vec<TermInfo>,
 }
 
-impl FieldTerms {
+#[cfg(test)]
+impl EagerFieldTerms {
     fn len(&self) -> usize {
         self.infos.len()
     }
@@ -37,15 +43,21 @@ impl FieldTerms {
     /// unlike `iter_terms`'s owned `String::from_utf8_lossy`.
     fn term_str(&self, i: usize) -> &str {
         std::str::from_utf8(self.term(i))
-            .expect("FieldTerms invariant violated: term bytes are valid UTF-8")
+            .expect("EagerFieldTerms invariant violated: term bytes are valid UTF-8")
     }
 }
 
-pub struct TermDict {
-    by_field: std::collections::HashMap<String, FieldTerms>,
+/// Eager full-parse term dictionary, kept ONLY as a `#[cfg(test)]` differential
+/// oracle: it walks the ENTIRE `.tis` up front into per-field compact buffers.
+/// Production uses the lazy `.tii`-backed `TermDict` below; the module tests
+/// assert the two agree on every query over the fixtures and a synthetic corpus.
+#[cfg(test)]
+pub struct EagerTermDict {
+    by_field: std::collections::HashMap<String, EagerFieldTerms>,
 }
 
-impl TermDict {
+#[cfg(test)]
+impl EagerTermDict {
     /// Decodes the `.tis` (format 2.1+, marker 0xFFFFFFFD).
     ///
     /// Each entry shares a prefix with the previous term ONLY over the
@@ -55,7 +67,7 @@ impl TermDict {
     /// distinguishing field) reproduces exactly what `DictionaryLoader::load` does.
     /// The freq/prox pointers are deltas accumulated across the WHOLE file,
     /// not per field.
-    pub fn read(tis: &[u8], field_names: &[String]) -> std::io::Result<TermDict> {
+    pub fn read(tis: &[u8], field_names: &[String]) -> std::io::Result<EagerTermDict> {
         let mut pos = 0usize;
         let _marker = read_i32_be(tis, &mut pos)?;
         let term_count = read_u64_be(tis, &mut pos)?;
@@ -63,7 +75,7 @@ impl TermDict {
         let _skip_interval = read_i32_be(tis, &mut pos)?;
         let _max_skip_levels = read_i32_be(tis, &mut pos)?;
 
-        let mut by_field: std::collections::HashMap<String, FieldTerms> =
+        let mut by_field: std::collections::HashMap<String, EagerFieldTerms> =
             std::collections::HashMap::new();
         let mut prev_text = String::new();
         let mut freq_ptr: u64 = 0;
@@ -96,7 +108,7 @@ impl TermDict {
         for ft in by_field.values_mut() {
             ft.offsets.push(ft.text.len() as u32);
         }
-        Ok(TermDict { by_field })
+        Ok(EagerTermDict { by_field })
     }
 
     /// Looks up (field, term) by binary search over the field's compact buffer.
@@ -151,8 +163,8 @@ impl TermDict {
     /// (`fieldName · \0 · text`, i.e. field names ascending, terms ascending
     /// within each field). Unlike `iter_terms`, never materializes a `Vec` of
     /// all terms up front — the k-way streaming merge walks this instead.
-    pub fn cursor(&self) -> TermCursor<'_> {
-        TermCursor::new(self)
+    pub fn cursor(&self) -> EagerTermCursor<'_> {
+        EagerTermCursor::new(self)
     }
 
     /// Enumerates ALL terms as `(field, text)`. Order not guaranteed (grouped by
@@ -174,7 +186,7 @@ impl TermDict {
 
 /// One sampled entry of the sparse `.tii` index: a full term (text + `TermInfo`)
 /// plus the `.tis` byte offset from which sequential scanning must resume to
-/// reach it (see `LazyTermDict::open`'s module-level accumulation note).
+/// reach it (see `TermDict::open`'s module-level accumulation note).
 pub struct IndexEntry {
     pub field: String,
     pub text: String,
@@ -185,22 +197,22 @@ pub struct IndexEntry {
 /// Lazily-queryable term dictionary: holds the raw `.tis` bytes uninterpreted
 /// and only the SPARSE `.tii` index parsed up front (a small fraction of the
 /// terms), as a single GLOBAL list (not grouped by field). Unlike the eager
-/// `TermDict`, opening this does not walk every `.tis` entry — `info` seeks to
+/// `EagerTermDict`, opening this does not walk every `.tis` entry — `info` seeks to
 /// the nearest `IndexEntry` and scans forward from there.
 ///
 /// `.tis`/`.tii` are physically ordered by the composite key `(field_name
-/// ascending, text ascending)` (the eager `TermCursor` / writer guarantee
+/// ascending, text ascending)` (the eager `EagerTermCursor` / writer guarantee
 /// this), so `index` is already sorted by that key and can be binary-searched
 /// with `partition_point`. `index[0]` is a synthetic anchor `("", "")` — see
 /// `open` — so every real target has a well-defined predecessor entry.
-pub struct LazyTermDict {
+pub struct TermDict {
     tis: Vec<u8>,
     index: Vec<IndexEntry>,
     field_names: Vec<String>,
 }
 
-impl LazyTermDict {
-    /// Decodes the `.tii` sparse index (mirrors `TermDict::read`'s header handling,
+impl TermDict {
+    /// Decodes the `.tii` sparse index (mirrors `EagerTermDict::read`'s header handling,
     /// plus the synthetic first entry ZSL always writes — see `zsl/writer/terms.rs`)
     /// and stashes a copy of `.tis` for later on-demand decoding by `info`.
     ///
@@ -221,7 +233,7 @@ impl LazyTermDict {
     /// `INDEX_INTERVAL` also counts GLOBALLY across all fields, so a field's first
     /// term may have no preceding `.tii` sample of its own — the synthetic anchor
     /// (`tis_offset = 24`, the first real `.tis` term's start) covers that case.
-    pub fn open(tis: &[u8], tii: &[u8], field_names: &[String]) -> std::io::Result<LazyTermDict> {
+    pub fn open(tis: &[u8], tii: &[u8], field_names: &[String]) -> std::io::Result<TermDict> {
         let mut pos = 0usize;
         // header (same 24 bytes as .tis)
         let _marker = read_i32_be(tii, &mut pos)?;
@@ -286,7 +298,7 @@ impl LazyTermDict {
             });
             prev_text = text;
         }
-        Ok(LazyTermDict {
+        Ok(TermDict {
             tis: tis.to_vec(),
             index,
             field_names: field_names.to_vec(),
@@ -342,7 +354,7 @@ impl LazyTermDict {
     }
 
     /// Terms of `field` that start with `prefix`, matching the eager
-    /// `TermDict::terms_with_prefix` exactly. Finds the `.tii` anchor at or before
+    /// `EagerTermDict::terms_with_prefix` exactly. Finds the `.tii` anchor at or before
     /// `(field, prefix)` in canonical `(field_name, text)` order, seeks its
     /// `tis_offset`, and forward-decodes `.tis` from there — collecting matches of
     /// `field` until the field changes or the text passes the prefix range.
@@ -396,9 +408,9 @@ impl LazyTermDict {
 
     /// Sequentially decodes the WHOLE `.tis` from just past its 24-byte header.
     /// `.tis` is physically written in canonical `(field_name asc, text asc)`
-    /// order (see `TermCursor`'s doc comment and `zsl/writer/terms.rs`), so a
+    /// order (see `EagerTermCursor`'s doc comment and `zsl/writer/terms.rs`), so a
     /// plain top-to-bottom decode already yields that order — no sorting or
-    /// per-field grouping needed, unlike the eager `TermDict::iter_terms`
+    /// per-field grouping needed, unlike the eager `EagerTermDict::iter_terms`
     /// (which enumerates a `HashMap` and so has no ordering guarantee of its
     /// own). Used by both `iter_terms` and `cursor`.
     fn decode_all(&self) -> Vec<(String, String)> {
@@ -433,29 +445,29 @@ impl LazyTermDict {
     }
 
     /// Cursor over every `(field, term)` pair in ZSL canonical order,
-    /// matching the eager `TermCursor`'s semantics exactly (the merge relies
-    /// on this order to interleave sources correctly). Unlike `TermCursor`,
+    /// matching the eager `EagerTermCursor`'s semantics exactly (the merge relies
+    /// on this order to interleave sources correctly). Unlike `EagerTermCursor`,
     /// this OWNS its decoded `Vec` instead of borrowing the dict — it's built
     /// from raw `.tis` bytes rather than an already-grouped `HashMap`, and the
     /// merge only ever needs `peek`/`advance`, so no lifetime is required.
-    pub fn cursor(&self) -> LazyTermCursor {
-        LazyTermCursor {
+    pub fn cursor(&self) -> TermCursor {
+        TermCursor {
             terms: self.decode_all(),
             i: 0,
         }
     }
 }
 
-/// Owned cursor over a `LazyTermDict`'s terms in canonical order (see
-/// `LazyTermDict::cursor`). Pre-decoded at construction time since the merge
+/// Owned cursor over a `TermDict`'s terms in canonical order (see
+/// `TermDict::cursor`). Pre-decoded at construction time since the merge
 /// reads every entry anyway, so there's no benefit to decoding lazily on
 /// `advance`.
-pub struct LazyTermCursor {
+pub struct TermCursor {
     terms: Vec<(String, String)>,
     i: usize,
 }
 
-impl LazyTermCursor {
+impl TermCursor {
     /// current `(field, term)` pair, or `None` once every pair is exhausted.
     pub fn peek(&self) -> Option<(&str, &str)> {
         self.terms
@@ -472,9 +484,9 @@ impl LazyTermCursor {
 }
 
 /// Decodes a single `.tis` entry starting at `*pos`, advancing it past the entry.
-/// Mirrors `TermDict::read`'s per-entry decoding (shared prefix taken over the
+/// Mirrors `EagerTermDict::read`'s per-entry decoding (shared prefix taken over the
 /// previous TEXT only, never across field boundaries — see that function's doc
-/// comment) but for exactly one entry, so `LazyTermDict::info` can resume a scan
+/// comment) but for exactly one entry, so `TermDict::info` can resume a scan
 /// from any `.tii`-indexed offset instead of decoding the whole `.tis`.
 fn decode_entry(
     tis: &[u8],
@@ -504,25 +516,26 @@ fn decode_entry(
     ))
 }
 
-/// Lazy cursor over all `(field, term)` pairs of a `TermDict`, in ZSL
+/// Cursor over all `(field, term)` pairs of an `EagerTermDict`, in ZSL
 /// canonical order (field names sorted ascending, terms ascending within each
 /// field — equivalent to sorting `(fieldName, text)` tuples since `\0` is the
 /// minimum byte and never appears inside a field name or term). Backed
-/// directly by each field's already-sorted `FieldTerms` buffer: no `Vec` of
-/// all terms is built up front, so memory stays bounded regardless of how
-/// many terms the segment holds.
-pub struct TermCursor<'a> {
-    dict: &'a TermDict,
+/// directly by each field's already-sorted `EagerFieldTerms` buffer. Kept as a
+/// `#[cfg(test)]` oracle for the production lazy `TermCursor`.
+#[cfg(test)]
+pub struct EagerTermCursor<'a> {
+    dict: &'a EagerTermDict,
     fields: Vec<&'a str>,
     field_idx: usize,
     term_idx: usize,
 }
 
-impl<'a> TermCursor<'a> {
-    fn new(dict: &'a TermDict) -> TermCursor<'a> {
+#[cfg(test)]
+impl<'a> EagerTermCursor<'a> {
+    fn new(dict: &'a EagerTermDict) -> EagerTermCursor<'a> {
         let mut fields: Vec<&str> = dict.by_field.keys().map(String::as_str).collect();
         fields.sort_unstable();
-        TermCursor {
+        EagerTermCursor {
             dict,
             fields,
             field_idx: 0,
@@ -565,7 +578,7 @@ mod tests {
     use crate::zsl::fields::read_field_infos;
     use std::path::PathBuf;
 
-    fn dict() -> TermDict {
+    fn dict() -> EagerTermDict {
         let dir = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/zsl_index"
@@ -591,7 +604,7 @@ mod tests {
             .into_iter()
             .map(|f| f.name)
             .collect();
-        TermDict::read(cf.sub(&tis).unwrap(), &names).unwrap()
+        EagerTermDict::read(cf.sub(&tis).unwrap(), &names).unwrap()
     }
 
     #[test]
@@ -600,7 +613,7 @@ mod tests {
         let mut buf = vec![0xFF, 0xFF, 0xFF, 0xFD];
         buf.extend_from_slice(&5u64.to_be_bytes());
         buf.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]);
-        assert!(TermDict::read(&buf, &[]).is_err());
+        assert!(EagerTermDict::read(&buf, &[]).is_err());
     }
 
     #[test]
@@ -639,7 +652,6 @@ mod tests {
         assert!(!got.is_empty());
     }
 
-    #[cfg(test)]
     fn fixture_dict_bytes() -> (Vec<u8>, Vec<u8>, Vec<String>) {
         use crate::zsl::cfs::CompoundFile;
         use crate::zsl::fields::read_field_infos;
@@ -666,7 +678,6 @@ mod tests {
         )
     }
 
-    #[cfg(test)]
     fn fixture_dict_bytes_multiseg() -> (Vec<u8>, Vec<u8>, Vec<String>) {
         use crate::zsl::cfs::CompoundFile;
         use crate::zsl::fields::read_field_infos;
@@ -696,8 +707,8 @@ mod tests {
     #[test]
     fn lazy_info_matches_eager_for_every_term_and_absentees() {
         for (tis, tii, names) in [fixture_dict_bytes(), fixture_dict_bytes_multiseg()] {
-            let eager = TermDict::read(&tis, &names).unwrap();
-            let lazy = LazyTermDict::open(&tis, &tii, &names).unwrap();
+            let eager = EagerTermDict::read(&tis, &names).unwrap();
+            let lazy = TermDict::open(&tis, &tii, &names).unwrap();
             for (field, text) in eager.iter_terms() {
                 assert_eq!(
                     lazy.info(&field, &text),
@@ -727,7 +738,6 @@ mod tests {
     /// field 1 ("title"): 160 more terms, zero-padded ascending, disjoint doc-id
     /// range from field 0 (prefix sharing must not leak across fields — see
     /// `dump_entry`'s doc comment).
-    #[cfg(test)]
     fn large_dict_bytes() -> (Vec<u8>, Vec<u8>, Vec<String>) {
         use crate::zsl::writer::invert::TermPostings;
         use crate::zsl::writer::terms::write_term_dict;
@@ -775,8 +785,8 @@ mod tests {
     fn lazy_seek_path_exercised_by_synthetic_multi_sample_tii() {
         let (tis, tii, field_names) = large_dict_bytes();
 
-        let eager = TermDict::read(&tis, &field_names).unwrap();
-        let lazy = LazyTermDict::open(&tis, &tii, &field_names).unwrap();
+        let eager = EagerTermDict::read(&tis, &field_names).unwrap();
+        let lazy = TermDict::open(&tis, &tii, &field_names).unwrap();
 
         // sanity: the synthesized corpus must actually produce multiple .tii samples,
         // i.e. more than just the synthetic ("","") anchor — otherwise this test would
@@ -809,8 +819,8 @@ mod tests {
         fields: &[&str],
         prefixes: &[&str],
     ) {
-        let eager = TermDict::read(tis, names).unwrap();
-        let lazy = LazyTermDict::open(tis, tii, names).unwrap();
+        let eager = EagerTermDict::read(tis, names).unwrap();
+        let lazy = TermDict::open(tis, tii, names).unwrap();
         for &field in fields {
             for &pfx in prefixes {
                 let mut a = lazy.terms_with_prefix(field, pfx);
@@ -862,8 +872,8 @@ mod tests {
             fixture_dict_bytes_multiseg(),
             large_dict_bytes(),
         ] {
-            let eager = TermDict::read(&tis, &names).unwrap();
-            let lazy = LazyTermDict::open(&tis, &tii, &names).unwrap();
+            let eager = EagerTermDict::read(&tis, &names).unwrap();
+            let lazy = TermDict::open(&tis, &tii, &names).unwrap();
 
             // iter_terms: same multiset AND, critically for the merge, cursor gives the same ORDER.
             let mut a = lazy.iter_terms();

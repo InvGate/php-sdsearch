@@ -83,7 +83,7 @@ impl ZslSegment {
     /// (field names ascending, terms ascending within each field), without
     /// materializing a `Vec` of all terms like `all_terms` does. Used by the
     /// bounded-memory k-way streaming merge.
-    pub fn term_cursor(&self) -> TermCursor<'_> {
+    pub fn term_cursor(&self) -> TermCursor {
         self.dict.cursor()
     }
 
@@ -135,10 +135,15 @@ impl ZslSegment {
         let name_ending = |ext: &str| cfs.names().into_iter().find(|n| n.ends_with(ext));
         let fnm = name_ending(".fnm").ok_or_else(|| std::io::Error::other("no .fnm"))?;
         let tis = name_ending(".tis").ok_or_else(|| std::io::Error::other("no .tis"))?;
+        let tii_name = name_ending(".tii").ok_or_else(|| std::io::Error::other("no .tii"))?;
 
         let fields = read_field_infos(cfs.sub(&fnm).unwrap())?;
         let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
-        let dict = TermDict::read(cfs.sub(&tis).unwrap(), &field_names)?;
+        let dict = TermDict::open(
+            cfs.sub(&tis).unwrap(),
+            cfs.sub(&tii_name).unwrap(),
+            &field_names,
+        )?;
 
         let fdx_name = name_ending(".fdx").ok_or_else(|| std::io::Error::other("no .fdx"))?;
         let num_docs_total = cfs.sub(&fdx_name).unwrap().len() / 8;

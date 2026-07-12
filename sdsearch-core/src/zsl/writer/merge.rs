@@ -641,13 +641,15 @@ mod tests {
         let dict = terms::write_term_dict(&[]);
 
         // directory built by hand (NOT `assemble_cfs`): only the extensions REQUIRED by
-        // `ZslSegment::open_from` (.fdx .fdt .fnm .tis .frq), without `.nrm`/`.tii` (optional) and
-        // without `.prx` (deliberately omitted).
+        // `ZslSegment::open_from` (.fdx .fdt .fnm .tis .tii .frq), without `.nrm` (optional) and
+        // without `.prx` (deliberately omitted). `.tii` is required by `open_from` (the lazy dict
+        // seeks through it) and the writer always emits one, so it is included here.
         let files: Vec<(&str, &[u8])> = vec![
             (".fdx", &fdx),
             (".fdt", &fdt),
             (".fnm", &fnm_bytes),
             (".tis", &dict.tis),
+            (".tii", &dict.tii),
             (".frq", &dict.frq),
         ];
         let cfs_bytes = crate::zsl::writer::cfs::write_cfs("_x", &files);
@@ -876,6 +878,7 @@ mod tests {
             (".fdt", &fdt),
             (".fnm", &fnm_bytes),
             (".tis", &dict.tis),
+            (".tii", &dict.tii),
             (".frq", &dict.frq),
         ];
         let cfs_bytes = crate::zsl::writer::cfs::write_cfs("_x", &files);
