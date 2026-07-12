@@ -340,6 +340,59 @@ impl LazyTermDict {
         }
         None
     }
+
+    /// Terms of `field` that start with `prefix`, matching the eager
+    /// `TermDict::terms_with_prefix` exactly. Finds the `.tii` anchor at or before
+    /// `(field, prefix)` in canonical `(field_name, text)` order, seeks its
+    /// `tis_offset`, and forward-decodes `.tis` from there — collecting matches of
+    /// `field` until the field changes or the text passes the prefix range.
+    ///
+    /// The anchor may sit in an EARLIER field than `field` (e.g. when `field`'s own
+    /// first term precedes any `.tii` sample taken from it): entries with `f < field`
+    /// are skipped, `f == field` entries are collected/filtered by prefix, and the
+    /// scan stops as soon as `f > field` (canonical order guarantees nothing further
+    /// can belong to `field`).
+    pub fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
+        let key = (field, prefix);
+        // index[0] is the synthetic ("","") anchor ⇒ partition_point is always >= 1.
+        let gt = self
+            .index
+            .partition_point(|e| (e.field.as_str(), e.text.as_str()) <= key);
+        let anchor = &self.index[gt - 1];
+        let mut out = Vec::new();
+        // the anchor itself is a real term that may already match (e.g. prefix == an index term).
+        if !anchor.text.is_empty() && anchor.field == field && anchor.text.starts_with(prefix) {
+            out.push(anchor.text.clone());
+        }
+        let mut pos = anchor.tis_offset;
+        let mut prev = anchor.text.clone();
+        let (mut fp, mut pp) = (anchor.info.freq_pointer, anchor.info.prox_pointer);
+        while pos < self.tis.len() {
+            let Ok((f, t, _)) = decode_entry(
+                &self.tis,
+                &mut pos,
+                &prev,
+                &mut fp,
+                &mut pp,
+                &self.field_names,
+            ) else {
+                break;
+            };
+            // canonical order is (field_name, text); stop once we pass this field.
+            if f.as_str() > field {
+                break;
+            }
+            if f == field {
+                if t.starts_with(prefix) {
+                    out.push(t.clone());
+                } else if t.as_str() > prefix {
+                    break; // past the range in-field
+                }
+            }
+            prev = t;
+        }
+        out
+    }
 }
 
 /// Decodes a single `.tis` entry starting at `*pos`, advancing it past the entry.
@@ -581,31 +634,30 @@ mod tests {
         }
     }
 
-    /// The committed fixtures (`zsl_index`, `zsl_index_multiseg`) both have far fewer
-    /// than `INDEX_INTERVAL` (128) terms, so their `.tii` holds only the synthetic
-    /// anchor and `lazy_info_matches_eager_for_every_term_and_absentees` above never
-    /// exercises a real `.tii` sample: every lookup degenerates to a full `.tis` scan
-    /// from offset 24, never touching the `running = running.wrapping_add(index_delta)`
-    /// accumulation in `LazyTermDict::open` nor the exact-hit fast path in `info`.
+    /// Synthesizes a >128-term, 2-field term dictionary directly via the writer's
+    /// batch `write_term_dict` (mirroring `tii_samples_every_index_interval_terms`
+    /// / `multi_field_sample_terms` in `zsl/writer/terms.rs`, scaled up to 560 terms —
+    /// the same order of magnitude the review used to demonstrate ~429/560 mismatches
+    /// when the accumulation order is reverted). Guarantees `index_len() > 1`, i.e.
+    /// the `.tii` actually got multiple real samples rather than just the synthetic
+    /// `("","")` anchor — the committed fixtures (`zsl_index`, `zsl_index_multiseg`)
+    /// both have far fewer than `INDEX_INTERVAL` (128) terms and can't exercise the
+    /// sparse seek path on their own.
     ///
-    /// This test synthesizes a >128-term, 2-field term dictionary directly via the
-    /// writer's batch `write_term_dict` (mirroring `tii_samples_every_index_interval_terms`
-    /// / `multi_field_sample_terms` in `zsl/writer/terms.rs`, scaled up to 560 terms — the
-    /// same order of magnitude the review used to demonstrate ~429/560 mismatches when the
-    /// accumulation order is reverted), asserts the `.tii` actually got multiple real
-    /// samples (`index_len() > 1`), and then runs the eager-vs-lazy differential over
-    /// every synthesized term plus a couple of absentees.
-    #[test]
-    fn lazy_seek_path_exercised_by_synthetic_multi_sample_tii() {
+    /// field 0 ("body"): 400 terms, zero-padded so lexicographic order == insertion
+    /// order, sharing the "shared" prefix (exercises prefix-sharing across many
+    /// consecutive .tis/.tii entries). Every 10th term gets a second, far-away doc
+    /// (exercises multi-doc freq/prox deltas).
+    /// field 1 ("title"): 160 more terms, zero-padded ascending, disjoint doc-id
+    /// range from field 0 (prefix sharing must not leak across fields — see
+    /// `dump_entry`'s doc comment).
+    #[cfg(test)]
+    fn large_dict_bytes() -> (Vec<u8>, Vec<u8>, Vec<String>) {
         use crate::zsl::writer::invert::TermPostings;
         use crate::zsl::writer::terms::write_term_dict;
 
         let mut terms: Vec<TermPostings> = Vec::new();
 
-        // field 0 ("body"): 400 terms, zero-padded so lexicographic order == insertion
-        // order, sharing the "shared" prefix (exercises prefix-sharing across many
-        // consecutive .tis/.tii entries). Every 10th term gets a second, far-away doc
-        // (exercises multi-doc freq/prox deltas).
         for i in 0..400usize {
             let text = format!("shared{i:04}");
             let docs = if i % 10 == 0 {
@@ -619,9 +671,6 @@ mod tests {
                 docs,
             });
         }
-        // field 1 ("title"): 160 more terms, zero-padded ascending, disjoint doc-id
-        // range from field 0 (prefix sharing must not leak across fields — see
-        // `dump_entry`'s doc comment).
         for i in 0..160usize {
             let text = format!("word{i:04}");
             let docs = if i % 7 == 0 {
@@ -643,9 +692,15 @@ mod tests {
 
         let field_names = vec!["body".to_string(), "title".to_string()];
         let dict_files = write_term_dict(&terms);
+        (dict_files.tis, dict_files.tii, field_names)
+    }
 
-        let eager = TermDict::read(&dict_files.tis, &field_names).unwrap();
-        let lazy = LazyTermDict::open(&dict_files.tis, &dict_files.tii, &field_names).unwrap();
+    #[test]
+    fn lazy_seek_path_exercised_by_synthetic_multi_sample_tii() {
+        let (tis, tii, field_names) = large_dict_bytes();
+
+        let eager = TermDict::read(&tis, &field_names).unwrap();
+        let lazy = LazyTermDict::open(&tis, &tii, &field_names).unwrap();
 
         // sanity: the synthesized corpus must actually produce multiple .tii samples,
         // i.e. more than just the synthetic ("","") anchor — otherwise this test would
@@ -657,17 +712,70 @@ mod tests {
             lazy.index_len()
         );
 
-        for term in &terms {
-            let field = &field_names[term.field_num];
+        for (field, text) in eager.iter_terms() {
             assert_eq!(
-                lazy.info(field, &term.text),
-                eager.info(field, &term.text),
-                "mismatch at {field}:{}",
-                term.text
+                lazy.info(&field, &text),
+                eager.info(&field, &text),
+                "mismatch at {field}:{text}"
             );
         }
 
         assert_eq!(lazy.info("body", "definitelymissing"), None);
         assert_eq!(lazy.info("no_such_field", "x"), None);
+    }
+
+    /// for each `(field, prefix)` asserts `lazy.terms_with_prefix` == `eager.terms_with_prefix`
+    /// (both sorted, since neither API guarantees an order).
+    fn assert_prefix_parity(
+        tis: &[u8],
+        tii: &[u8],
+        names: &[String],
+        fields: &[&str],
+        prefixes: &[&str],
+    ) {
+        let eager = TermDict::read(tis, names).unwrap();
+        let lazy = LazyTermDict::open(tis, tii, names).unwrap();
+        for &field in fields {
+            for &pfx in prefixes {
+                let mut a = lazy.terms_with_prefix(field, pfx);
+                a.sort();
+                let mut b = eager.terms_with_prefix(field, pfx);
+                b.sort();
+                assert_eq!(a, b, "prefix mismatch {field}:{pfx:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_prefix_matches_eager() {
+        // small fixtures (fields title/body/id_key) — only the synthetic anchor, no
+        // real .tii samples.
+        for (tis, tii, names) in [fixture_dict_bytes(), fixture_dict_bytes_multiseg()] {
+            assert_prefix_parity(
+                &tis,
+                &tii,
+                &names,
+                &["title", "body", "id_key", "no_such_field"],
+                &["", "a", "ne", "work", "zzz"],
+            );
+        }
+
+        // large synthetic corpus (real, multi-sample .tii): "body" has shared0000..shared0399,
+        // "title" has word0000..word0159 (INDEX_INTERVAL=128 globally, body written first, so
+        // .tii samples land inside "body" at ~terms 128/256/384 and spill into "title" after
+        // term 400). Prefixes chosen to hit all three terms_with_prefix branches:
+        // "" / "a" precede the first real sample (anchor may be an earlier field or the
+        // synthetic ("","") one); "shared" matches broadly within one field; "shared01"
+        // (shared0100..shared0199) straddles the ~128 sample boundary; "shared05" is past
+        // the last real "body" term (max shared0399) so it matches nothing; "zzz" matches
+        // nothing in any field.
+        let (tis, tii, names) = large_dict_bytes();
+        assert_prefix_parity(
+            &tis,
+            &tii,
+            &names,
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            &["", "a", "shared", "shared01", "shared05", "zzz"],
+        );
     }
 }
