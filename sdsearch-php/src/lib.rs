@@ -5,10 +5,10 @@
 use ext_php_rs::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use sdsearch_core::query::{build_query, search, InGroup, Occur, Query, QueryParams, WhereGroup};
+use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::search_index;
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
@@ -206,7 +206,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
     };
     let query = build_query(&params).map_err(|e| format!("sdsearch: build_query: {e}"))?;
     let hits = search(index, &query, 0.0, 1);
-    Ok(hits.first().map(|h| h.id as i64).unwrap_or(-1))
+    Ok(hits.first().map_or(-1, |h| h.id as i64))
 }
 
 /// core of `find_doc_ids`: verbatim term query over `<field>:value` (the `field` is LITERAL,

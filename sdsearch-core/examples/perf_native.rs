@@ -1,7 +1,7 @@
 //! perf of the native reader over a large user-provided ZSL index.
 //! Usage: SDSEARCH_PERF_INDEX=/path/to/index cargo run -p sdsearch-core --release --example perf_native
 //! If the env var is unset, exits 0 without running (for CI/dev without the index).
-use sdsearch_core::query::{build_query, search, QueryParams};
+use sdsearch_core::query::{QueryParams, build_query, search};
 use sdsearch_core::zsl::index::ZslIndex;
 use std::time::Instant;
 

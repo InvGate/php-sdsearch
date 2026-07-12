@@ -40,7 +40,7 @@ pub enum CfsSource<'a> {
     Path(&'a Path),
 }
 
-impl<'a> CfsSource<'a> {
+impl CfsSource<'_> {
     fn len(&self) -> io::Result<u64> {
         match self {
             CfsSource::Mem(data) => Ok(data.len() as u64),

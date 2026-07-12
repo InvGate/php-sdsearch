@@ -33,29 +33,35 @@ struct TrackingAlloc;
 
 unsafe impl GlobalAlloc for TrackingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe {
+            System.dealloc(ptr, layout);
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
-        if !p.is_null() {
-            let old = layout.size();
-            if new_size >= old {
-                let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
-                PEAK.fetch_max(live, Ordering::Relaxed);
-            } else {
-                LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+        unsafe {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() {
+                let old = layout.size();
+                if new_size >= old {
+                    let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                    PEAK.fetch_max(live, Ordering::Relaxed);
+                } else {
+                    LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+                }
             }
+            p
         }
-        p
     }
 }
 
@@ -82,8 +88,7 @@ fn copy_kb_base() -> PathBuf {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     ));
     if dst.is_dir() {
         std::fs::remove_dir_all(&dst).ok();

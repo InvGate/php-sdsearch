@@ -2,11 +2,10 @@
 //! tokenization regex deviates from stock Zend Lucene: tokens keep - _ . : # / @
 //! (emails, URLs, and ticket refs stay as a single term).
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 
-static TOKEN_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[\p{L}\p{N}\-_.:#/@]+[\p{L}\p{N}]?").unwrap());
+static TOKEN_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"[\p{L}\p{N}\-_.:#/@]+[\p{L}\p{N}]?").unwrap());
 
 /// tokenizes and lowercases, replicating the legacy analyzer
 pub fn analyze(text: &str) -> Vec<String> {

@@ -32,12 +32,12 @@ fn seg() -> ZslSegment {
 
 fn doc_set(hits: &[sdsearch_core::search::Hit]) -> Vec<usize> {
     let mut v: Vec<usize> = hits.iter().map(|h| h.id).collect();
-    v.sort();
+    v.sort_unstable();
     v
 }
 fn oracle_set(exp: &Expected, key: &str) -> Vec<usize> {
     let mut v: Vec<usize> = exp.queries[key].iter().map(|h| h.id).collect();
-    v.sort();
+    v.sort_unstable();
     v
 }
 

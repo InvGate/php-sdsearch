@@ -40,7 +40,7 @@ fn opens_clean_with_orphan_cfs_and_stale_lock_file() {
     let existing_cfs = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+        .find(|p| p.extension().is_some_and(|x| x == "cfs"))
         .expect("the KB fixture has a .cfs");
     std::fs::copy(&existing_cfs, dir.join("_99.cfs")).unwrap(); // orphan (not in segments_N)
     std::fs::write(dir.join("write.lock.file"), b"").unwrap(); // stale lock file (not held)

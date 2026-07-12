@@ -3,7 +3,7 @@
 
 use crate::index::IndexReader;
 use crate::search::{
-    finalize, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms, Hit,
+    Hit, finalize, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms,
 };
 use std::collections::HashMap;
 
@@ -69,7 +69,7 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
-                let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
                 for (id, s) in union_scores(index, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s;
                 }
@@ -85,7 +85,7 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
-                let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
                 for (id, s) in union_scores(index, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s;
                 }
@@ -93,7 +93,7 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
             acc
         }
         Query::Phrase { field, terms } => {
-            let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
             phrase_scores(index, field, &refs)
         }
         Query::Boolean { clauses } => eval_boolean(index, clauses),
@@ -398,7 +398,7 @@ mod tests {
     }
     fn ids(hits: &[crate::search::Hit]) -> Vec<usize> {
         let mut v: Vec<usize> = hits.iter().map(|h| h.id).collect();
-        v.sort();
+        v.sort_unstable();
         v
     }
 
@@ -562,7 +562,7 @@ mod tests {
     fn build_query_empty_field_is_error() {
         let mut p = params("vpn");
         p.where_groups = vec![WhereGroup {
-            field: "".into(),
+            field: String::new(),
             values: vec!["x".into()],
             occur: Occur::Should,
         }];

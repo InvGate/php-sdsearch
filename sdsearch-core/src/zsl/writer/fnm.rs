@@ -10,7 +10,7 @@ pub fn write_fnm(fields: &[FieldMeta]) -> Vec<u8> {
     write_vint(&mut out, fields.len() as u64);
     for f in fields {
         write_modified_utf8(&mut out, &f.name);
-        out.push(if f.indexed { 0x01 } else { 0x00 });
+        out.push(u8::from(f.indexed));
     }
     out
 }
@@ -18,7 +18,7 @@ pub fn write_fnm(fields: &[FieldMeta]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zsl::fields::{read_field_infos, FieldInfo};
+    use crate::zsl::fields::{FieldInfo, read_field_infos};
 
     #[test]
     fn fnm_roundtrips_names_and_indexed_flag_through_reader() {

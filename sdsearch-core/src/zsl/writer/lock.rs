@@ -10,7 +10,7 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub struct WriteLock {
-    _file: File, // keeping the File alive == holding the lock (released when dropped)
+    file: File, // keeping the File alive == holding the lock (released when dropped)
 }
 
 impl WriteLock {
@@ -25,7 +25,7 @@ impl WriteLock {
             .truncate(false)
             .open(&path)?;
         match file.try_lock() {
-            Ok(()) => Ok(WriteLock { _file: file }),
+            Ok(()) => Ok(WriteLock { file }),
             Err(TryLockError::WouldBlock) => Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "write lock already held",
@@ -38,7 +38,7 @@ impl WriteLock {
 impl Drop for WriteLock {
     fn drop(&mut self) {
         // best-effort: release the lock explicitly (it is released anyway when the File closes).
-        let _ = self._file.unlock();
+        let _ = self.file.unlock();
     }
 }
 

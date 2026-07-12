@@ -71,7 +71,7 @@ mod tests {
         std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .find(|p| p.extension().is_some_and(|x| x == "cfs"))
             .expect("no .cfs in fixture — regenerate with sdsearch_dump_zsl_index.php")
     }
 

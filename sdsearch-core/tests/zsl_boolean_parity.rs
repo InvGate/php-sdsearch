@@ -1,6 +1,6 @@
 //! Parity of boolean composition (build_query + executor) vs the ZSL boolean oracle
 //! (a transcription of Zend Lucene's boolean query builder in the multiseg generator).
-use sdsearch_core::query::{build_query, search, InGroup, Occur, QueryParams, WhereGroup};
+use sdsearch_core::query::{InGroup, Occur, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::search::Hit;
 use sdsearch_core::zsl::index::ZslIndex;
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ fn idx() -> ZslIndex {
     .unwrap()
 }
 fn sorted(mut v: Vec<usize>) -> Vec<usize> {
-    v.sort();
+    v.sort_unstable();
     v
 }
 fn eng(hits: &[Hit]) -> Vec<usize> {

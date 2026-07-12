@@ -11,7 +11,7 @@
 //!      sorts by new doc-id; drops terms with no live docs.
 //!   4. serializes reusing the `write_segment_cfs` primitives (norms COPIED verbatim via write_norms_raw).
 
-use super::cfs::{write_cfs_streaming, CfsSource};
+use super::cfs::{CfsSource, write_cfs_streaming};
 use super::invert::{FieldMeta, StoredField, TermPostings};
 use super::{assemble_cfs, fnm, norms, stored, terms};
 use crate::index::IndexReader;
@@ -368,7 +368,10 @@ fn merge_streaming_inner(
     // max-heap, so keys are wrapped in Reverse) drives the k-way merge. Keys are cloned into the
     // heap (bounded: at most one small (field, term) per segment at a time) because the cursors'
     // borrows end at each `peek`, so we cannot hold `&str` across an `advance`.
-    let mut cursors: Vec<_> = segs.iter().map(|s| s.term_cursor()).collect();
+    let mut cursors: Vec<_> = segs
+        .iter()
+        .map(super::super::segment::ZslSegment::term_cursor)
+        .collect();
     let mut heap: BinaryHeap<Reverse<(String, String, usize)>> = BinaryHeap::new();
     for (si, cur) in cursors.iter().enumerate() {
         if let Some((f, t)) = cur.peek() {

@@ -79,9 +79,8 @@ pub(crate) fn wildcard_terms(
     // preg_quote + wildcard replacement (equivalent to ZSL)
     let escaped = regex::escape(pattern);
     let regex_str = format!("^{}$", escaped.replace("\\*", ".*").replace("\\?", "."));
-    let re = match regex::Regex::new(&regex_str) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+    let Ok(re) = regex::Regex::new(&regex_str) else {
+        return Vec::new();
     };
     index
         .terms_with_prefix(field, prefix)
@@ -101,7 +100,7 @@ pub(crate) fn fuzzy_terms(
     min_similarity: f32,
     prefix_length: usize,
 ) -> Vec<String> {
-    let min_sim = min_similarity as f64;
+    let min_sim = f64::from(min_similarity);
     // exact prefix = first prefix_length UTF-8 chars
     let prefix: String = term.chars().take(prefix_length).collect();
     let prefix_byte_len = prefix.len();
@@ -194,7 +193,7 @@ pub(crate) fn phrase_scores(
         if is_match {
             let s: f32 = (0..terms.len())
                 .map(|i| {
-                    let tf = per_term[i].0.get(&doc).map(|v| v.len() as u32).unwrap_or(0);
+                    let tf = per_term[i].0.get(&doc).map_or(0, |v| v.len() as u32);
                     score_with_idf(per_term[i].1, tf, index.field_len(doc, field))
                 })
                 .sum();
@@ -264,7 +263,7 @@ pub fn wildcard_query(
     limit: usize,
 ) -> Vec<Hit> {
     let terms = wildcard_terms(index, field, pattern, min_prefix_len);
-    let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+    let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
     finalize(index, union_scores(index, field, &refs), min_score, limit)
 }
 
@@ -279,7 +278,7 @@ pub fn fuzzy_query(
     limit: usize,
 ) -> Vec<Hit> {
     let terms = fuzzy_terms(index, field, term, min_similarity, prefix_length);
-    let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+    let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
     finalize(index, union_scores(index, field, &refs), min_score, limit)
 }
 
@@ -376,7 +375,7 @@ mod tests {
         // "test*" => terms testing, tested => docs 0 and 1
         let hits = wildcard_query(&wildcard_corpus(), "body", "test*", 2, 0.0, 10);
         let mut ids: Vec<usize> = hits.iter().map(|h| h.id).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec![0, 1]);
     }
 
@@ -446,7 +445,7 @@ mod tests {
         // "brown fox": doc0 (brown@1,fox@2) and doc1 (brown@0,fox@1)
         let hits = phrase_query(&phrase_corpus(), "body", &["brown", "fox"], 0.0, 10);
         let mut ids: Vec<usize> = hits.iter().map(|h| h.id).collect();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec![0, 1]);
     }
 

@@ -29,7 +29,7 @@ pub fn write_term_postings(
 
         let mut prev_pos = 0u32;
         for &pos in positions {
-            write_vint(prx, (pos - prev_pos) as u64);
+            write_vint(prx, u64::from(pos - prev_pos));
             prev_pos = pos;
         }
     }

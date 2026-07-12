@@ -93,14 +93,14 @@ pub fn read_modified_utf8(data: &[u8], pos: &mut usize) -> io::Result<String> {
             s.push(b0 as char);
         } else if b0 & 0xE0 == 0xC0 {
             let b1 = read_byte(data, pos)?;
-            let cp = (((b0 & 0x1F) as u32) << 6) | ((b1 & 0x3F) as u32);
+            let cp = (u32::from(b0 & 0x1F) << 6) | u32::from(b1 & 0x3F);
             s.push(char::from_u32(cp).unwrap_or('\u{FFFD}')); // C0 80 -> 0
         } else if b0 & 0xF0 == 0xE0 {
             // 3-byte (BMP).
             let b1 = read_byte(data, pos)?;
             let b2 = read_byte(data, pos)?;
             let cp =
-                (((b0 & 0x0F) as u32) << 12) | (((b1 & 0x3F) as u32) << 6) | ((b2 & 0x3F) as u32);
+                (u32::from(b0 & 0x0F) << 12) | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
             s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         } else {
             // 4-byte (supplementary plane). ZSL's PHP writer stores standard UTF-8 (not Java's
@@ -110,10 +110,10 @@ pub fn read_modified_utf8(data: &[u8], pos: &mut usize) -> io::Result<String> {
             let b1 = read_byte(data, pos)?;
             let b2 = read_byte(data, pos)?;
             let b3 = read_byte(data, pos)?;
-            let cp = (((b0 & 0x07) as u32) << 18)
-                | (((b1 & 0x3F) as u32) << 12)
-                | (((b2 & 0x3F) as u32) << 6)
-                | ((b3 & 0x3F) as u32);
+            let cp = (u32::from(b0 & 0x07) << 18)
+                | (u32::from(b1 & 0x3F) << 12)
+                | (u32::from(b2 & 0x3F) << 6)
+                | u32::from(b3 & 0x3F);
             s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         }
     }

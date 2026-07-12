@@ -2,10 +2,10 @@
 use crate::index::IndexReader;
 use crate::zsl::cfs::CompoundFile;
 use crate::zsl::deletes::DeletedDocs;
-use crate::zsl::fields::{read_field_infos, FieldInfo};
+use crate::zsl::fields::{FieldInfo, read_field_infos};
 use crate::zsl::norms::{approx_field_len, read_norms};
 use crate::zsl::postings::{for_each_posting, read_all_positions, read_freqs, read_positions};
-use crate::zsl::stored::{read_stored_fields, read_stored_raw, StoredRaw};
+use crate::zsl::stored::{StoredRaw, read_stored_fields, read_stored_raw};
 use crate::zsl::terms::{TermCursor, TermDict, TermInfo};
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,7 +50,7 @@ impl ZslSegment {
     /// column of the field's raw norm bytes (one per doc, incl. deletes), or `None`.
     /// The merge COPIES them verbatim (no re-encoding) into the merged segment.
     pub fn norm_bytes(&self, field: &str) -> Option<&[u8]> {
-        self.norms.get(field).map(|v| v.as_slice())
+        self.norms.get(field).map(std::vec::Vec::as_slice)
     }
 
     /// all `(field, text)` terms of the segment (to walk them during the merge).
@@ -126,11 +126,11 @@ impl ZslSegment {
     pub fn open(index_dir: &Path) -> std::io::Result<ZslSegment> {
         let cfs_path = std::fs::read_dir(index_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .find(|p| p.extension().is_some_and(|x| x == "cfs"))
             .ok_or_else(|| std::io::Error::other("no .cfs in index dir"))?;
         let del_path = std::fs::read_dir(index_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "del").unwrap_or(false));
+            .find(|p| p.extension().is_some_and(|x| x == "del"));
         Self::open_from(index_dir, &cfs_path, del_path)
     }
 
@@ -231,8 +231,7 @@ impl IndexReader for ZslSegment {
     fn doc_freq(&self, field: &str, term: &str) -> usize {
         self.dict
             .info(field, term)
-            .map(|ti| ti.doc_freq as usize)
-            .unwrap_or(0)
+            .map_or(0, |ti| ti.doc_freq as usize)
     }
 
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
@@ -251,8 +250,7 @@ impl IndexReader for ZslSegment {
         self.norms
             .get(field)
             .and_then(|v| v.get(doc_id))
-            .map(|b| approx_field_len(*b))
-            .unwrap_or(1)
+            .map_or(1, |b| approx_field_len(*b))
     }
 
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
@@ -494,29 +492,31 @@ mod tests {
 
         // must also agree with positions_all's doc set (both are delete-filtered).
         let mut expected: Vec<usize> = s.positions_all(field, term).into_keys().collect();
-        expected.sort();
+        expected.sort_unstable();
         let mut got = live.clone();
-        got.sort();
+        got.sort_unstable();
         assert_eq!(got, expected);
     }
 
     #[test]
     fn merge_accessors_expose_fields_deletes_norms_terms_stored() {
         let s = seg(); // incidents fixture, 4 docs, no deletes
-                       // field_infos: includes title (indexed)
-        assert!(s
-            .field_infos()
-            .iter()
-            .any(|f| f.name == "title" && f.is_indexed));
+        // field_infos: includes title (indexed)
+        assert!(
+            s.field_infos()
+                .iter()
+                .any(|f| f.name == "title" && f.is_indexed)
+        );
         // is_deleted: nothing deleted in the fixture
         assert!(!s.is_deleted(0));
         // norm_bytes: title has a 4-byte column (one per doc)
-        assert_eq!(s.norm_bytes("title").map(|c| c.len()), Some(4));
+        assert_eq!(s.norm_bytes("title").map(<[u8]>::len), Some(4));
         assert!(s.norm_bytes("campo_inexistente").is_none());
         // all_terms: title:new present
-        assert!(s
-            .all_terms()
-            .contains(&("title".to_string(), "new".to_string())));
+        assert!(
+            s.all_terms()
+                .contains(&("title".to_string(), "new".to_string()))
+        );
         // stored_raw doc 0: contains id_key="165" (same value as stored_fields)
         let raw = s.stored_raw(0).unwrap();
         let names = s.field_infos();

@@ -179,7 +179,7 @@ where
 
         let mut prev_pos = 0u32;
         for &pos in positions {
-            write_vint(&mut self.prx_scratch, (pos - prev_pos) as u64);
+            write_vint(&mut self.prx_scratch, u64::from(pos - prev_pos));
             prev_pos = pos;
         }
 
@@ -347,16 +347,13 @@ fn dump_entry(
     write_vint(out, prefix_chars as u64);
     write_modified_utf8(out, &text[prefix_bytes..]);
     write_vint(out, field_num as u64);
-    write_vint(out, doc_freq as u64);
-    match prev {
-        Some((_, _, pf, pp)) => {
-            write_vint(out, freq_ptr - pf);
-            write_vint(out, prox_ptr - pp);
-        }
-        None => {
-            write_vint(out, freq_ptr);
-            write_vint(out, prox_ptr);
-        }
+    write_vint(out, u64::from(doc_freq));
+    if let Some((_, _, pf, pp)) = prev {
+        write_vint(out, freq_ptr - pf);
+        write_vint(out, prox_ptr - pp);
+    } else {
+        write_vint(out, freq_ptr);
+        write_vint(out, prox_ptr);
     }
     // skipOffset is omitted: docFreq is always < skipInterval.
 }
@@ -577,7 +574,7 @@ mod tests {
 
         // state of the previous term in the .tis
         let mut prev: Option<(&str, usize, u64, u64)> = None; // (text, field, freqPtr, proxPtr)
-                                                              // state of the last sample in the .tii
+        // state of the last sample in the .tii
         let mut idx_prev: Option<(&str, usize, u64, u64)> = None;
         let mut last_index_position: u64 = 24;
 
@@ -637,16 +634,13 @@ mod tests {
         write_vint(out, prefix_chars as u64);
         write_modified_utf8(out, &term.text[prefix_bytes..]);
         write_vint(out, term.field_num as u64);
-        write_vint(out, doc_freq as u64);
-        match prev {
-            Some((_, _, pf, pp)) => {
-                write_vint(out, freq_ptr - pf);
-                write_vint(out, prox_ptr - pp);
-            }
-            None => {
-                write_vint(out, freq_ptr);
-                write_vint(out, prox_ptr);
-            }
+        write_vint(out, u64::from(doc_freq));
+        if let Some((_, _, pf, pp)) = prev {
+            write_vint(out, freq_ptr - pf);
+            write_vint(out, prox_ptr - pp);
+        } else {
+            write_vint(out, freq_ptr);
+            write_vint(out, prox_ptr);
         }
         // skipOffset is omitted: docFreq is always < skipInterval.
     }

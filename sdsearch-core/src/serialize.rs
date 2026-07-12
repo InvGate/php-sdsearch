@@ -37,7 +37,7 @@ pub fn read_vint(data: &[u8], pos: &mut usize) -> std::io::Result<u64> {
                 "overlong varint (more than 64 bits)",
             ));
         }
-        result |= ((byte & 0x7f) as u64) << shift;
+        result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             break;
         }
@@ -61,7 +61,7 @@ mod tests {
             16_383,
             16_384,
             1_000_000,
-            u32::MAX as u64,
+            u64::from(u32::MAX),
         ] {
             let mut buf = Vec::new();
             write_vint(&mut buf, v);
