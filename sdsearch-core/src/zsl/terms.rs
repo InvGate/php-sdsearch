@@ -393,6 +393,82 @@ impl LazyTermDict {
         }
         out
     }
+
+    /// Sequentially decodes the WHOLE `.tis` from just past its 24-byte header.
+    /// `.tis` is physically written in canonical `(field_name asc, text asc)`
+    /// order (see `TermCursor`'s doc comment and `zsl/writer/terms.rs`), so a
+    /// plain top-to-bottom decode already yields that order — no sorting or
+    /// per-field grouping needed, unlike the eager `TermDict::iter_terms`
+    /// (which enumerates a `HashMap` and so has no ordering guarantee of its
+    /// own). Used by both `iter_terms` and `cursor`.
+    fn decode_all(&self) -> Vec<(String, String)> {
+        let mut pos = 24usize; // past the header
+        let mut prev = String::new();
+        let (mut fp, mut pp) = (0u64, 0u64);
+        let mut out = Vec::new();
+        while pos < self.tis.len() {
+            match decode_entry(
+                &self.tis,
+                &mut pos,
+                &prev,
+                &mut fp,
+                &mut pp,
+                &self.field_names,
+            ) {
+                Ok((f, t, _)) => {
+                    prev = t.clone();
+                    out.push((f, t));
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Enumerates ALL terms as `(field, text)`, in canonical `.tis` order (see
+    /// `decode_all`). Used by the merge to walk each source segment's terms
+    /// and copy their postings via `positions_all(field, text)`.
+    pub fn iter_terms(&self) -> Vec<(String, String)> {
+        self.decode_all()
+    }
+
+    /// Cursor over every `(field, term)` pair in ZSL canonical order,
+    /// matching the eager `TermCursor`'s semantics exactly (the merge relies
+    /// on this order to interleave sources correctly). Unlike `TermCursor`,
+    /// this OWNS its decoded `Vec` instead of borrowing the dict — it's built
+    /// from raw `.tis` bytes rather than an already-grouped `HashMap`, and the
+    /// merge only ever needs `peek`/`advance`, so no lifetime is required.
+    pub fn cursor(&self) -> LazyTermCursor {
+        LazyTermCursor {
+            terms: self.decode_all(),
+            i: 0,
+        }
+    }
+}
+
+/// Owned cursor over a `LazyTermDict`'s terms in canonical order (see
+/// `LazyTermDict::cursor`). Pre-decoded at construction time since the merge
+/// reads every entry anyway, so there's no benefit to decoding lazily on
+/// `advance`.
+pub struct LazyTermCursor {
+    terms: Vec<(String, String)>,
+    i: usize,
+}
+
+impl LazyTermCursor {
+    /// current `(field, term)` pair, or `None` once every pair is exhausted.
+    pub fn peek(&self) -> Option<(&str, &str)> {
+        self.terms
+            .get(self.i)
+            .map(|(f, t)| (f.as_str(), t.as_str()))
+    }
+
+    /// moves to the next pair in canonical order. No-op once exhausted.
+    pub fn advance(&mut self) {
+        if self.i < self.terms.len() {
+            self.i += 1;
+        }
+    }
 }
 
 /// Decodes a single `.tis` entry starting at `*pos`, advancing it past the entry.
@@ -777,5 +853,39 @@ mod tests {
             &names.iter().map(String::as_str).collect::<Vec<_>>(),
             &["", "a", "shared", "shared01", "shared05", "zzz"],
         );
+    }
+
+    #[test]
+    fn lazy_iter_and_cursor_match_eager() {
+        for (tis, tii, names) in [
+            fixture_dict_bytes(),
+            fixture_dict_bytes_multiseg(),
+            large_dict_bytes(),
+        ] {
+            let eager = TermDict::read(&tis, &names).unwrap();
+            let lazy = LazyTermDict::open(&tis, &tii, &names).unwrap();
+
+            // iter_terms: same multiset AND, critically for the merge, cursor gives the same ORDER.
+            let mut a = lazy.iter_terms();
+            a.sort();
+            let mut b = eager.iter_terms();
+            b.sort();
+            assert_eq!(a, b);
+
+            // cursor sequence identical, element by element (canonical .tis order — the merge relies on it)
+            let (mut ec, mut lc) = (eager.cursor(), lazy.cursor());
+            loop {
+                let (e, l) = (
+                    ec.peek().map(|(f, t)| (f.to_string(), t.to_string())),
+                    lc.peek().map(|(f, t)| (f.to_string(), t.to_string())),
+                );
+                assert_eq!(e, l);
+                if e.is_none() {
+                    break;
+                }
+                ec.advance();
+                lc.advance();
+            }
+        }
     }
 }
