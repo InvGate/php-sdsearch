@@ -6,7 +6,7 @@ use crate::zsl::fields::{read_field_infos, FieldInfo};
 use crate::zsl::norms::{approx_field_len, read_norms};
 use crate::zsl::postings::{for_each_posting, read_all_positions, read_freqs, read_positions};
 use crate::zsl::stored::{read_stored_fields, read_stored_raw, StoredRaw};
-use crate::zsl::terms::{TermCursor, TermDict};
+use crate::zsl::terms::{TermCursor, TermDict, TermInfo};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -72,7 +72,33 @@ impl ZslSegment {
             return;
         };
         // degrade: a corrupt tail stops iteration rather than panicking across FFI
-        let _ = for_each_posting(frq, prx, ti, |d, pos| {
+        let _ = for_each_posting(frq, prx, &ti, |d, pos| {
+            if !self.deletes.is_deleted(d) {
+                f(d, pos);
+            }
+        });
+    }
+
+    /// Like [`for_each_live_posting`](Self::for_each_live_posting) but takes a `TermInfo`
+    /// the caller already has (captured from a [`TermCursor::peek_info`] during the merge)
+    /// instead of resolving it via `self.dict.info(field, term)`. Semantics are otherwise
+    /// identical: no-op if `.prx` is absent, deletes filtered, a corrupt tail stops iteration
+    /// rather than panicking across FFI.
+    ///
+    /// This is the merge's fast path: the lazy `TermDict::info` forward-decodes up to
+    /// `INDEX_INTERVAL` (128) `.tis` entries per call, so re-looking-up every term during a
+    /// full-index merge is O(term_count × 128); the cursor already decoded each `TermInfo`
+    /// while walking `.tis` once, so threading it through here avoids all the re-seeking.
+    pub fn for_each_live_posting_ti(&self, term_info: &TermInfo, mut f: impl FnMut(usize, &[u32])) {
+        if self.prx_name.is_empty() {
+            return;
+        }
+        let (Some(frq), Some(prx)) = (self.cfs.sub(&self.frq_name), self.cfs.sub(&self.prx_name))
+        else {
+            return;
+        };
+        // degrade: a corrupt tail stops iteration rather than panicking across FFI
+        let _ = for_each_posting(frq, prx, term_info, |d, pos| {
             if !self.deletes.is_deleted(d) {
                 f(d, pos);
             }
@@ -83,7 +109,7 @@ impl ZslSegment {
     /// (field names ascending, terms ascending within each field), without
     /// materializing a `Vec` of all terms like `all_terms` does. Used by the
     /// bounded-memory k-way streaming merge.
-    pub fn term_cursor(&self) -> TermCursor<'_> {
+    pub fn term_cursor(&self) -> TermCursor {
         self.dict.cursor()
     }
 
@@ -135,10 +161,15 @@ impl ZslSegment {
         let name_ending = |ext: &str| cfs.names().into_iter().find(|n| n.ends_with(ext));
         let fnm = name_ending(".fnm").ok_or_else(|| std::io::Error::other("no .fnm"))?;
         let tis = name_ending(".tis").ok_or_else(|| std::io::Error::other("no .tis"))?;
+        let tii_name = name_ending(".tii").ok_or_else(|| std::io::Error::other("no .tii"))?;
 
         let fields = read_field_infos(cfs.sub(&fnm).unwrap())?;
         let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
-        let dict = TermDict::read(cfs.sub(&tis).unwrap(), &field_names)?;
+        let dict = TermDict::open(
+            cfs.sub(&tis).unwrap(),
+            cfs.sub(&tii_name).unwrap(),
+            &field_names,
+        )?;
 
         let fdx_name = name_ending(".fdx").ok_or_else(|| std::io::Error::other("no .fdx"))?;
         let num_docs_total = cfs.sub(&fdx_name).unwrap().len() / 8;
@@ -207,7 +238,7 @@ impl IndexReader for ZslSegment {
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
         match self.dict.info(field, term) {
             // degrade: a corrupt .frq yields no postings rather than a panic across FFI
-            Some(ti) => read_freqs(self.cfs.sub(&self.frq_name).unwrap(), ti)
+            Some(ti) => read_freqs(self.cfs.sub(&self.frq_name).unwrap(), &ti)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|(d, _)| !self.deletes.is_deleted(*d))
@@ -251,7 +282,7 @@ impl IndexReader for ZslSegment {
             Some(ti) => read_positions(
                 self.cfs.sub(&self.frq_name).unwrap(),
                 self.cfs.sub(&self.prx_name).unwrap(),
-                ti,
+                &ti,
                 doc_id,
             )
             .unwrap_or_default(),
@@ -266,7 +297,7 @@ impl IndexReader for ZslSegment {
             Some(ti) if !self.prx_name.is_empty() => read_all_positions(
                 self.cfs.sub(&self.frq_name).unwrap(),
                 self.cfs.sub(&self.prx_name).unwrap(),
-                ti,
+                &ti,
             )
             .unwrap_or_default()
             .into_iter()
@@ -439,7 +470,7 @@ mod tests {
             .dict
             .info(field, term)
             .expect("fixture must index title:backup");
-        let raw = read_freqs(s.cfs.sub(&s.frq_name).unwrap(), ti).unwrap();
+        let raw = read_freqs(s.cfs.sub(&s.frq_name).unwrap(), &ti).unwrap();
         let raw_docs: Vec<usize> = raw.iter().map(|(d, _)| *d).collect();
         assert!(
             raw_docs.contains(&1),

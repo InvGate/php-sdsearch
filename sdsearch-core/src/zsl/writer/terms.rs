@@ -410,7 +410,7 @@ mod tests {
     use super::*;
     use crate::zsl::bytes::read_u64_be;
     use crate::zsl::postings::{read_all_positions, read_freqs};
-    use crate::zsl::terms::TermDict;
+    use crate::zsl::terms::EagerTermDict;
     use crate::zsl::writer::invert::invert;
     use crate::zsl::writer::{WriterDoc, WriterField, WriterOpts};
 
@@ -437,17 +437,17 @@ mod tests {
         let inv = invert(&docs, &WriterOpts::default());
         let f = write_term_dict(&inv.terms);
         let names = field_names(&inv);
-        let dict = TermDict::read(&f.tis, &names).unwrap();
+        let dict = EagerTermDict::read(&f.tis, &names).unwrap();
 
         assert_eq!(dict.info("title", "workflow").unwrap().doc_freq, 2);
         assert_eq!(dict.info("title", "done").unwrap().doc_freq, 1);
 
         let body_new = dict.info("body", "new").unwrap();
-        assert_eq!(read_freqs(&f.frq, body_new).unwrap(), vec![(0, 2)]);
+        assert_eq!(read_freqs(&f.frq, &body_new).unwrap(), vec![(0, 2)]);
 
         let title_wf = dict.info("title", "workflow").unwrap();
         assert_eq!(
-            read_all_positions(&f.frq, &f.prx, title_wf).unwrap(),
+            read_all_positions(&f.frq, &f.prx, &title_wf).unwrap(),
             vec![(0, vec![2]), (1, vec![1])]
         );
     }
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(read_u64_be(&f.tii, &mut pos).unwrap(), 3);
 
         // and the .tis is still readable
-        let dict = TermDict::read(&f.tis, &field_names(&inv)).unwrap();
+        let dict = EagerTermDict::read(&f.tis, &field_names(&inv)).unwrap();
         assert_eq!(dict.info("t", "w0000").unwrap().doc_freq, 1);
         assert_eq!(dict.info("t", "w0299").unwrap().doc_freq, 1);
     }

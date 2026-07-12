@@ -16,6 +16,7 @@ use super::invert::{FieldMeta, StoredField, TermPostings};
 use super::{assemble_cfs, fnm, norms, stored, terms};
 use crate::index::IndexReader;
 use crate::zsl::segment::ZslSegment;
+use crate::zsl::terms::TermInfo;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::File;
@@ -207,6 +208,10 @@ pub fn merge_segments_streaming(
     let fdt_tmp = index_dir.join(format!("{merged_name}.fdt.tmp"));
     let frq_tmp = index_dir.join(format!("{merged_name}.frq.tmp"));
     let prx_tmp = index_dir.join(format!("{merged_name}.prx.tmp"));
+    // The final `.cfs` is assembled into this staging file and only renamed onto the real
+    // `{merged_name}.cfs` once fully written + fsynced, so a mid-write I/O error can never leave
+    // a partial FINAL `.cfs` on disk — only this `.cfs.tmp`, which is cleaned up below.
+    let cfs_tmp = index_dir.join(format!("{merged_name}.cfs.tmp"));
 
     let result = merge_streaming_inner(
         index_dir,
@@ -215,12 +220,15 @@ pub fn merge_segments_streaming(
         &fdt_tmp,
         &frq_tmp,
         &prx_tmp,
+        &cfs_tmp,
     );
 
-    // Clean up temp files on BOTH the success and error paths (best-effort).
+    // Clean up staging files on BOTH the success and error paths (best-effort). `.cfs.tmp` is
+    // included so a failed assembly (or a failed rename) never leaks a partial staging file.
     let _ = std::fs::remove_file(&fdt_tmp);
     let _ = std::fs::remove_file(&frq_tmp);
     let _ = std::fs::remove_file(&prx_tmp);
+    let _ = std::fs::remove_file(&cfs_tmp);
 
     result
 }
@@ -232,6 +240,7 @@ fn merge_streaming_inner(
     fdt_tmp: &Path,
     frq_tmp: &Path,
     prx_tmp: &Path,
+    cfs_tmp: &Path,
 ) -> io::Result<usize> {
     let segs: Vec<ZslSegment> = segments
         .iter()
@@ -370,7 +379,18 @@ fn merge_streaming_inner(
     while let Some(Reverse((field, term, first_si))) = heap.pop() {
         // gather EVERY segment currently positioned at this exact (field, term). Advancing a
         // cursor and re-pushing its next (strictly greater) term keeps the heap in sync.
-        let mut contributing: Vec<usize> = vec![first_si];
+        //
+        // GOTCHA: each contributing cursor's `TermInfo` is captured HERE, at pop time, BEFORE
+        // `advance()` moves it past this term. A segment has at most one key on the heap at a
+        // time, pushed by a `peek()` that did NOT advance the cursor — so when that key is
+        // popped, `cursors[si]` is still positioned exactly at `(field, term)` and `peek_info()`
+        // is this term's info. After `advance()` it would be the NEXT term's, which is why we
+        // must not read it at posting-copy time below.
+        let first_ti = cursors[first_si]
+            .peek_info()
+            .expect("a cursor whose key is on the heap is positioned at that term")
+            .clone();
+        let mut contributing: Vec<(usize, TermInfo)> = vec![(first_si, first_ti)];
         cursors[first_si].advance();
         if let Some((f, t)) = cursors[first_si].peek() {
             heap.push(Reverse((f.to_string(), t.to_string(), first_si)));
@@ -381,7 +401,11 @@ fn merge_streaming_inner(
                 break;
             }
             let Reverse((_, _, si)) = heap.pop().unwrap();
-            contributing.push(si);
+            let ti = cursors[si]
+                .peek_info()
+                .expect("a cursor whose key is on the heap is positioned at that term")
+                .clone();
+            contributing.push((si, ti));
             cursors[si].advance();
             if let Some((f, t)) = cursors[si].peek() {
                 heap.push(Reverse((f.to_string(), t.to_string(), si)));
@@ -390,20 +414,21 @@ fn merge_streaming_inner(
 
         // Contributing segments in ASCENDING index (+ locals ascending within each) => new
         // doc-ids come out ascending, matching merge_segments' BTreeMap<new_id, _> ordering
-        // (dense renumbering assigns lower ids to earlier segments). `for_each_live_posting`
+        // (dense renumbering assigns lower ids to earlier segments). `for_each_live_posting_ti`
         // yields ascending LOCAL doc within a segment, which maps to ascending NEW id (dense
         // renumbering), and segment ranges are globally ordered — so postings arrive in
         // ascending new-id order across the whole term without any gather/sort, bounding peak
         // memory to one posting's positions rather than the whole term's doc list.
-        contributing.sort_unstable();
+        contributing.sort_unstable_by_key(|(si, _)| *si);
         let mf = field_index[&field];
         dict_writer.begin_term(mf, &term)?;
-        for &si in &contributing {
+        for (si, ti) in &contributing {
+            let si = *si;
             let map = &doc_maps[si];
-            // `for_each_live_posting`'s callback is `FnMut` and can't propagate `?`, so capture
+            // `for_each_live_posting_ti`'s callback is `FnMut` and can't propagate `?`, so capture
             // any `add_posting` error here and check it after the segment finishes iterating.
             let mut posting_err: Option<io::Error> = None;
-            segs[si].for_each_live_posting(&field, &term, |local, positions| {
+            segs[si].for_each_live_posting_ti(ti, |local, positions| {
                 if posting_err.is_some() {
                     return;
                 }
@@ -439,12 +464,19 @@ fn merge_streaming_inner(
         (".prx", CfsSource::Path(prx_tmp)),
     ];
 
-    // Write the merged .cfs durably: stream it into the file, then fsync BEFORE returning so the
-    // generation flip in optimize() only references a durable .cfs.
+    // Write the merged .cfs durably and ATOMICALLY: stream it into `{merged_name}.cfs.tmp`, fsync
+    // the content, then rename it onto the real `{merged_name}.cfs`. The staging + rename means a
+    // failure partway through `write_cfs_streaming` (disk full, I/O error) can only leave the
+    // `.cfs.tmp` (cleaned up by the caller), never a truncated FINAL `.cfs`. The directory fsync
+    // makes the rename durable so the generation flip in optimize() only references a durable .cfs.
     let cfs_path = index_dir.join(format!("{merged_name}.cfs"));
-    let mut cfs_file = File::create(&cfs_path)?;
-    write_cfs_streaming(&mut cfs_file, merged_name, &files)?;
-    cfs_file.sync_all()?;
+    {
+        let mut cfs_file = File::create(cfs_tmp)?;
+        write_cfs_streaming(&mut cfs_file, merged_name, &files)?;
+        cfs_file.sync_all()?;
+    }
+    std::fs::rename(cfs_tmp, &cfs_path)?;
+    super::durability::sync_dir(index_dir);
 
     Ok(doc_count)
 }
@@ -626,13 +658,15 @@ mod tests {
         let dict = terms::write_term_dict(&[]);
 
         // directory built by hand (NOT `assemble_cfs`): only the extensions REQUIRED by
-        // `ZslSegment::open_from` (.fdx .fdt .fnm .tis .frq), without `.nrm`/`.tii` (optional) and
-        // without `.prx` (deliberately omitted).
+        // `ZslSegment::open_from` (.fdx .fdt .fnm .tis .tii .frq), without `.nrm` (optional) and
+        // without `.prx` (deliberately omitted). `.tii` is required by `open_from` (the lazy dict
+        // seeks through it) and the writer always emits one, so it is included here.
         let files: Vec<(&str, &[u8])> = vec![
             (".fdx", &fdx),
             (".fdt", &fdt),
             (".fnm", &fnm_bytes),
             (".tis", &dict.tis),
+            (".tii", &dict.tii),
             (".frq", &dict.frq),
         ];
         let cfs_bytes = crate::zsl::writer::cfs::write_cfs("_x", &files);
@@ -667,6 +701,8 @@ mod tests {
         assert!(!dir.join("_m.fdt.tmp").exists());
         assert!(!dir.join("_m.frq.tmp").exists());
         assert!(!dir.join("_m.prx.tmp").exists());
+        // the .cfs staging file was renamed onto the final .cfs, not left behind.
+        assert!(!dir.join("_m.cfs.tmp").exists());
     }
 
     #[test]
@@ -690,6 +726,35 @@ mod tests {
         );
         let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
         assert_streaming_byte_identical(&dir, &refs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn streaming_merge_cleans_staging_and_leaves_no_partial_cfs_when_final_rename_fails() {
+        // Regression lock for the atomic-.cfs write: a pre-existing directory at the final
+        // `_m.cfs` path makes the rename of the fully-written `.cfs.tmp` staging file fail. The
+        // merge must return Err, must NOT leak any staging file (`.cfs.tmp` / `.fdt/.frq/.prx.tmp`),
+        // and must never leave a truncated FINAL `.cfs` (the blocking directory stays untouched).
+        let dir = temp_kb_full();
+        let infos = read_segment_infos(&dir).unwrap();
+        let refs: Vec<(String, i64)> = infos.iter().map(|s| (s.name.clone(), s.del_gen)).collect();
+
+        std::fs::create_dir(dir.join("_m.cfs")).unwrap(); // blocks the final rename target
+
+        let result = merge_segments_streaming(&dir, "_m", &refs);
+        assert!(
+            result.is_err(),
+            "merge must fail when the final rename is blocked"
+        );
+
+        // no staging file leaked (cleaned on the error path)...
+        assert!(!dir.join("_m.cfs.tmp").exists());
+        assert!(!dir.join("_m.fdt.tmp").exists());
+        assert!(!dir.join("_m.frq.tmp").exists());
+        assert!(!dir.join("_m.prx.tmp").exists());
+        // ...and the final path is still the blocking directory, never a truncated .cfs file.
+        assert!(dir.join("_m.cfs").is_dir());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -830,6 +895,7 @@ mod tests {
             (".fdt", &fdt),
             (".fnm", &fnm_bytes),
             (".tis", &dict.tis),
+            (".tii", &dict.tii),
             (".frq", &dict.frq),
         ];
         let cfs_bytes = crate::zsl::writer::cfs::write_cfs("_x", &files);

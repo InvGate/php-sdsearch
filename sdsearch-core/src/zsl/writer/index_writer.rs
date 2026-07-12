@@ -209,25 +209,31 @@ impl IndexWriter {
         let new_gen =
             segments::write_optimized_generation(&self.dir, &gen, &merged_name, doc_count as u32)?;
 
-        // 6) orphan cleanup POST-flip (best-effort): .cfs/.del/.sti of the old segments.
-        //    Never before the flip (crash-safety invariant: the merged segment is referenced only
-        //    after the atomic segments.gen flip). The merged _<k> is not in `infos`.
+        // 6) old-segment cleanup POST-flip (best-effort), DEFERRED one generation.
+        //    Never before the flip (crash-safety: the merged segment is referenced only after the
+        //    atomic segments.gen flip). We do NOT delete the old .cfs/.sti/.del now: the prune in
+        //    step 5 keeps the previous generation's manifest as a grace window for lock-free
+        //    readers, and that manifest still references these files — deleting them now would
+        //    leave such a reader with dangling references (and on Windows the unlink of a mapped
+        //    .cfs fails silently, leaking it). Instead we hand this round's superseded files to
+        //    `process_pending_deletions`, which deletes the PREVIOUS round's files (whose manifest
+        //    the step-5 prune just removed) and records these for the next flip. The merged _<k>
+        //    is not in `infos`, so it is never listed.
+        let mut superseded: Vec<String> = Vec::new();
         for info in &infos {
-            let _ = std::fs::remove_file(self.dir.join(format!("{}.cfs", info.name)));
-            let _ = std::fs::remove_file(self.dir.join(format!("{}.sti", info.name)));
-            let del_name = match info.del_gen {
-                -1 => None,
-                0 => Some(format!("{}.del", info.name)),
-                g => Some(format!(
+            superseded.push(format!("{}.cfs", info.name));
+            superseded.push(format!("{}.sti", info.name));
+            match info.del_gen {
+                -1 => {}
+                0 => superseded.push(format!("{}.del", info.name)),
+                g => superseded.push(format!(
                     "{}_{}.del",
                     info.name,
                     crate::zsl::segments::to_base36(g as u64)
                 )),
-            };
-            if let Some(dn) = del_name {
-                let _ = std::fs::remove_file(self.dir.join(dn));
             }
         }
+        segments::process_pending_deletions(&self.dir, &superseded);
 
         Ok(CommitReport {
             generation: new_gen,
@@ -309,6 +315,11 @@ impl IndexWriter {
             self.next_name_counter,
         )?;
 
+        // A flip happened (this point is unreachable on the empty-commit no-op above): reclaim any
+        // deferred deletions from a previous optimize whose manifest the flip's prune just removed.
+        // This add-only commit supersedes nothing, so it records no new files.
+        segments::process_pending_deletions(&self.dir, &[]);
+
         Ok(CommitReport {
             generation,
             segments,
@@ -358,6 +369,45 @@ mod tests {
         WriterDoc {
             fields: vec![WriterField::text("title", &format!("zqxmark unique{i}"))],
         }
+    }
+
+    #[test]
+    fn optimize_keeps_previous_generation_segment_files_as_a_grace_window() {
+        let dir = temp_kb_full();
+        // build a multi-segment index: KB base (_2) + several flushed segments in one commit.
+        let opts = WriterOpts {
+            max_buffered_docs: 2,
+            ..WriterOpts::default()
+        };
+        let mut w = IndexWriter::open(&dir, opts).unwrap();
+        for i in 0..6 {
+            w.add_document(doc_mark(i)).unwrap();
+        }
+        w.commit().unwrap();
+
+        let pre = read_segment_infos(&dir).unwrap();
+        assert!(
+            pre.len() >= 2,
+            "need a multi-segment index for optimize to merge"
+        );
+        let old_names: Vec<String> = pre.iter().map(|s| s.name.clone()).collect();
+
+        // optimize collapses everything into one segment and flips the generation.
+        let w2 = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        w2.optimize().unwrap();
+
+        // The prune keeps the PREVIOUS generation's manifest as a grace window for lock-free
+        // readers that read segments.gen an instant before the flip. Those readers open the
+        // previous manifest, which still references the old segments — so their .cfs must ALSO
+        // still exist, or the grace window points at deleted data. Deletion is deferred one
+        // generation for exactly this reason.
+        for name in &old_names {
+            assert!(
+                dir.join(format!("{name}.cfs")).exists(),
+                "old segment {name}.cfs must survive one generation as a reader grace window"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -597,10 +647,29 @@ mod tests {
         assert_eq!(idx.num_docs(), live);
         assert_eq!(idx.doc_freq("title", "zqxmark"), 3); // 4 - 1 deleted
 
-        // orphan cleanup: the old .cfs were deleted; the merged one exists
-        assert!(!dir.join("_2.cfs").exists());
+        // Deferred cleanup: the old segments' .cfs are NOT deleted immediately — they survive one
+        // generation as a grace window for lock-free readers (the kept previous manifest still
+        // references them). The merged segment exists.
+        assert!(
+            dir.join("_2.cfs").exists(),
+            "old .cfs kept one generation as a grace window"
+        );
+        assert!(dir.join("_3.cfs").exists());
+        assert!(dir.join("_4.cfs").exists());
+        assert!(dir.join(format!("{}.cfs", infos[0].name)).exists());
+
+        // The NEXT flip (another commit) prunes the previous manifest and reclaims the deferred
+        // files, so the old .cfs are finally gone — deferral does not leak.
+        let mut w4 = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        w4.add_document(doc_mark(99)).unwrap();
+        w4.commit().unwrap();
+        assert!(
+            !dir.join("_2.cfs").exists(),
+            "old .cfs reclaimed on the next flip"
+        );
         assert!(!dir.join("_3.cfs").exists());
         assert!(!dir.join("_4.cfs").exists());
+        // the merged segment (referenced by the current manifest) is untouched.
         assert!(dir.join(format!("{}.cfs", infos[0].name)).exists());
 
         std::fs::remove_dir_all(&dir).ok();

@@ -118,7 +118,7 @@ mod tests {
     use super::*;
     use crate::zsl::cfs::CompoundFile;
     use crate::zsl::fields::read_field_infos;
-    use crate::zsl::terms::TermDict;
+    use crate::zsl::terms::EagerTermDict;
     use std::path::PathBuf;
 
     fn cfs() -> CompoundFile {
@@ -147,9 +147,9 @@ mod tests {
             .into_iter()
             .map(|f| f.name)
             .collect();
-        let dict = TermDict::read(&sub(".tis"), &names).unwrap();
+        let dict = EagerTermDict::read(&sub(".tis"), &names).unwrap();
         let info = dict.info("title", "new").unwrap();
-        let freqs = read_freqs(&sub(".frq"), info).unwrap();
+        let freqs = read_freqs(&sub(".frq"), &info).unwrap();
         // "new" is in all 4 docs (all "New workflow"), freq 1 each
         assert_eq!(freqs, vec![(0, 1), (1, 1), (2, 1), (3, 1)]);
     }
@@ -165,26 +165,31 @@ mod tests {
     }
 
     #[test]
-    fn for_each_posting_matches_read_all_positions() {
-        let cf = cfs();
-        let sub = |ext: &str| {
-            cf.sub(&cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap())
-                .unwrap()
-                .to_vec()
-        };
-        let names: Vec<String> = read_field_infos(&sub(".fnm"))
-            .unwrap()
-            .into_iter()
-            .map(|f| f.name)
-            .collect();
-        let dict = TermDict::read(&sub(".tis"), &names).unwrap();
-        let ti = dict.info("title", "new").unwrap();
-        let frq = sub(".frq");
-        let prx = sub(".prx");
+    fn for_each_posting_decodes_written_postings() {
+        // Independent ground truth: encode known postings with the writer, then assert the
+        // decoder reproduces them EXACTLY. Doc ids ascend and the per-doc position counts VARY
+        // (3, 1, 4, 1) so a scratch buffer that is not cleared between docs would leak stale
+        // positions into later docs and fail here. NOT compared against `read_all_positions`
+        // (which now delegates to `for_each_posting`, so that comparison is tautological).
+        let docs: Vec<(usize, Vec<u32>)> = vec![
+            (0, vec![0, 3, 7]),
+            (2, vec![5]),
+            (5, vec![1, 2, 9, 40]),
+            (6, vec![0]),
+        ];
 
-        let expected = read_all_positions(&frq, &prx, ti).unwrap();
+        let mut frq: Vec<u8> = Vec::new();
+        let mut prx: Vec<u8> = Vec::new();
+        let (freq_pointer, prox_pointer) =
+            crate::zsl::writer::postings::write_term_postings(&mut frq, &mut prx, &docs);
+        let info = TermInfo {
+            doc_freq: docs.len() as u32,
+            freq_pointer,
+            prox_pointer,
+        };
+
         let mut got: Vec<(usize, Vec<u32>)> = Vec::new();
-        for_each_posting(&frq, &prx, ti, |doc, pos| got.push((doc, pos.to_vec()))).unwrap();
-        assert_eq!(got, expected);
+        for_each_posting(&frq, &prx, &info, |doc, pos| got.push((doc, pos.to_vec()))).unwrap();
+        assert_eq!(got, docs);
     }
 }
