@@ -293,6 +293,15 @@ impl LazyTermDict {
         })
     }
 
+    /// Test-only: number of parsed `.tii` index entries (including the synthetic
+    /// `("","")` anchor). Lets tests assert a synthesized corpus actually produced
+    /// more than the trivial single-anchor index, i.e. exercised the sparse seek
+    /// path in `info` rather than degenerating to a full `.tis` scan from offset 24.
+    #[cfg(test)]
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+
     /// Looks up `(field, term)` by seeking to the nearest `.tii` index entry
     /// at or before it (composite key `(field, text)`) and, unless that's an
     /// exact hit, forward-decoding `.tis` from there until the target is found,
@@ -570,5 +579,95 @@ mod tests {
             assert_eq!(lazy.info("title", "definitelymissing"), None);
             assert_eq!(lazy.info("no_such_field", "x"), None);
         }
+    }
+
+    /// The committed fixtures (`zsl_index`, `zsl_index_multiseg`) both have far fewer
+    /// than `INDEX_INTERVAL` (128) terms, so their `.tii` holds only the synthetic
+    /// anchor and `lazy_info_matches_eager_for_every_term_and_absentees` above never
+    /// exercises a real `.tii` sample: every lookup degenerates to a full `.tis` scan
+    /// from offset 24, never touching the `running = running.wrapping_add(index_delta)`
+    /// accumulation in `LazyTermDict::open` nor the exact-hit fast path in `info`.
+    ///
+    /// This test synthesizes a >128-term, 2-field term dictionary directly via the
+    /// writer's batch `write_term_dict` (mirroring `tii_samples_every_index_interval_terms`
+    /// / `multi_field_sample_terms` in `zsl/writer/terms.rs`, scaled up to 560 terms — the
+    /// same order of magnitude the review used to demonstrate ~429/560 mismatches when the
+    /// accumulation order is reverted), asserts the `.tii` actually got multiple real
+    /// samples (`index_len() > 1`), and then runs the eager-vs-lazy differential over
+    /// every synthesized term plus a couple of absentees.
+    #[test]
+    fn lazy_seek_path_exercised_by_synthetic_multi_sample_tii() {
+        use crate::zsl::writer::invert::TermPostings;
+        use crate::zsl::writer::terms::write_term_dict;
+
+        let mut terms: Vec<TermPostings> = Vec::new();
+
+        // field 0 ("body"): 400 terms, zero-padded so lexicographic order == insertion
+        // order, sharing the "shared" prefix (exercises prefix-sharing across many
+        // consecutive .tis/.tii entries). Every 10th term gets a second, far-away doc
+        // (exercises multi-doc freq/prox deltas).
+        for i in 0..400usize {
+            let text = format!("shared{i:04}");
+            let docs = if i % 10 == 0 {
+                vec![(i, vec![0u32, 3]), (i + 10_000, vec![1u32])]
+            } else {
+                vec![(i, vec![0u32])]
+            };
+            terms.push(TermPostings {
+                field_num: 0,
+                text,
+                docs,
+            });
+        }
+        // field 1 ("title"): 160 more terms, zero-padded ascending, disjoint doc-id
+        // range from field 0 (prefix sharing must not leak across fields — see
+        // `dump_entry`'s doc comment).
+        for i in 0..160usize {
+            let text = format!("word{i:04}");
+            let docs = if i % 7 == 0 {
+                vec![(20_000 + i, vec![0u32, 2]), (20_000 + i + 500, vec![1u32])]
+            } else {
+                vec![(20_000 + i, vec![0u32])]
+            };
+            terms.push(TermPostings {
+                field_num: 1,
+                text,
+                docs,
+            });
+        }
+        assert_eq!(
+            terms.len(),
+            560,
+            "corpus must comfortably exceed INDEX_INTERVAL (128)"
+        );
+
+        let field_names = vec!["body".to_string(), "title".to_string()];
+        let dict_files = write_term_dict(&terms);
+
+        let eager = TermDict::read(&dict_files.tis, &field_names).unwrap();
+        let lazy = LazyTermDict::open(&dict_files.tis, &dict_files.tii, &field_names).unwrap();
+
+        // sanity: the synthesized corpus must actually produce multiple .tii samples,
+        // i.e. more than just the synthetic ("","") anchor — otherwise this test would
+        // silently degenerate back into the same full-scan-only coverage as the
+        // fixture-based differential test above.
+        assert!(
+            lazy.index_len() > 1,
+            "corpus too small to exercise the sparse .tii seek path: index_len={}",
+            lazy.index_len()
+        );
+
+        for term in &terms {
+            let field = &field_names[term.field_num];
+            assert_eq!(
+                lazy.info(field, &term.text),
+                eager.info(field, &term.text),
+                "mismatch at {field}:{}",
+                term.text
+            );
+        }
+
+        assert_eq!(lazy.info("body", "definitelymissing"), None);
+        assert_eq!(lazy.info("no_such_field", "x"), None);
     }
 }
