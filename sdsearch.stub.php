@@ -42,11 +42,17 @@ namespace SdSearch {
          *   "where": [ { "field": "status", "values": ["open"], "occur": "must" } ],
          *   "in":    [ { "field": "category_key", "values": ["10", "11"] } ],
          *   "min_score": 0.0,
-         *   "limit": 20
+         *   "limit": 20,
+         *   "accent_insensitive": false,
+         *   "field_weights": { "title": 3.0, "description": 1.0 }
          * }
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
          * - `in[]` matches a field against any of the literal values (already-suffixed key fields).
+         * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
+         *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
+         * - `field_weights` (optional, default `{}`): per-field score multipliers; a field not
+         *   listed weighs `1.0`. Empty = every field weighed equally (current behavior).
          *
          * The return value is a JSON array of hits:
          * ```json
