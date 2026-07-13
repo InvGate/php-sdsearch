@@ -999,7 +999,6 @@ version = "0.1.2"
 dependencies = [
  "fst",
  "memmap2",
- "once_cell",
  "regex",
  "serde",
  "serde_json",

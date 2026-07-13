@@ -711,7 +711,7 @@ mod tests {
         let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
         w.delete_document(5);
         w.commit().unwrap();
-        assert!(ZslIndex::open(&dir).unwrap().num_docs() == 19);
+        assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 19);
 
         // 1 segment BUT with deletions => optimize must run (collapses the .del)
         let w2 = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
