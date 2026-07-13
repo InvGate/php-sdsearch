@@ -49,6 +49,8 @@ fn base(text: &str) -> QueryParams {
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
+        accent_insensitive: false,
+        field_weights: std::collections::HashMap::new(),
     }
 }
 

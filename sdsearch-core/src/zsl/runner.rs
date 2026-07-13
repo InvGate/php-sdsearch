@@ -3,7 +3,7 @@
 //! limit==0 = unlimited).
 
 use crate::analysis::analyze;
-use crate::query::{Occur, Query, QueryParams, build_query, search};
+use crate::query::{Occur, Query, QueryParams, build_query, search_with_weights};
 use crate::search::Hit;
 use crate::zsl::index::ZslIndex;
 use std::collections::HashSet;
@@ -21,10 +21,10 @@ pub fn search_index(
     let index = ZslIndex::open(index_dir)?;
     let query = build_query(params)?;
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let mut hits = search(&index, &query, min_score, lim);
+    let mut hits = search_with_weights(&index, &query, &params.field_weights, min_score, lim);
     if hits.is_empty() {
         if let Some(fb) = fallback_query(&params.text) {
-            hits = search(&index, &fb, min_score, lim);
+            hits = search_with_weights(&index, &fb, &params.field_weights, min_score, lim);
         }
     }
     Ok(hits)
@@ -73,6 +73,8 @@ mod tests {
             fuzzy_similarity: 0.5,
             fuzzy_prefix_len: 3,
             wildcard_min_prefix: 0,
+            accent_insensitive: false,
+            field_weights: std::collections::HashMap::new(),
         }
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {

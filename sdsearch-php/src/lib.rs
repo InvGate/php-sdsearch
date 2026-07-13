@@ -38,6 +38,12 @@ struct ParamsDto {
     min_score: f32,
     #[serde(default)]
     limit: u64,
+    /// optional: accent-insensitive text matching (Spanish). Omitted = false.
+    #[serde(default)]
+    accent_insensitive: bool,
+    /// optional: per-field score multipliers (field -> weight). Omitted = {} (equal).
+    #[serde(default)]
+    field_weights: HashMap<String, f32>,
 }
 #[derive(Serialize)]
 struct HitDto {
@@ -81,6 +87,8 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
+        accent_insensitive: dto.accent_insensitive,
+        field_weights: dto.field_weights,
     };
     let hits = search_index(
         Path::new(index_dir),
@@ -203,6 +211,8 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
+        accent_insensitive: false,
+        field_weights: HashMap::new(),
     };
     let query = build_query(&params).map_err(|e| format!("sdsearch: build_query: {e}"))?;
     let hits = search(index, &query, 0.0, 1);

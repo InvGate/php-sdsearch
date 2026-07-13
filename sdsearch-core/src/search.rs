@@ -282,6 +282,22 @@ pub fn fuzzy_query(
     finalize(index, union_scores(index, field, &refs), min_score, limit)
 }
 
+/// terms in `field` that are accent variants of `token` and actually exist in the
+/// dictionary. Spanish's single-tilde rule keeps the candidate set linear
+/// (`analysis::accent_variants`); filtering by `doc_freq > 0` keeps only real
+/// terms, so the caller's `union_scores` never reads empty postings. Read-only,
+/// no reindex: works over the existing ZendLucene indexes.
+pub(crate) fn accent_variant_terms(
+    index: &impl IndexReader,
+    field: &str,
+    token: &str,
+) -> Vec<String> {
+    crate::analysis::accent_variants(token)
+        .into_iter()
+        .filter(|term| index.doc_freq(field, term) > 0)
+        .collect()
+}
+
 /// Phrase query with exact adjacency.
 pub fn phrase_query(
     index: &impl IndexReader,
@@ -315,6 +331,40 @@ mod tests {
         let ids: Vec<usize> = hits.iter().map(|h| h.id).collect();
         // doc 1 (tf=2) before doc 0 (tf=1); doc 2 does not match
         assert_eq!(ids, vec![1, 0]);
+    }
+
+    fn accent_corpus() -> MemoryIndex {
+        let mut idx = MemoryIndex::new();
+        for text in ["el avión despega", "reserva de avion", "gestión de flota"] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            idx.add_document(d);
+        }
+        idx
+    }
+
+    #[test]
+    fn accent_variant_terms_keeps_only_existing_terms() {
+        let idx = accent_corpus();
+        let mut got = accent_variant_terms(&idx, "body", "avion");
+        got.sort();
+        // both the plain and the accented form exist in the corpus; ávion/avíon do not.
+        assert_eq!(got, vec!["avion".to_string(), "avión".to_string()]);
+    }
+
+    #[test]
+    fn accent_variant_terms_bridges_from_accented_query() {
+        let idx = accent_corpus();
+        // user types the accented form; the plain "avion" (doc 1) must still surface.
+        let got = accent_variant_terms(&idx, "body", "avión");
+        assert!(got.contains(&"avion".to_string()));
+        assert!(got.contains(&"avión".to_string()));
+    }
+
+    #[test]
+    fn accent_variant_terms_empty_when_nothing_matches() {
+        let idx = accent_corpus();
+        assert!(accent_variant_terms(&idx, "body", "zzz").is_empty());
     }
 
     #[test]

@@ -3,7 +3,8 @@
 
 use crate::index::IndexReader;
 use crate::search::{
-    Hit, finalize, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms,
+    Hit, accent_variant_terms, finalize, fuzzy_terms, phrase_scores, term_scores, union_scores,
+    wildcard_terms,
 };
 use std::collections::HashMap;
 
@@ -18,6 +19,13 @@ pub enum Occur {
 pub enum Query {
     /// exact term; field None = all indexed fields (ZSL null-field rewrite).
     Term {
+        field: Option<String>,
+        text: String,
+    },
+    /// accent-insensitive term: expands to the existing accent variants of `text`
+    /// (Spanish single-tilde rule, filtered against the dictionary). field None =
+    /// all indexed fields, like `Term`.
+    AccentTerm {
         field: Option<String>,
         text: String,
     },
@@ -49,14 +57,37 @@ fn target_fields(index: &impl IndexReader, field: &Option<String>) -> Vec<String
     }
 }
 
+/// per-field score multiplier; a field absent from `weights` scores at 1.0.
+fn field_weight(weights: &HashMap<String, f32>, field: &str) -> f32 {
+    weights.get(field).copied().unwrap_or(1.0)
+}
+
 /// evaluates a query to a doc_id -> score map (without filtering min_score or truncating).
-fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
+/// `weights` scales each field's leaf contribution (see `field_weight`).
+fn eval(
+    index: &impl IndexReader,
+    q: &Query,
+    weights: &HashMap<String, f32>,
+) -> HashMap<usize, f32> {
     match q {
         Query::Term { field, text } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
+                let w = field_weight(weights, &f);
                 for (id, s) in term_scores(index, &f, text) {
-                    *acc.entry(id).or_insert(0.0) += s;
+                    *acc.entry(id).or_insert(0.0) += s * w;
+                }
+            }
+            acc
+        }
+        Query::AccentTerm { field, text } => {
+            let mut acc: HashMap<usize, f32> = HashMap::new();
+            for f in target_fields(index, field) {
+                let w = field_weight(weights, &f);
+                let terms = accent_variant_terms(index, &f, text);
+                let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
+                for (id, s) in union_scores(index, &f, &refs) {
+                    *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
             acc
@@ -68,10 +99,11 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
         } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
+                let w = field_weight(weights, &f);
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
                 for (id, s) in union_scores(index, &f, &refs) {
-                    *acc.entry(id).or_insert(0.0) += s;
+                    *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
             acc
@@ -84,39 +116,48 @@ fn eval(index: &impl IndexReader, q: &Query) -> HashMap<usize, f32> {
         } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
+                let w = field_weight(weights, &f);
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
                 for (id, s) in union_scores(index, &f, &refs) {
-                    *acc.entry(id).or_insert(0.0) += s;
+                    *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
             acc
         }
         Query::Phrase { field, terms } => {
+            let w = field_weight(weights, field);
             let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
             phrase_scores(index, field, &refs)
+                .into_iter()
+                .map(|(id, s)| (id, s * w))
+                .collect()
         }
-        Query::Boolean { clauses } => eval_boolean(index, clauses),
+        Query::Boolean { clauses } => eval_boolean(index, clauses, weights),
     }
 }
 
 /// Lucene-style boolean semantics: must (intersection, required), should (sum/coord),
 /// must-not (exclusion); if there is no must, at least one should must match.
-fn eval_boolean(index: &impl IndexReader, clauses: &[(Occur, Query)]) -> HashMap<usize, f32> {
+fn eval_boolean(
+    index: &impl IndexReader,
+    clauses: &[(Occur, Query)],
+    weights: &HashMap<String, f32>,
+) -> HashMap<usize, f32> {
     let musts: Vec<HashMap<usize, f32>> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::Must)
-        .map(|(_, q)| eval(index, q))
+        .map(|(_, q)| eval(index, q, weights))
         .collect();
     let shoulds: Vec<HashMap<usize, f32>> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::Should)
-        .map(|(_, q)| eval(index, q))
+        .map(|(_, q)| eval(index, q, weights))
         .collect();
     let mustnots: Vec<HashMap<usize, f32>> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::MustNot)
-        .map(|(_, q)| eval(index, q))
+        .map(|(_, q)| eval(index, q, weights))
         .collect();
 
     // accumulated score and matched (should+must) clauses per doc, for the coord.
@@ -187,7 +228,20 @@ fn eval_boolean(index: &impl IndexReader, clauses: &[(Occur, Query)]) -> HashMap
 /// boolean (top) level; the leaves in `search.rs` score raw, because normalizing per leaf
 /// would distort the boolean composition.
 pub fn search(index: &impl IndexReader, query: &Query, min_score: f32, limit: usize) -> Vec<Hit> {
-    let scored = eval(index, query);
+    search_with_weights(index, query, &HashMap::new(), min_score, limit)
+}
+
+/// like `search`, but applies per-field score multipliers (`weights`, field -> factor;
+/// missing = 1.0). The multiplier is applied at the leaves, BEFORE the top-hit→1.0
+/// normalization, so it only reorders and keeps the `min_score` scale intact.
+pub fn search_with_weights(
+    index: &impl IndexReader,
+    query: &Query,
+    weights: &HashMap<String, f32>,
+    min_score: f32,
+    limit: usize,
+) -> Vec<Hit> {
+    let scored = eval(index, query, weights);
     let top = scored.values().copied().fold(0.0f32, f32::max);
     let normalized: Vec<(usize, f32)> = if top > 0.0 {
         scored.into_iter().map(|(id, s)| (id, s / top)).collect()
@@ -218,6 +272,12 @@ pub struct QueryParams {
     pub fuzzy_similarity: f32,
     pub fuzzy_prefix_len: usize,
     pub wildcard_min_prefix: usize,
+    /// when true, the per-token text clauses become accent-insensitive (Spanish):
+    /// `avion` also matches `avión` and vice-versa. Off = current ZSL behavior.
+    pub accent_insensitive: bool,
+    /// optional per-field score multipliers (field -> weight); missing field = 1.0.
+    /// Empty map = every field weighted equally (current behavior).
+    pub field_weights: HashMap<String, f32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -282,15 +342,21 @@ fn text_subquery(p: &QueryParams) -> Query {
         },
     ));
     // QueryParser::parse(RAW text): the analyzer tokenizes the original text ->
-    // one all-fields term (default-OR) per token.
+    // one all-fields term (default-OR) per token. With accent_insensitive on, the
+    // per-token clause becomes an AccentTerm so `avion` also reaches `avión`.
     for tok in crate::analysis::analyze(&p.text) {
-        clauses.push((
-            Occur::Should,
+        let leaf = if p.accent_insensitive {
+            Query::AccentTerm {
+                field: None,
+                text: tok,
+            }
+        } else {
             Query::Term {
                 field: None,
                 text: tok,
-            },
-        ));
+            }
+        };
+        clauses.push((Occur::Should, leaf));
     }
     Query::Boolean { clauses }
 }
@@ -415,6 +481,107 @@ mod tests {
         }
     }
 
+    fn accent_index() -> MemoryIndex {
+        let mut idx = MemoryIndex::new();
+        for title in ["el avión despega", "un avion barato", "otra cosa"] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            idx.add_document(d);
+        }
+        idx
+    }
+
+    fn query_has_accent_term(q: &Query) -> bool {
+        match q {
+            Query::AccentTerm { .. } => true,
+            Query::Boolean { clauses } => clauses.iter().any(|(_, c)| query_has_accent_term(c)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn build_query_accent_flag_emits_accent_terms() {
+        let mut p = params("avion");
+        p.accent_insensitive = true;
+        assert!(query_has_accent_term(&build_query(&p).unwrap()));
+    }
+
+    #[test]
+    fn build_query_without_accent_flag_has_no_accent_terms() {
+        assert!(!query_has_accent_term(
+            &build_query(&params("avion")).unwrap()
+        ));
+    }
+
+    #[test]
+    fn accent_term_matches_plain_and_accented() {
+        // "avion" must reach both the accented (doc 0) and plain (doc 1) documents.
+        let q = Query::AccentTerm {
+            field: Some("title".into()),
+            text: "avion".into(),
+        };
+        assert_eq!(ids(&search(&accent_index(), &q, 0.0, 100)), vec![0, 1]);
+    }
+
+    #[test]
+    fn plain_term_does_not_bridge_accents() {
+        // guard: without AccentTerm, a plain "avion" term only hits the plain doc.
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "avion".into(),
+        };
+        assert_eq!(ids(&search(&accent_index(), &q, 0.0, 100)), vec![1]);
+    }
+
+    fn two_field_index() -> MemoryIndex {
+        // doc0 has the term in `title`, doc1 has it in `body`; equal field length so
+        // raw scores tie and the field weight alone decides the order.
+        let mut idx = MemoryIndex::new();
+        let mut d0 = Document::new();
+        d0.add("title", "vpn", FieldKind::Text);
+        d0.add("body", "x", FieldKind::Text);
+        idx.add_document(d0);
+        let mut d1 = Document::new();
+        d1.add("title", "x", FieldKind::Text);
+        d1.add("body", "vpn", FieldKind::Text);
+        idx.add_document(d1);
+        idx
+    }
+
+    #[test]
+    fn field_weight_decides_top_hit() {
+        let idx = two_field_index();
+        let q = Query::Term {
+            field: None,
+            text: "vpn".into(),
+        };
+        let weight = |field: &str, w: f32| {
+            let mut m = HashMap::new();
+            m.insert(field.to_string(), w);
+            m
+        };
+        // weighting `title` heavily brings the title doc (0) to the top...
+        let hits = search_with_weights(&idx, &q, &weight("title", 10.0), 0.0, 100);
+        assert_eq!(hits[0].id, 0);
+        // ...and weighting `body` flips it to the body doc (1).
+        let hits = search_with_weights(&idx, &q, &weight("body", 10.0), 0.0, 100);
+        assert_eq!(hits[0].id, 1);
+    }
+
+    #[test]
+    fn empty_weights_match_unweighted_search() {
+        let idx = two_field_index();
+        let q = Query::Term {
+            field: None,
+            text: "vpn".into(),
+        };
+        let weighted = search_with_weights(&idx, &q, &HashMap::new(), 0.0, 100);
+        let plain = search(&idx, &q, 0.0, 100);
+        let w_ids: Vec<usize> = weighted.iter().map(|h| h.id).collect();
+        let p_ids: Vec<usize> = plain.iter().map(|h| h.id).collect();
+        assert_eq!(w_ids, p_ids);
+    }
+
     #[test]
     fn must_requires_all_clauses() {
         // vpn AND lang=es => only doc0
@@ -504,6 +671,8 @@ mod tests {
             fuzzy_similarity: 0.5,
             fuzzy_prefix_len: 3,
             wildcard_min_prefix: 0,
+            accent_insensitive: false,
+            field_weights: HashMap::new(),
         }
     }
 
