@@ -148,7 +148,7 @@ impl MemoryIndex {
                     let mut sorted = positions.clone();
                     sorted.sort_unstable();
                     for p in sorted {
-                        write_vint(&mut postings_bin, p as u64);
+                        write_vint(&mut postings_bin, u64::from(p));
                     }
                     prev = doc_id;
                 }
@@ -203,7 +203,7 @@ impl IndexReader for MemoryIndex {
     fn doc_freq(&self, field: &str, term: &str) -> usize {
         self.postings
             .get(&(field.to_string(), term.to_string()))
-            .map_or(0, |p| p.len())
+            .map_or(0, std::collections::HashMap::len)
     }
 
     /// postings of (field, term): iterator of (doc_id, term_freq); freq = number of positions

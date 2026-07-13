@@ -9,7 +9,7 @@
 //!       {"name":"title","value":"...","kind":"text","stored":true}, ... ] } ] }
 //!   kind ∈ {"text","keyword","unindexed"} (default stored=true)
 
-use sdsearch_core::zsl::writer::{append_documents, FieldKind, WriterDoc, WriterField, WriterOpts};
+use sdsearch_core::zsl::writer::{FieldKind, WriterDoc, WriterField, WriterOpts, append_documents};
 use std::path::Path;
 
 #[derive(serde::Deserialize)]
@@ -77,7 +77,11 @@ fn main() {
     // JSON output for the harness to parse (includes timing + process peak RSS)
     println!(
         "{{\"segment\":\"{}\",\"doc_count\":{},\"generation\":{},\"elapsed_ms\":{:.3},\"peak_rss_kb\":{}}}",
-        report.segment_name, report.doc_count, report.generation, elapsed_ms, peak_rss_kb()
+        report.segment_name,
+        report.doc_count,
+        report.generation,
+        elapsed_ms,
+        peak_rss_kb()
     );
 }
 

@@ -55,31 +55,37 @@ struct TrackingAlloc;
 
 unsafe impl GlobalAlloc for TrackingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() && TRACK.load(Ordering::Relaxed) {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc(layout);
+            if !p.is_null() && TRACK.load(Ordering::Relaxed) {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        if TRACK.load(Ordering::Relaxed) {
-            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe {
+            System.dealloc(ptr, layout);
+            if TRACK.load(Ordering::Relaxed) {
+                LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            }
         }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
-        if !p.is_null() && TRACK.load(Ordering::Relaxed) {
-            let old = layout.size();
-            if new_size >= old {
-                let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
-                PEAK.fetch_max(live, Ordering::Relaxed);
-            } else {
-                LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+        unsafe {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() && TRACK.load(Ordering::Relaxed) {
+                let old = layout.size();
+                if new_size >= old {
+                    let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                    PEAK.fetch_max(live, Ordering::Relaxed);
+                } else {
+                    LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+                }
             }
+            p
         }
-        p
     }
 }
 
@@ -87,9 +93,7 @@ unsafe impl GlobalAlloc for TrackingAlloc {
 /// `BENCH_TRACK_HEAP` (default: on). Startup allocations before this are minimal and precede any
 /// `reset_peak`, so LIVE accounting stays consistent for the whole measured region.
 fn init_track() -> bool {
-    let on = std::env::var("BENCH_TRACK_HEAP")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let on = std::env::var("BENCH_TRACK_HEAP").map_or(true, |v| v != "0");
     TRACK.store(on, Ordering::Relaxed);
     on
 }
@@ -265,10 +269,16 @@ fn run_rebuild(n: usize, cap: usize) {
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     // total LIVE docs (base + added) via a post-commit reader — CommitReport.doc_count is the
     // per-session count, not the index total (see index_writer.rs commit_inner).
-    let doc_count = ZslIndex::open(&dir).map(|r| r.num_docs()).unwrap_or(0);
+    let doc_count = ZslIndex::open(&dir).map_or(0, |r| r.num_docs());
     println!(
         "{{\"engine\":\"native\",\"pass\":\"{}\",\"workload\":\"rebuild\",\"n\":{},\"cap\":{},\"ms\":{:.3},\"heap_peak_kb\":{},\"rss_peak_kb\":{},\"doc_count\":{}}}",
-        pass_label(), n, cap, ms, heap_peak_kb(), rss_peak_kb(), doc_count
+        pass_label(),
+        n,
+        cap,
+        ms,
+        heap_peak_kb(),
+        rss_peak_kb(),
+        doc_count
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -296,10 +306,18 @@ fn run_churn(n: usize, cap: usize) {
     }
     w.commit().expect("commit failed");
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let doc_count = ZslIndex::open(&dir).map(|r| r.num_docs()).unwrap_or(0);
+    let doc_count = ZslIndex::open(&dir).map_or(0, |r| r.num_docs());
     println!(
         "{{\"engine\":\"native\",\"pass\":\"{}\",\"workload\":\"churn\",\"n\":{},\"cap\":{},\"pct1\":{},\"ms\":{:.3},\"heap_peak_kb\":{},\"rss_peak_kb\":{},\"doc_count_before\":{},\"doc_count\":{}}}",
-        pass_label(), n, cap, one_pct, ms, heap_peak_kb(), rss_peak_kb(), doc_count_before, doc_count
+        pass_label(),
+        n,
+        cap,
+        one_pct,
+        ms,
+        heap_peak_kb(),
+        rss_peak_kb(),
+        doc_count_before,
+        doc_count
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -354,7 +372,12 @@ fn run_search(n: usize, iters: usize) {
     }
     println!(
         "{{\"engine\":\"native\",\"pass\":\"{}\",\"workload\":\"search\",\"n\":{},\"iters\":{},\"heap_peak_kb\":{},\"rss_peak_kb\":{},{}}}",
-        pass_label(), n, iters, heap_peak_kb(), rss_peak_kb(), parts.join(",")
+        pass_label(),
+        n,
+        iters,
+        heap_peak_kb(),
+        rss_peak_kb(),
+        parts.join(",")
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -362,7 +385,7 @@ fn run_search(n: usize, iters: usize) {
 fn main() {
     init_track(); // TIME pass (BENCH_TRACK_HEAP=0) vs HEAP pass (default), before any measured op.
     let args: Vec<String> = std::env::args().collect();
-    let workload = args.get(1).map(String::as_str).unwrap_or("rebuild");
+    let workload = args.get(1).map_or("rebuild", String::as_str);
     let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
     match workload {
         "rebuild" => run_rebuild(n, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000)),

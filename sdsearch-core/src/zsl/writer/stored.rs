@@ -38,7 +38,7 @@ impl<Fdt: Write, Fdx: Write> StoredStreamWriter<Fdt, Fdx> {
         write_vint(&mut block, fields.len() as u64);
         for sf in fields {
             write_vint(&mut block, sf.field_num as u64);
-            block.push(if sf.tokenized { 0x01 } else { 0x00 }); // never binary here
+            block.push(u8::from(sf.tokenized)); // never binary here
             write_modified_utf8(&mut block, &sf.value);
         }
 
@@ -128,7 +128,7 @@ mod tests {
             write_vint(&mut fdt, fields.len() as u64);
             for sf in fields {
                 write_vint(&mut fdt, sf.field_num as u64);
-                fdt.push(if sf.tokenized { 0x01 } else { 0x00 }); // never binary here
+                fdt.push(u8::from(sf.tokenized)); // never binary here
                 write_modified_utf8(&mut fdt, &sf.value);
             }
         }
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn stored_raw_roundtrips_field_num_and_tokenized_flag() {
-        use crate::zsl::stored::{read_stored_raw, StoredRaw};
+        use crate::zsl::stored::{StoredRaw, read_stored_raw};
         let stored = vec![
             vec![
                 StoredField {
@@ -243,10 +243,12 @@ mod tests {
             ]
         );
         // the host application does not index binaries: the round-trip must never report is_binary=true
-        assert!(read_stored_raw(&fdx, &fdt, 0)
-            .unwrap()
-            .iter()
-            .all(|r| !r.is_binary));
+        assert!(
+            read_stored_raw(&fdx, &fdt, 0)
+                .unwrap()
+                .iter()
+                .all(|r| !r.is_binary)
+        );
         assert_eq!(
             read_stored_raw(&fdx, &fdt, 1).unwrap(),
             vec![StoredRaw {

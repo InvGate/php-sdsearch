@@ -1,7 +1,7 @@
 //! Leaf-query parity over a real MULTI-SEGMENT ZSL index vs the ZSL oracle.
 //! Exercises global doc-ids crossing segments, deletion exclusion, and per-base routing.
 use sdsearch_core::index::IndexReader;
-use sdsearch_core::search::{fuzzy_query, phrase_query, term_query, wildcard_query, Hit};
+use sdsearch_core::search::{Hit, fuzzy_query, phrase_query, term_query, wildcard_query};
 use sdsearch_core::zsl::index::ZslIndex;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ fn idx() -> ZslIndex {
     .unwrap()
 }
 fn sorted(mut v: Vec<usize>) -> Vec<usize> {
-    v.sort();
+    v.sort_unstable();
     v
 }
 fn eng(hits: &[Hit]) -> Vec<usize> {

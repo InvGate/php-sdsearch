@@ -3,7 +3,7 @@
 //! limit==0 = unlimited).
 
 use crate::analysis::analyze;
-use crate::query::{build_query, search, Occur, Query, QueryParams};
+use crate::query::{Occur, Query, QueryParams, build_query, search};
 use crate::search::Hit;
 use crate::zsl::index::ZslIndex;
 use std::collections::HashSet;
@@ -77,7 +77,7 @@ mod tests {
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {
         let mut v: Vec<usize> = hits.iter().map(|h| h.id).collect();
-        v.sort();
+        v.sort_unstable();
         v
     }
 

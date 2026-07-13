@@ -50,7 +50,7 @@ pub struct NewSegment {
 
 /// segment name for a counter (== Zend Lucene's segment-naming scheme).
 pub fn segment_name(counter: u32) -> String {
-    format!("_{}", to_base36(counter as u64))
+    format!("_{}", to_base36(u64::from(counter)))
 }
 
 /// inverse of `to_base36`: parses a lowercase base-36 string to a number. `None` if any
@@ -67,7 +67,7 @@ fn from_base36(s: &str) -> Option<u64> {
             b'a'..=b'z' => b - b'a' + 10,
             _ => return None,
         };
-        n = n.checked_mul(36)?.checked_add(digit as u64)?;
+        n = n.checked_mul(36)?.checked_add(u64::from(digit))?;
     }
     Some(n)
 }
@@ -86,9 +86,8 @@ fn from_base36(s: &str) -> Option<u64> {
 /// may have read the old `segments.gen` value an instant before the flip and are about to
 /// open the generation manifest it pointed to.
 fn prune_old_generations(index_dir: &Path, keep_from_gen: u64) {
-    let entries = match std::fs::read_dir(index_dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(index_dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {

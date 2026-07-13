@@ -1,0 +1,4 @@
+# Pin the formatting style explicitly so `cargo fmt --check` is deterministic across rustfmt
+# versions. Without this, the style follows rustfmt's floating default, which differs between
+# toolchain releases (e.g. import ordering changed under the 2024 style) and silently drifts CI.
+style_edition = "2024"

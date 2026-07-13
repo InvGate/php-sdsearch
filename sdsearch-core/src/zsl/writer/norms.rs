@@ -8,10 +8,8 @@
 //! `byte b>0 -> f32::from_bits((b<<21) + 0x30000000)`, and `_floatToByte` (binary search +
 //! round to nearest) identical to `Zend_Search_Lucene_Search_Similarity`.
 
-use once_cell::sync::Lazy;
-
 /// SmallFloat table: `NORM_TABLE[b]` = the float value that byte `b` decodes to.
-static NORM_TABLE: Lazy<[f32; 256]> = Lazy::new(|| {
+static NORM_TABLE: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
     let mut t = [0f32; 256];
     for (b, slot) in t.iter_mut().enumerate().skip(1) {
         *slot = f32::from_bits(((b as u32) << 21).wrapping_add(0x3000_0000));

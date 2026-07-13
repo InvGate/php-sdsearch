@@ -6,7 +6,7 @@
 //!   queries.json: {"fields":["body","tag"],"queries":[{"name":"work","text":"work"},...]}
 
 use sdsearch_core::index::IndexReader;
-use sdsearch_core::query::{build_query, search, QueryParams};
+use sdsearch_core::query::{QueryParams, build_query, search};
 use sdsearch_core::zsl::index::ZslIndex;
 use std::collections::BTreeMap;
 use std::path::Path;

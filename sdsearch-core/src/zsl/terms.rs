@@ -117,7 +117,7 @@ impl EagerTermDict {
         let target = term.as_bytes();
         let (mut lo, mut hi) = (0usize, ft.len());
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = usize::midpoint(lo, hi);
             match ft.term(mid).cmp(target) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -130,15 +130,14 @@ impl EagerTermDict {
     /// Terms of `field` that start with `prefix`. Locates the range start by
     /// binary search and walks until a term stops matching the prefix.
     pub fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
-        let ft = match self.by_field.get(field) {
-            Some(f) => f,
-            None => return Vec::new(),
+        let Some(ft) = self.by_field.get(field) else {
+            return Vec::new();
         };
         let pb = prefix.as_bytes();
         // partition_point: first index with term(i) >= prefix.
         let (mut lo, mut hi) = (0usize, ft.len());
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = usize::midpoint(lo, hi);
             if ft.term(mid) < pb {
                 lo = mid + 1;
             } else {
@@ -247,7 +246,7 @@ impl TermDict {
         let _pfx = read_vint(tii, &mut pos)?;
         let _suf = read_modified_utf8(tii, &mut pos)?;
         let _raw_field = read_i32_be(tii, &mut pos)?; // raw Int, not VInt
-                                                      // consume the literal 0x0F marker byte:
+        // consume the literal 0x0F marker byte:
         if pos >= tii.len() {
             return Err(std::io::Error::other("tii: truncated synthetic entry"));
         }
@@ -428,7 +427,7 @@ impl TermDict {
                 &self.field_names,
             ) {
                 Ok((f, t, ti)) => {
-                    prev = t.clone();
+                    prev.clone_from(&t);
                     out.push((f, t, ti));
                 }
                 Err(_) => break,
@@ -599,7 +598,7 @@ mod tests {
         let path = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .find(|p| p.extension().is_some_and(|x| x == "cfs"))
             .unwrap();
         let cf = CompoundFile::open(&path).unwrap();
         let fnm = cf
@@ -675,7 +674,7 @@ mod tests {
         let path = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .find(|p| p.extension().is_some_and(|x| x == "cfs"))
             .unwrap();
         let cf = CompoundFile::open(&path).unwrap();
         let find = |ext: &str| cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap();
@@ -701,7 +700,7 @@ mod tests {
         let path = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().map(|x| x == "cfs").unwrap_or(false))
+            .find(|p| p.extension().is_some_and(|x| x == "cfs"))
             .unwrap();
         let cf = CompoundFile::open(&path).unwrap();
         let find = |ext: &str| cf.names().into_iter().find(|n| n.ends_with(ext)).unwrap();

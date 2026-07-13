@@ -31,7 +31,7 @@ fn seg() -> ZslSegment {
     .unwrap()
 }
 fn sorted(mut v: Vec<usize>) -> Vec<usize> {
-    v.sort();
+    v.sort_unstable();
     v
 }
 fn engine_set(hits: &[sdsearch_core::search::Hit]) -> Vec<usize> {

@@ -36,29 +36,35 @@ struct TrackingAlloc;
 
 unsafe impl GlobalAlloc for TrackingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
+        unsafe {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            p
         }
-        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe {
+            System.dealloc(ptr, layout);
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
-        if !p.is_null() {
-            let old = layout.size();
-            if new_size >= old {
-                let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
-                PEAK.fetch_max(live, Ordering::Relaxed);
-            } else {
-                LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+        unsafe {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() {
+                let old = layout.size();
+                if new_size >= old {
+                    let live = LIVE.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                    PEAK.fetch_max(live, Ordering::Relaxed);
+                } else {
+                    LIVE.fetch_sub(old - new_size, Ordering::Relaxed);
+                }
             }
+            p
         }
-        p
     }
 }
 
@@ -265,7 +271,13 @@ fn run_existing(args: &[String]) {
 
     println!(
         "{{\"source\":\"{}\",\"n_extra\":{},\"segments_before\":{},\"doc_count\":{},\"optimize_ms\":{:.2},\"heap_peak_kb\":{},\"vmhwm_kb\":{}}}",
-        src.display(), n_extra, segments_before, report.doc_count, optimize_ms, heap_peak_kb, vmhwm_kb()
+        src.display(),
+        n_extra,
+        segments_before,
+        report.doc_count,
+        optimize_ms,
+        heap_peak_kb,
+        vmhwm_kb()
     );
 
     std::fs::remove_dir_all(scratch).ok();
@@ -306,7 +318,13 @@ fn run_hot(args: &[String]) {
 
     println!(
         "{{\"mode\":\"hot\",\"n\":{},\"cap\":{},\"segments_before\":{},\"doc_count\":{},\"optimize_ms\":{:.2},\"heap_peak_kb\":{},\"vmhwm_kb\":{}}}",
-        n, cap, segments_before, report.doc_count, optimize_ms, heap_peak_kb, vmhwm_kb()
+        n,
+        cap,
+        segments_before,
+        report.doc_count,
+        optimize_ms,
+        heap_peak_kb,
+        vmhwm_kb()
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -354,7 +372,13 @@ fn main() {
 
     println!(
         "{{\"n\":{},\"cap\":{},\"segments_before\":{},\"doc_count\":{},\"optimize_ms\":{:.2},\"heap_peak_kb\":{},\"vmhwm_kb\":{}}}",
-        n, cap, segments_before, report.doc_count, optimize_ms, heap_peak_kb, vmhwm_kb()
+        n,
+        cap,
+        segments_before,
+        report.doc_count,
+        optimize_ms,
+        heap_peak_kb,
+        vmhwm_kb()
     );
 
     std::fs::remove_dir_all(&dir).ok();

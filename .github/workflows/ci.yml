@@ -65,6 +65,10 @@ jobs:
       - run: cargo audit
       - run: cargo deny check
       - run: cargo machete
+      # Copy-paste detection (regression ratchet): fails if duplication in the crate sources
+      # exceeds the threshold in .jscpd.json. Node is preinstalled on ubuntu runners.
+      - name: Duplicate-code check (jscpd)
+        run: npx --yes jscpd sdsearch-core/src sdsearch-php/src
 
   coverage:
     name: Coverage (sdsearch-core -> octocov)

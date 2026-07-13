@@ -8,7 +8,7 @@
 use super::lock::WriteLock;
 use super::merge;
 use super::segments::{self, Generation, NewSegment};
-use super::{write_segment_cfs, WriterDoc, WriterOpts};
+use super::{WriterDoc, WriterOpts, write_segment_cfs};
 use crate::index::IndexReader;
 use crate::zsl::deletes::DeletedDocs;
 use crate::zsl::index::ZslIndex;
@@ -106,7 +106,11 @@ impl IndexWriter {
     /// (over-counting deletes). The host application never re-deletes an already-deleted doc, so this never manifests.
     pub fn document_count(&self) -> usize {
         let flushed: usize = self.flushed.iter().map(|s| s.doc_count as usize).sum();
-        let pending: usize = self.pending_deletes.values().map(|s| s.len()).sum();
+        let pending: usize = self
+            .pending_deletes
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum();
         (self.base_live_docs + flushed + self.buffer.len()).saturating_sub(pending)
     }
 
@@ -518,7 +522,7 @@ mod tests {
         assert!(!dir.join("_3.cfs").exists()); // orphan cleaned by Drop
         assert!(!dir.join("segments_7").exists()); // generation NOT flipped
         assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 20); // intact
-                                                                  // lock released → re-open OK
+        // lock released → re-open OK
         let _w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -707,7 +711,7 @@ mod tests {
         let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
         w.delete_document(5);
         w.commit().unwrap();
-        assert!(ZslIndex::open(&dir).unwrap().num_docs() == 19);
+        assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 19);
 
         // 1 segment BUT with deletions => optimize must run (collapses the .del)
         let w2 = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
@@ -754,12 +758,14 @@ mod tests {
         assert!(!dir.join("segments_9").exists());
         // current (11 == "b") and immediately-previous (10 == "a") survive: grace window for
         // lock-free concurrent readers that read segments.gen just before the last flip.
-        assert!(dir
-            .join(format!("segments_{}", crate::zsl::segments::to_base36(10)))
-            .exists());
-        assert!(dir
-            .join(format!("segments_{}", crate::zsl::segments::to_base36(11)))
-            .exists());
+        assert!(
+            dir.join(format!("segments_{}", crate::zsl::segments::to_base36(10)))
+                .exists()
+        );
+        assert!(
+            dir.join(format!("segments_{}", crate::zsl::segments::to_base36(11)))
+                .exists()
+        );
 
         // segments.gen and the actual segment data (.cfs) are untouched by the pruning.
         assert!(dir.join("segments.gen").exists());
@@ -772,7 +778,7 @@ mod tests {
     #[test]
     fn commit_prunes_using_numeric_not_lexical_order_across_base36_rollover() {
         let dir = temp_kb_full(); // KB: gen 6
-                                  // enough commits to cross the base36 rollover ("z" = 35 -> "10" = 36), plus margin.
+        // enough commits to cross the base36 rollover ("z" = 35 -> "10" = 36), plus margin.
         for i in 0..35 {
             let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
             w.add_document(doc_mark(100 + i)).unwrap();
@@ -821,9 +827,10 @@ mod tests {
         assert!(!dir.join("segments_8").exists());
         // current (10 == "a") and immediately-previous (9) survive.
         assert!(dir.join("segments_9").exists());
-        assert!(dir
-            .join(format!("segments_{}", crate::zsl::segments::to_base36(10)))
-            .exists());
+        assert!(
+            dir.join(format!("segments_{}", crate::zsl::segments::to_base36(10)))
+                .exists()
+        );
 
         assert!(dir.join("segments.gen").exists());
         let idx = ZslIndex::open(&dir).unwrap();

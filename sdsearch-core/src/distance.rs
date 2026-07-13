@@ -16,7 +16,7 @@ pub fn levenshtein_bytes(a: &[u8], b: &[u8]) -> usize {
     for i in 1..=n {
         cur[0] = i;
         for j in 1..=m {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let cost = usize::from(a[i - 1] != b[j - 1]);
             cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);

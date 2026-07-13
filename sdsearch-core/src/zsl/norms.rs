@@ -25,8 +25,8 @@ pub fn decode_norm(b: u8) -> f32 {
     if b == 0 {
         return 0.0;
     }
-    let mantissa = (b & 0x07) as u32;
-    let exponent = ((b >> 3) & 0x1F) as u32;
+    let mantissa = u32::from(b & 0x07);
+    let exponent = u32::from((b >> 3) & 0x1F);
     let bits = (exponent << 24) | (mantissa << 21);
     f32::from_bits(bits)
 }
