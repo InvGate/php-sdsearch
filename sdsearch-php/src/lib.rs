@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::time::Duration;
 
-use sdsearch_core::mlt::MltParams;
+use sdsearch_core::mlt::{MltParams, RangeFilter};
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
@@ -71,6 +71,15 @@ struct MltTermFilterDto {
 }
 
 #[derive(Deserialize)]
+struct MltRangeFilterDto {
+    field: String,
+    #[serde(default)]
+    from: Option<f64>,
+    #[serde(default)]
+    to: Option<f64>,
+}
+
+#[derive(Deserialize)]
 struct MltParamsDto {
     id_field: String,
     id_value: String,
@@ -80,6 +89,8 @@ struct MltParamsDto {
     source_fields: Vec<String>,
     #[serde(default)]
     term_filters: Vec<MltTermFilterDto>,
+    #[serde(default)]
+    range_filters: Vec<MltRangeFilterDto>,
     #[serde(default = "default_min_term_freq")]
     min_term_freq: u32,
     #[serde(default = "default_max_query_terms")]
@@ -179,6 +190,15 @@ fn run_mlt(index_dir: &str, params_json: &str) -> Result<String, String> {
             .term_filters
             .into_iter()
             .map(|f| (f.field, f.value))
+            .collect(),
+        range_filters: dto
+            .range_filters
+            .into_iter()
+            .map(|f| RangeFilter {
+                field: f.field,
+                from: f.from,
+                to: f.to,
+            })
             .collect(),
         field_weights: dto.field_weights,
         size: dto.size as usize,

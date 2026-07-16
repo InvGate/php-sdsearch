@@ -79,6 +79,7 @@ namespace SdSearch {
          *   "fields": ["title", "description"],
          *   "source_fields": ["id"],
          *   "term_filters": [ { "field": "status_key", "value": "open" } ],
+         *   "range_filters": [ { "field": "created_at_key", "from": 1700000000, "to": 1800000000 } ],
          *   "min_term_freq": 2,
          *   "max_query_terms": 25,
          *   "min_doc_freq": 5,
@@ -98,6 +99,10 @@ namespace SdSearch {
          * - `term_filters[].field` is used VERBATIM — unlike `id_field`, no `_key` is appended.
          *   Pass the already-suffixed indexed name (e.g. `"status_key"`); a wrong name matches
          *   nothing and silently empties the result set.
+         * - `range_filters[]` is `{ field, from?, to? }`: a hit's stored `field` must parse as a
+         *   number within `[from, to]` (inclusive; either bound may be omitted for a half-open
+         *   range). `field` is verbatim like `term_filters`; a missing/non-numeric value on a doc
+         *   excludes it. Suits epoch-int fields such as `created_at_key`.
          * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
          * - `max_doc_freq` and `posting_budget` are tri-state: **omit** (or `null`) → the engine
          *   infers a safety default from the index size (max_doc_freq ≈ half the docs;

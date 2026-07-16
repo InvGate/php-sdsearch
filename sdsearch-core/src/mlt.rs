@@ -8,6 +8,16 @@ use crate::search::{Hit, finalize, term_scores};
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// A numeric range filter over a stored field: a hit's stored `field` value must parse as a
+/// number within `[from, to]` (inclusive). Either bound may be `None` (half-open); a doc whose
+/// field is missing or non-numeric does not match.
+#[derive(Debug, Clone)]
+pub struct RangeFilter {
+    pub field: String,
+    pub from: Option<f64>,
+    pub to: Option<f64>,
+}
+
 /// Parameters for a More Like This query.
 ///
 /// `max_doc_freq` and `posting_budget` are three-state: `None` = infer a safety default from
@@ -23,6 +33,7 @@ pub struct MltParams {
     pub posting_budget: Option<usize>,
     pub timeout: Option<std::time::Duration>,
     pub term_filters: Vec<(String, String)>,
+    pub range_filters: Vec<RangeFilter>,
     pub field_weights: HashMap<String, f32>,
     pub size: usize,
     pub min_score: f32,
@@ -165,6 +176,22 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
         score.retain(|id, _| postings.binary_search_by_key(id, |&(d, _)| d).is_ok());
     }
 
+    // Range filters: read each surviving candidate's stored value once and test every range
+    // (numeric, inclusive; a missing/non-numeric field fails the filter). The candidate set is
+    // already small here, so a stored-field read per candidate is cheap — and it sidesteps
+    // enumerating a high-cardinality field's terms.
+    if !p.range_filters.is_empty() {
+        score.retain(|id, _| {
+            let stored = index.stored_fields(*id);
+            p.range_filters.iter().all(|rf| {
+                stored
+                    .get(&rf.field)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|x| rf.from.is_none_or(|f| x >= f) && rf.to.is_none_or(|t| x <= t))
+            })
+        });
+    }
+
     let top = score.values().copied().fold(0.0f32, f32::max);
     let normalized: Vec<(usize, f32)> = if top > 0.0 {
         score.into_iter().map(|(id, s)| (id, s / top)).collect()
@@ -192,6 +219,7 @@ mod tests {
             posting_budget: Some(0),
             timeout: None,
             term_filters: Vec::new(),
+            range_filters: Vec::new(),
             field_weights: HashMap::new(),
             size: 10,
             min_score: 0.0,
@@ -518,5 +546,70 @@ mod tests {
             !picked.contains(&"the".to_string()),
             "dynamic default must drop >50%-of-docs terms: {picked:?}"
         );
+    }
+
+    // doc 0 source; docs 1..3 share "zebra" but carry different numeric `created` values.
+    fn range_idx() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for (body, created) in [
+            ("zebra alpha", "1000"), // 0: source
+            ("zebra beta", "1500"),  // 1
+            ("zebra gamma", "2500"), // 2
+            ("zebra delta", "oops"), // 3: non-numeric created
+        ] {
+            let mut d = Document::new();
+            d.add("body", body, FieldKind::Text);
+            d.add("created", created, FieldKind::Keyword);
+            m.add_document(d);
+        }
+        m
+    }
+
+    fn range(field: &str, from: Option<f64>, to: Option<f64>) -> RangeFilter {
+        RangeFilter {
+            field: field.to_string(),
+            from,
+            to,
+        }
+    }
+
+    #[test]
+    fn range_filter_keeps_only_docs_in_bounds() {
+        let m = range_idx();
+        let mut p = params(&["body"]);
+        // inclusive [1200, 2000]: doc 1 (1500) in; doc 2 (2500) out; doc 3 (non-numeric) out.
+        p.range_filters = vec![range("created", Some(1200.0), Some(2000.0))];
+        let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(ids.contains(&1), "doc 1 (1500) is in range: {ids:?}");
+        assert!(!ids.contains(&2), "doc 2 (2500) is above range: {ids:?}");
+        assert!(
+            !ids.contains(&3),
+            "doc 3 (non-numeric) must not match: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn range_filter_bounds_are_inclusive_and_half_open() {
+        let m = range_idx();
+
+        // from-only (>= 2500) keeps doc 2 exactly at the bound; drops doc 1.
+        let mut p = params(&["body"]);
+        p.range_filters = vec![range("created", Some(2500.0), None)];
+        let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(
+            ids.contains(&2),
+            "inclusive lower bound keeps 2500: {ids:?}"
+        );
+        assert!(!ids.contains(&1), "1500 < 2500 dropped: {ids:?}");
+
+        // to-only (<= 1500) keeps doc 1; drops doc 2.
+        let mut p2 = params(&["body"]);
+        p2.range_filters = vec![range("created", None, Some(1500.0))];
+        let ids2: Vec<usize> = more_like_this(&m, 0, &p2).iter().map(|h| h.id).collect();
+        assert!(
+            ids2.contains(&1),
+            "inclusive upper bound keeps 1500: {ids2:?}"
+        );
+        assert!(!ids2.contains(&2), "2500 > 1500 dropped: {ids2:?}");
     }
 }
