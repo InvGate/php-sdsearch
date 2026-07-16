@@ -3,7 +3,8 @@
 //! limit==0 = unlimited).
 
 use crate::analysis::analyze;
-use crate::query::{Occur, Query, QueryParams, build_query, search_with_weights};
+use crate::mlt::{MltParams, more_like_this};
+use crate::query::{InGroup, Occur, Query, QueryParams, build_query, search, search_with_weights};
 use crate::search::Hit;
 use crate::zsl::index::ZslIndex;
 use std::collections::HashSet;
@@ -50,6 +51,46 @@ fn fallback_query(text: &str) -> Option<Query> {
         None
     } else {
         Some(Query::Boolean { clauses })
+    }
+}
+
+/// Resolves an id-field value to an internal doc id via an `InGroup` over
+/// `<id_field>_key` (build_query adds the suffix), like the writer's resolver.
+fn resolve_reference_doc(
+    index: &ZslIndex,
+    id_field: &str,
+    id_value: &str,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    let params = QueryParams {
+        text: String::new(),
+        where_groups: Vec::new(),
+        in_groups: vec![InGroup {
+            field: id_field.to_string(),
+            values: vec![id_value.to_string()],
+        }],
+        fuzzy_similarity: 0.5,
+        fuzzy_prefix_len: 3,
+        wildcard_min_prefix: 0,
+        accent_insensitive: false,
+        field_weights: std::collections::HashMap::new(),
+    };
+    let query = build_query(&params)?;
+    let hits = search(index, &query, 0.0, 1);
+    Ok(hits.first().map(|h| h.id))
+}
+
+/// Opens a ZSL index, resolves the reference id-field value to an internal doc id,
+/// and runs a More Like This query. Returns an empty vec if the reference doc is not found.
+pub fn more_like_this_index(
+    index_dir: &Path,
+    id_field: &str,
+    id_value: &str,
+    params: &MltParams,
+) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
+    let index = ZslIndex::open(index_dir)?;
+    match resolve_reference_doc(&index, id_field, id_value)? {
+        Some(doc_id) => Ok(more_like_this(&index, doc_id, params)),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -108,5 +149,77 @@ mod tests {
         // "how" matches the two "how to ..." docs even with limit=0.
         let hits = search_index(&multiseg(), &params("how"), 0.0, 0).unwrap();
         assert!(hits.len() >= 2, "limit=0 must return all matches");
+    }
+
+    use crate::mlt::MltParams;
+    use crate::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
+    use std::collections::HashMap as StdHashMap;
+
+    fn mlt_params(fields: &[&str]) -> MltParams {
+        MltParams {
+            fields: fields.iter().map(|s| (*s).to_string()).collect(),
+            min_term_freq: 1,
+            max_query_terms: 25,
+            min_doc_freq: 1,
+            max_doc_freq: 0,
+            posting_budget: 0,
+            timeout: None,
+            term_filters: Vec::new(),
+            field_weights: StdHashMap::new(),
+            size: 10,
+            min_score: 0.0,
+        }
+    }
+
+    // The writer only appends to an EXISTING index, so bootstrap by copying the KB
+    // fixture to a temp dir, then append 3 docs carrying an `id_key` keyword and a
+    // `body` text field that shares a rare term ("zebra" in A and B only). The KB
+    // docs use a `title` field, so they never collide with our `body` postings.
+    fn temp_index_with_mlt_docs() -> PathBuf {
+        let src = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        let dir = std::env::temp_dir().join(format!("sdsearch_mlt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        for (id, body) in [("A", "zebra alpha"), ("B", "zebra beta"), ("C", "cat gamma")] {
+            w.add_document(WriterDoc {
+                fields: vec![
+                    WriterField::keyword("id_key", id),
+                    WriterField::text("body", body),
+                ],
+            })
+            .unwrap();
+        }
+        w.commit().unwrap();
+        dir
+    }
+
+    #[test]
+    fn more_like_this_index_finds_similar_and_excludes_source() {
+        let dir = temp_index_with_mlt_docs();
+
+        // reference doc "A" (resolved via id -> id_key) shares "zebra" with "B" only.
+        let hits = more_like_this_index(&dir, "id", "A", &mlt_params(&["body"])).unwrap();
+        let ids: Vec<String> = hits
+            .iter()
+            .filter_map(|h| h.fields.get("id_key").cloned())
+            .collect();
+        assert!(ids.contains(&"B".to_string()), "expected B among {ids:?}");
+        assert!(!ids.contains(&"A".to_string()), "source A must be excluded: {ids:?}");
+
+        // unknown reference id -> empty, not an error.
+        let none = more_like_this_index(&dir, "id", "ZZZ", &mlt_params(&["body"])).unwrap();
+        assert!(none.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
