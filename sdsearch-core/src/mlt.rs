@@ -4,7 +4,9 @@
 use crate::analysis::analyze;
 use crate::index::IndexReader;
 use crate::score::idf;
-use std::collections::HashMap;
+use crate::search::{Hit, finalize, term_scores};
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// Parameters for a More Like This query. `max_doc_freq == 0` = unbounded;
 /// `max_query_terms == 0` = no cap; `posting_budget == 0` = off; `size == 0` = unlimited.
@@ -90,6 +92,63 @@ pub(crate) fn select_terms(
     out
 }
 
+/// field weight (defaults to 1.0 when not listed) — local mirror of the query module's helper.
+fn weight_of(weights: &HashMap<String, f32>, field: &str) -> f32 {
+    weights.get(field).copied().unwrap_or(1.0)
+}
+
+/// Runs a More Like This query for `source_doc`: selects distinctive terms, unions
+/// their postings (per-field weighted) into a score map, excludes the source doc,
+/// applies term filters (each must match), normalizes the top hit to 1.0, and
+/// finalizes (filter min_score, sort, truncate to `size`, hydrate stored fields).
+///
+/// Best-effort timeout: the top-ranked term is always processed; before each
+/// subsequent term the wall-clock deadline is checked and the union stops early
+/// if it has passed. Early stops yield approximate scores (a runaway guard).
+pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams) -> Vec<Hit> {
+    let selected = select_terms(index, source_doc, p);
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let deadline = p.timeout.map(|d| Instant::now() + d);
+    let mut score: HashMap<usize, f32> = HashMap::new();
+    for (i, s) in selected.iter().enumerate() {
+        if i > 0 {
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    break;
+                }
+            }
+        }
+        let w = weight_of(&p.field_weights, &s.field);
+        for (id, sc) in term_scores(index, &s.field, &s.term) {
+            *score.entry(id).or_insert(0.0) += sc * w;
+        }
+    }
+
+    score.remove(&source_doc);
+
+    for (field, value) in &p.term_filters {
+        let matching: HashSet<usize> = index
+            .postings_for(field, value)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        score.retain(|id, _| matching.contains(id));
+    }
+
+    let top = score.values().copied().fold(0.0f32, f32::max);
+    let normalized: Vec<(usize, f32)> = if top > 0.0 {
+        score.into_iter().map(|(id, s)| (id, s / top)).collect()
+    } else {
+        score.into_iter().collect()
+    };
+
+    let limit = if p.size == 0 { usize::MAX } else { p.size };
+    finalize(index, normalized, p.min_score, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +220,54 @@ mod tests {
         let terms = select_terms(&m, 0, &p);
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].term, "zebra");
+    }
+
+    // doc 0 shares "zebra" with doc 1 only; doc 2/3 are unrelated.
+    fn sim_idx() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in ["zebra alpha", "zebra beta", "cat gamma", "dog delta"] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn returns_similar_docs_excluding_source() {
+        let m = sim_idx();
+        let hits = more_like_this(&m, 0, &params(&["body"]));
+        let ids: Vec<usize> = hits.iter().map(|h| h.id).collect();
+        assert!(!ids.contains(&0), "source doc must be excluded: {ids:?}");
+        assert!(ids.contains(&1), "doc 1 shares 'zebra': {ids:?}");
+    }
+
+    #[test]
+    fn empty_when_no_terms_survive_filters() {
+        let m = sim_idx();
+        let mut p = params(&["body"]);
+        p.min_term_freq = 99; // nothing qualifies
+        assert!(more_like_this(&m, 0, &p).is_empty());
+    }
+
+    #[test]
+    fn term_filters_restrict_results() {
+        let mut m = MemoryIndex::new();
+        // doc 0 source; docs 1 and 2 both share "zebra" but differ on status_key.
+        for (body, status) in [
+            ("zebra alpha", "open"),
+            ("zebra beta", "open"),
+            ("zebra gamma", "closed"),
+        ] {
+            let mut d = Document::new();
+            d.add("body", body, FieldKind::Text);
+            d.add("status_key", status, FieldKind::Keyword);
+            m.add_document(d);
+        }
+        let mut p = params(&["body"]);
+        p.term_filters = vec![("status_key".to_string(), "open".to_string())];
+        let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(ids.contains(&1), "doc 1 is open: {ids:?}");
+        assert!(!ids.contains(&2), "doc 2 is closed, filtered out: {ids:?}");
     }
 }
