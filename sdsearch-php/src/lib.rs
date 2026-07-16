@@ -215,6 +215,7 @@ pub fn sdsearch_version() -> String {
 pub struct Engine;
 
 #[php_impl]
+#[php(change_method_case = "none")]
 impl Engine {
     pub fn __construct() -> Self {
         Engine
