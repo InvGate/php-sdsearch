@@ -33,6 +33,7 @@ echo sdsearch_version(); // "0.1.0" — also a smoke test that the extension loa
 |---|---|---|
 | `__construct()` | Create an engine. | — |
 | `search(string $indexDir, string $paramsJson): string` | Run a query, return hits as JSON. | bad params JSON, missing index, engine error |
+| `more_like_this(string $indexDir, string $paramsJson): string` | Find documents similar to a reference document, return hits as JSON. | bad params JSON, missing index, engine error |
 
 ### `SdSearch\Writer`
 
@@ -157,10 +158,72 @@ foreach ($hits as $hit) {
 | `where` | array | Each `{field, values[], occur}`; `occur` ∈ `must` \| `mustnot` \| `should` (default `should`). |
 | `in` | array | Each `{field, values[]}`; matches the (literal, key-suffixed) field against any value. |
 | `min_score` | float | Drop hits below this score. |
-| `limit` | int | Maximum hits to return. |
+| `limit` | int | Maximum hits to return (`0` = unlimited). |
+| `accent_insensitive` | bool | Optional (default `false`). When `true`, text matching is Spanish accent-insensitive (`avion` also matches `avión` and vice-versa). |
+| `field_weights` | object | Optional (default `{}`). Per-field score multipliers (`{"title": 3.0}`); a field not listed weighs `1.0`. |
 
 Each hit is `{ "id": int, "score": float, "fields": { name: value, ... } }`, where `id` is
 the global internal document id and `fields` are the document's stored fields.
+
+## More Like This (read path)
+
+Given a reference document already in the index, `more_like_this` finds similar documents:
+it reads the reference's stored text for the requested `fields`, picks the most distinctive
+terms (high term-frequency in the doc but rare across the collection, by `tf*idf`), and runs
+a boolean query for them — excluding the reference document itself.
+
+```php
+use SdSearch\Engine;
+
+$engine = new Engine();
+
+$params = [
+    'id_field'    => 'id',          // logical id field; the engine resolves it as `id_key`
+    'id_value'    => '42',          // the reference document's id value
+    'fields'      => ['title', 'body'],   // stored TEXT fields to mine candidate terms from
+    'source_fields' => ['id_key', 'title'], // stored fields to return per hit ([] = all)
+    'term_filters'  => [            // each hit must also match these (fields used verbatim)
+        ['field' => 'status_key', 'value' => 'published'],
+    ],
+    'range_filters' => [            // numeric range over a stored field (inclusive, half-open ok)
+        ['field' => 'created_at_key', 'from' => 1_700_000_000, 'to' => 1_800_000_000],
+    ],
+    'min_should_match' => '30%',    // >= N terms (int) or a percentage of selected terms; 0/1 = off
+    'min_term_freq'   => 2,
+    'max_query_terms' => 25,
+    'min_doc_freq'    => 5,
+    // max_doc_freq / posting_budget: OMIT for a safety default inferred from the index size;
+    // 0 = explicitly unbounded/off; a positive number = explicit cap.
+    'timeout_ms'      => 0,         // 0 = off; best-effort wall-clock guard
+    'field_weights'   => ['title' => 3.0],
+    'size'            => 10,
+    'min_score'       => 0.0,
+];
+
+$json = $engine->more_like_this($indexDir, json_encode($params));
+$hits = json_decode($json, true);   // same shape as search(); [] if the reference id is unknown
+```
+
+### More Like This parameters
+
+| Key | Type | Meaning |
+|---|---|---|
+| `id_field` | string | Logical id field of the reference doc; the engine resolves it as `<id_field>_key`. |
+| `id_value` | string | The reference document's id value. Unknown → `[]`. |
+| `fields` | array | Stored text fields to extract candidate terms from. A non-stored/unknown field is silently skipped. |
+| `source_fields` | array | Optional projection of returned stored fields (`[]` = all). |
+| `term_filters` | array | Each `{field, value}`; a hit must match all. `field` is used **verbatim** (no `_key` appended, unlike `id_field`). |
+| `range_filters` | array | Each `{field, from?, to?}`; a hit's stored `field` must parse as a number within `[from, to]` (inclusive; either bound optional). Missing/non-numeric field → excluded. `field` verbatim. |
+| `min_should_match` | int \| string | A hit must match at least this many of the selected terms. An integer (`2`) is an absolute count; a string `"N%"` (e.g. `"30%"`) is a percentage of the selected terms, floored (`3` terms × `30%` → `0`). `0`/`1` = off; a value above the selected-term count matches nothing. |
+| `min_term_freq` | int | Ignore reference terms occurring fewer than this many times (default 2). |
+| `max_query_terms` | int | Keep at most this many candidate terms (default 25; `0` = no cap). |
+| `min_doc_freq` | int | Ignore terms rarer than this across the collection (default 5). |
+| `max_doc_freq` | int | Ignore terms more common than this. **Omit** → safety default of ~half the collection size (skips non-discriminative, memory-heavy terms); `0` = unbounded. |
+| `posting_budget` | int | Cap on Σ doc-frequency of selected terms — a deterministic cost guard. **Omit** → safety default of ~the collection size; `0` = off. |
+| `timeout_ms` | int | Best-effort wall-clock guard; approximate scores if it fires (`0` = off). |
+| `field_weights` | object | Per-field score multipliers, as in `search`. |
+| `size` | int | Maximum hits to return (`0` = unlimited). |
+| `min_score` | float | Drop hits below this score (scores are normalized so the top hit is `1.0`). |
 
 ## Wrapping it safely
 

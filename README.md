@@ -28,13 +28,16 @@ feature set.
 ## What it does
 
 - **Reader** (`sdsearch-core::zsl`) — opens a ZSL index directory (single- or
-  multi-segment, including deleted docs), and answers term, boolean, wildcard, fuzzy, and
-  phrase queries through the same query engine used by the rest of `sdsearch-core`.
+  multi-segment, including deleted docs), and answers term, boolean, wildcard, fuzzy,
+  phrase, and "more like this" (similar-document) queries through the same query engine
+  used by the rest of `sdsearch-core`, with optional Spanish accent-insensitive matching
+  and per-field score weighting.
 - **Writer** (`sdsearch-core::zsl::writer`) — a streaming `IndexWriter` that adds
   documents, deletes documents, commits, and merges/optimizes segments, producing index
   files a stock Zend Search Lucene install can open, merge, and continue writing to.
 - **PHP binding** (`sdsearch-php`) — a compiled extension (`sdsearch`) exposing
-  `SdSearch\Engine` (search) and `SdSearch\Writer` (index/commit/optimize) to PHP, with a
+  `SdSearch\Engine` (search + more like this) and `SdSearch\Writer` (index/commit/optimize)
+  to PHP, with a
   panic-safe FFI boundary (a Rust panic becomes a catchable `PhpException`, never a
   crashed worker).
 

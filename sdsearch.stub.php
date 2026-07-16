@@ -67,6 +67,71 @@ namespace SdSearch {
          *                    internal engine error.
          */
         public function search(string $indexDir, string $paramsJson): string {}
+
+        /**
+         * More Like This: returns documents similar to a reference document as a JSON hit array.
+         *
+         * `$paramsJson` is a JSON object:
+         * ```json
+         * {
+         *   "id_field": "id",
+         *   "id_value": "12345",
+         *   "fields": ["title", "description"],
+         *   "source_fields": ["id"],
+         *   "term_filters": [ { "field": "status_key", "value": "open" } ],
+         *   "range_filters": [ { "field": "created_at_key", "from": 1700000000, "to": 1800000000 } ],
+         *   "min_should_match": "30%",
+         *   "min_term_freq": 2,
+         *   "max_query_terms": 25,
+         *   "min_doc_freq": 5,
+         *   "max_doc_freq": null,     // omit for a safety default from index size
+         *   "posting_budget": null,   // omit for a safety default from index size
+         *   "timeout_ms": 0,
+         *   "field_weights": { "title": 3.0 },
+         *   "size": 10,
+         *   "min_score": 0.0
+         * }
+         * ```
+         * - `id_field`/`id_value` identify the reference document. `id_field` is a LOGICAL
+         *   name: the engine appends `_key` (so `"id"` resolves against the indexed `id_key`).
+         * - `fields` are the stored text fields to mine candidate terms from. A field that is
+         *   not stored as text (typo, keyword-only, indexed-but-not-stored) is silently ignored;
+         *   if none of the requested fields is found, the result is `[]` (same as "no match").
+         * - `term_filters[].field` is used VERBATIM — unlike `id_field`, no `_key` is appended.
+         *   Pass the already-suffixed indexed name (e.g. `"status_key"`); a wrong name matches
+         *   nothing and silently empties the result set.
+         * - `range_filters[]` is `{ field, from?, to? }`: a hit's stored `field` must parse as a
+         *   number within `[from, to]` (inclusive; either bound may be omitted for a half-open
+         *   range). `field` is verbatim like `term_filters`; a missing/non-numeric value on a doc
+         *   excludes it. Suits epoch-int fields such as `created_at_key`.
+         * - `min_should_match` (optional): a hit must match at least this many of the selected
+         *   terms. An integer (`2`) is an absolute count; a string `"N%"` (e.g. `"30%"`) is a
+         *   percentage of the selected terms, floored like OpenSearch (`3` terms × `30%` → `0`).
+         *   `0`/`1` (or a percentage that floors to them) = off. Full OpenSearch grammar (negatives,
+         *   `"2<75%"` combinations) is NOT supported. CAVEATS: the number of selected terms is NOT
+         *   visible to the caller — it is data-dependent (a short source doc, `max_query_terms`, or
+         *   `posting_budget` can trim it), so an absolute count above it returns `[]` even when
+         *   similar docs exist (percentage scales with it, so it is safer). And under an early
+         *   `timeout_ms`, only the terms processed before the deadline count, so a high threshold
+         *   can empty the result set.
+         * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
+         * - `max_doc_freq` and `posting_budget` are tri-state: **omit** (or `null`) → the engine
+         *   infers a safety default from the index size (max_doc_freq ≈ half the docs;
+         *   posting_budget ≈ the doc count) so a single request can't load memory proportional
+         *   to the whole collection; `0` → explicitly unbounded/off; a positive number → explicit cap.
+         * - `posting_budget` caps Σ doc-frequency over selected terms (deterministic cost guard);
+         *   `timeout_ms` (`0` = off) is a best-effort wall-clock guard (approximate scores if it fires).
+         *
+         * Returns a JSON array of hits `[ { "id": 42, "score": 1.0, "fields": {…} } ]`;
+         * an unknown reference id returns `[]`.
+         *
+         * @param string $indexDir   Path to the ZSL index directory.
+         * @param string $paramsJson JSON-encoded MLT parameters (see above).
+         * @return string JSON-encoded array of hits.
+         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
+         *                    internal engine error.
+         */
+        public function more_like_this(string $indexDir, string $paramsJson): string {}
     }
 
     /**
