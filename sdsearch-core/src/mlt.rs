@@ -47,7 +47,9 @@ pub(crate) fn select_terms(
     let mut scored: Vec<(f32, Selected)> = Vec::new();
 
     for field in &p.fields {
-        let Some(text) = stored.get(field) else { continue };
+        let Some(text) = stored.get(field) else {
+            continue;
+        };
         let mut tf: HashMap<String, u32> = HashMap::new();
         for tok in analyze(text) {
             *tf.entry(tok).or_insert(0) += 1;
@@ -177,7 +179,14 @@ mod tests {
     // term's idf outweighs the common term — the tf*idf shape needs some spread.
     fn idx() -> MemoryIndex {
         let mut m = MemoryIndex::new();
-        for text in ["zebra the", "the cat", "the dog", "the fish", "the bird", "the frog"] {
+        for text in [
+            "zebra the",
+            "the cat",
+            "the dog",
+            "the fish",
+            "the bird",
+            "the frog",
+        ] {
             let mut d = Document::new();
             d.add("body", text, FieldKind::Text);
             m.add_document(d);
@@ -190,7 +199,10 @@ mod tests {
         let m = idx();
         let terms = select_terms(&m, 0, &params(&["body"]));
         let picked: Vec<&str> = terms.iter().map(|t| t.term.as_str()).collect();
-        assert!(picked.contains(&"zebra"), "expected 'zebra', got {picked:?}");
+        assert!(
+            picked.contains(&"zebra"),
+            "expected 'zebra', got {picked:?}"
+        );
         // "zebra" (rarer) must rank above "the" (common)
         assert_eq!(terms[0].term, "zebra");
     }
@@ -200,7 +212,10 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
         p.min_doc_freq = 2; // "zebra" has df 1 -> filtered out
-        let picked: Vec<String> = select_terms(&m, 0, &p).into_iter().map(|t| t.term).collect();
+        let picked: Vec<String> = select_terms(&m, 0, &p)
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
         assert!(!picked.contains(&"zebra".to_string()), "got {picked:?}");
     }
 

@@ -190,7 +190,11 @@ mod tests {
             }
         }
         let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
-        for (id, body) in [("A", "zebra alpha"), ("B", "zebra beta"), ("C", "cat gamma")] {
+        for (id, body) in [
+            ("A", "zebra alpha"),
+            ("B", "zebra beta"),
+            ("C", "cat gamma"),
+        ] {
             w.add_document(WriterDoc {
                 fields: vec![
                     WriterField::keyword("id_key", id),
@@ -214,7 +218,10 @@ mod tests {
             .filter_map(|h| h.fields.get("id_key").cloned())
             .collect();
         assert!(ids.contains(&"B".to_string()), "expected B among {ids:?}");
-        assert!(!ids.contains(&"A".to_string()), "source A must be excluded: {ids:?}");
+        assert!(
+            !ids.contains(&"A".to_string()),
+            "source A must be excluded: {ids:?}"
+        );
 
         // unknown reference id -> empty, not an error.
         let none = more_like_this_index(&dir, "id", "ZZZ", &mlt_params(&["body"])).unwrap();
