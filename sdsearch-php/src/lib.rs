@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::time::Duration;
 
-use sdsearch_core::mlt::{MltParams, RangeFilter};
+use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
@@ -79,6 +79,30 @@ struct MltRangeFilterDto {
     to: Option<f64>,
 }
 
+/// minimum-should-match from JSON: a number (`2`) or a string (`"2"` / `"30%"`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MinShouldMatchDto {
+    Count(u32),
+    Spec(String),
+}
+
+/// Parse the msm DTO into the core type. A trailing `%` is a percentage; otherwise an integer
+/// count. Unparseable input is treated as "off" (None) rather than failing the whole query.
+fn parse_min_should_match(dto: Option<MinShouldMatchDto>) -> Option<MinShouldMatch> {
+    match dto {
+        None => None,
+        Some(MinShouldMatchDto::Count(n)) => Some(MinShouldMatch::Count(n)),
+        Some(MinShouldMatchDto::Spec(s)) => {
+            let s = s.trim();
+            match s.strip_suffix('%') {
+                Some(pct) => pct.trim().parse::<u8>().ok().map(MinShouldMatch::Percent),
+                None => s.parse::<u32>().ok().map(MinShouldMatch::Count),
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct MltParamsDto {
     id_field: String,
@@ -92,7 +116,7 @@ struct MltParamsDto {
     #[serde(default)]
     range_filters: Vec<MltRangeFilterDto>,
     #[serde(default)]
-    min_should_match: u32,
+    min_should_match: Option<MinShouldMatchDto>,
     #[serde(default = "default_min_term_freq")]
     min_term_freq: u32,
     #[serde(default = "default_max_query_terms")]
@@ -202,7 +226,7 @@ fn run_mlt(index_dir: &str, params_json: &str) -> Result<String, String> {
                 to: f.to,
             })
             .collect(),
-        min_should_match: dto.min_should_match,
+        min_should_match: parse_min_should_match(dto.min_should_match),
         field_weights: dto.field_weights,
         size: dto.size as usize,
         min_score: dto.min_score,

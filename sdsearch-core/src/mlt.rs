@@ -18,6 +18,27 @@ pub struct RangeFilter {
     pub to: Option<f64>,
 }
 
+/// Minimum-should-match threshold: an absolute term count or a percentage of the selected
+/// terms. A percentage is resolved against the actual selected-term count and floored, like
+/// Lucene/OpenSearch (e.g. 3 terms at 30% → `floor(0.9)` = 0 = no constraint).
+#[derive(Debug, Clone, Copy)]
+pub enum MinShouldMatch {
+    Count(u32),
+    Percent(u8),
+}
+
+impl MinShouldMatch {
+    /// Resolve to an absolute term-count threshold given how many terms were selected.
+    pub(crate) fn threshold(self, selected: usize) -> u32 {
+        match self {
+            MinShouldMatch::Count(n) => n,
+            MinShouldMatch::Percent(pct) => {
+                u32::try_from(pct as usize * selected / 100).unwrap_or(u32::MAX)
+            }
+        }
+    }
+}
+
 /// Parameters for a More Like This query.
 ///
 /// `max_doc_freq` and `posting_budget` are three-state: `None` = infer a safety default from
@@ -34,10 +55,10 @@ pub struct MltParams {
     pub timeout: Option<std::time::Duration>,
     pub term_filters: Vec<(String, String)>,
     pub range_filters: Vec<RangeFilter>,
-    /// Require a hit to match at least this many of the selected terms. `0`/`1` = off (the
-    /// default Should union already requires ≥1); a value above the selected-term count
-    /// matches nothing.
-    pub min_should_match: u32,
+    /// Require a hit to match at least this many of the selected terms (an absolute count or a
+    /// percentage of the selected terms). `None`, or a threshold that resolves to `0`/`1`, is a
+    /// no-op (the Should union already requires ≥1); above the selected-term count → nothing.
+    pub min_should_match: Option<MinShouldMatch>,
     pub field_weights: HashMap<String, f32>,
     pub size: usize,
     pub min_score: f32,
@@ -155,10 +176,14 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
     // checked_add: an absurd timeout (Instant + huge Duration overflows) yields None,
     // which we treat as "no deadline" rather than panicking.
     let deadline = p.timeout.and_then(|d| Instant::now().checked_add(d));
-    // Only pay for the per-doc match-count bookkeeping (a second map of the same cardinality
-    // as `score`) when minimum-should-match is actually on. 0/1 never reads it, so the common
-    // path allocates nothing extra (an unused empty HashMap does not allocate).
-    let track_msm = p.min_should_match > 1;
+    // Resolve minimum-should-match against the actual number of selected terms (a percentage
+    // needs that count). Only pay for the per-doc match-count bookkeeping (a second map of the
+    // same cardinality as `score`) when it's on; a threshold of 0/1 never reads it, so the
+    // common path allocates nothing extra (an unused empty HashMap does not allocate).
+    let msm_threshold = p
+        .min_should_match
+        .map_or(0, |m| m.threshold(selected.len()));
+    let track_msm = msm_threshold > 1;
     let mut score: HashMap<usize, f32> = HashMap::new();
     let mut matched: HashMap<usize, u32> = HashMap::new();
     for (i, s) in selected.iter().enumerate() {
@@ -184,7 +209,7 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
     // 0/1 is a no-op (a doc is in `score` only if ≥1 term hit it). Under an early timeout the
     // counts reflect only the terms processed, so msm can empty the result set (best-effort).
     if track_msm {
-        score.retain(|id, _| matched.get(id).copied().unwrap_or(0) >= p.min_should_match);
+        score.retain(|id, _| matched.get(id).copied().unwrap_or(0) >= msm_threshold);
     }
 
     for (field, value) in &p.term_filters {
@@ -239,7 +264,7 @@ mod tests {
             timeout: None,
             term_filters: Vec::new(),
             range_filters: Vec::new(),
-            min_should_match: 0,
+            min_should_match: None,
             field_weights: HashMap::new(),
             size: 10,
             min_score: 0.0,
@@ -649,7 +674,7 @@ mod tests {
         let m = msm_idx();
         // msm = 2 keeps only docs matching both selected terms (alpha AND beta).
         let mut p = params(&["body"]);
-        p.min_should_match = 2;
+        p.min_should_match = Some(MinShouldMatch::Count(2));
         let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
         assert!(ids.contains(&1), "doc 1 matches alpha+beta: {ids:?}");
         assert!(!ids.contains(&2), "doc 2 matches only alpha: {ids:?}");
@@ -670,7 +695,7 @@ mod tests {
         let m = msm_idx();
         // only 2 terms are selected, so requiring 3 matches nothing.
         let mut p = params(&["body"]);
-        p.min_should_match = 3;
+        p.min_should_match = Some(MinShouldMatch::Count(3));
         assert!(more_like_this(&m, 0, &p).is_empty());
     }
 
@@ -678,7 +703,7 @@ mod tests {
     fn min_should_match_one_is_a_noop() {
         let m = msm_idx();
         let mut p = params(&["body"]);
-        p.min_should_match = 1;
+        p.min_should_match = Some(MinShouldMatch::Count(1));
         let one: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
         let off: Vec<usize> = more_like_this(&m, 0, &params(&["body"]))
             .iter()
@@ -694,11 +719,28 @@ mod tests {
         // msm=2 then filters everything out. Pins the (surprising) msm+timeout interaction.
         let m = msm_idx();
         let mut p = params(&["body"]);
-        p.min_should_match = 2;
+        p.min_should_match = Some(MinShouldMatch::Count(2));
         p.timeout = Some(Duration::from_millis(0));
         assert!(
             more_like_this(&m, 0, &p).is_empty(),
             "under a zero deadline only 1 term is processed, so msm=2 matches nothing"
         );
+    }
+
+    #[test]
+    fn min_should_match_percent_resolves_against_selected_count() {
+        // Percent::threshold floors: 2 selected terms * pct / 100.
+        assert_eq!(MinShouldMatch::Percent(100).threshold(2), 2); // all terms
+        assert_eq!(MinShouldMatch::Percent(75).threshold(2), 1); // floor(1.5) -> no-op
+        assert_eq!(MinShouldMatch::Percent(30).threshold(2), 0); // floor(0.6) -> off
+        assert_eq!(MinShouldMatch::Percent(50).threshold(4), 2);
+
+        // msm_idx has 2 selected terms; 100% requires both -> only doc 1 (alpha+beta), not doc 2.
+        let m = msm_idx();
+        let mut p = params(&["body"]);
+        p.min_should_match = Some(MinShouldMatch::Percent(100));
+        let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(ids.contains(&1), "100% keeps the both-terms doc: {ids:?}");
+        assert!(!ids.contains(&2), "100% drops the single-term doc: {ids:?}");
     }
 }

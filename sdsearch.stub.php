@@ -80,7 +80,7 @@ namespace SdSearch {
          *   "source_fields": ["id"],
          *   "term_filters": [ { "field": "status_key", "value": "open" } ],
          *   "range_filters": [ { "field": "created_at_key", "from": 1700000000, "to": 1800000000 } ],
-         *   "min_should_match": 2,
+         *   "min_should_match": "30%",
          *   "min_term_freq": 2,
          *   "max_query_terms": 25,
          *   "min_doc_freq": 5,
@@ -104,13 +104,16 @@ namespace SdSearch {
          *   number within `[from, to]` (inclusive; either bound may be omitted for a half-open
          *   range). `field` is verbatim like `term_filters`; a missing/non-numeric value on a doc
          *   excludes it. Suits epoch-int fields such as `created_at_key`.
-         * - `min_should_match` (optional, default `0`): a hit must match at least this many of the
-         *   selected terms. `0`/`1` = off. Integer only (OpenSearch percentage syntax is not
-         *   supported). CAVEATS: the number of selected terms is NOT visible to the caller — it is
-         *   data-dependent (a short source doc, `max_query_terms`, or `posting_budget` can trim it),
-         *   so an msm above it returns `[]` even when similar docs exist. And under an early
-         *   `timeout_ms`, only the terms processed before the deadline count, so a high msm can
-         *   empty the result set. Keep msm low (2–3).
+         * - `min_should_match` (optional): a hit must match at least this many of the selected
+         *   terms. An integer (`2`) is an absolute count; a string `"N%"` (e.g. `"30%"`) is a
+         *   percentage of the selected terms, floored like OpenSearch (`3` terms × `30%` → `0`).
+         *   `0`/`1` (or a percentage that floors to them) = off. Full OpenSearch grammar (negatives,
+         *   `"2<75%"` combinations) is NOT supported. CAVEATS: the number of selected terms is NOT
+         *   visible to the caller — it is data-dependent (a short source doc, `max_query_terms`, or
+         *   `posting_budget` can trim it), so an absolute count above it returns `[]` even when
+         *   similar docs exist (percentage scales with it, so it is safer). And under an early
+         *   `timeout_ms`, only the terms processed before the deadline count, so a high threshold
+         *   can empty the result set.
          * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
          * - `max_doc_freq` and `posting_budget` are tri-state: **omit** (or `null`) → the engine
          *   infers a safety default from the index size (max_doc_freq ≈ half the docs;
