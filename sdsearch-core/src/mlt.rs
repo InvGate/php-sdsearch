@@ -85,10 +85,13 @@ pub(crate) fn select_terms(
     let mut out: Vec<Selected> = Vec::new();
     let mut spent = 0usize;
     for (_, s) in scored {
-        if p.posting_budget > 0 && !out.is_empty() && spent + s.doc_freq > p.posting_budget {
+        if p.posting_budget > 0
+            && !out.is_empty()
+            && spent.saturating_add(s.doc_freq) > p.posting_budget
+        {
             break;
         }
-        spent += s.doc_freq;
+        spent = spent.saturating_add(s.doc_freq);
         out.push(s);
     }
     out
@@ -305,5 +308,108 @@ mod tests {
             "best-effort timeout must still return the top term's matches"
         );
         assert!(hits.iter().all(|h| h.id != 0), "source still excluded");
+    }
+
+    // Source doc 0 has a rare top term "zebra" (df 2 -> ranked first) and a common
+    // lower-ranked term "common" (df 5). Doc 1 is reachable ONLY via "zebra"; doc 2 is
+    // reachable ONLY via "common". With a zero deadline the loop processes the top term
+    // and stops, so doc 2 (behind the second term) must be absent — while with no timeout
+    // it appears. This FAILS if the deadline check is removed (the whole point of the guard).
+    fn ranked_terms_idx() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in [
+            "zebra common", // 0: source
+            "zebra x",      // 1: only "zebra"
+            "common y",     // 2: only "common"
+            "common a",     // 3: filler to make "common" common (low idf)
+            "common b",     // 4
+            "common c",     // 5
+        ] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn zero_timeout_stops_before_lower_ranked_terms() {
+        use std::time::Duration;
+        let m = ranked_terms_idx();
+
+        // No timeout: both "zebra" and "common" processed -> doc 2 (via "common") is present.
+        let full: Vec<usize> = more_like_this(&m, 0, &params(&["body"]))
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert!(full.contains(&1), "doc 1 (zebra) expected: {full:?}");
+        assert!(
+            full.contains(&2),
+            "doc 2 (common) expected without timeout: {full:?}"
+        );
+
+        // Zero deadline: only the top term "zebra" is processed -> doc 1 present, doc 2 absent.
+        let mut p = params(&["body"]);
+        p.timeout = Some(Duration::from_millis(0));
+        let early: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(early.contains(&1), "top term still yields doc 1: {early:?}");
+        assert!(
+            !early.contains(&2),
+            "lower-ranked term must be skipped under a zero deadline: {early:?}"
+        );
+    }
+
+    #[test]
+    fn max_doc_freq_filters_common_terms() {
+        // idx(): "zebra" df 1, "the" df 6. Cap at 1 -> "the" dropped, "zebra" kept.
+        let m = idx();
+        let mut p = params(&["body"]);
+        p.max_doc_freq = 1;
+        let picked: Vec<String> = select_terms(&m, 0, &p)
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert!(picked.contains(&"zebra".to_string()), "got {picked:?}");
+        assert!(
+            !picked.contains(&"the".to_string()),
+            "'the' too common: {picked:?}"
+        );
+    }
+
+    #[test]
+    fn field_weights_change_the_top_hit() {
+        // source doc 0 has title:zebra + body:quokka; doc 1 matches only title:zebra,
+        // doc 2 matches only body:quokka. Weighting a field flips which one ranks first.
+        let mut m = MemoryIndex::new();
+        for (title, body) in [("zebra", "quokka"), ("zebra", "xxx"), ("yyy", "quokka")] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("body", body, FieldKind::Text);
+            m.add_document(d);
+        }
+
+        let mut p = params(&["title", "body"]);
+        p.field_weights.insert("title".to_string(), 10.0);
+        let top_title = more_like_this(&m, 0, &p)[0].id;
+        assert_eq!(top_title, 1, "title-weighted -> doc 1 (title:zebra) first");
+
+        p.field_weights.clear();
+        p.field_weights.insert("body".to_string(), 10.0);
+        let top_body = more_like_this(&m, 0, &p)[0].id;
+        assert_eq!(top_body, 2, "body-weighted -> doc 2 (body:quokka) first");
+    }
+
+    #[test]
+    fn min_score_filters_out_all_hits_when_too_high() {
+        // scores are normalized so the top hit is exactly 1.0; a threshold above 1.0
+        // filters everything, while 0.0 keeps matches. Confirms min_score reaches finalize.
+        let m = sim_idx();
+        assert!(!more_like_this(&m, 0, &params(&["body"])).is_empty());
+        let mut p = params(&["body"]);
+        p.min_score = 2.0;
+        assert!(
+            more_like_this(&m, 0, &p).is_empty(),
+            "min_score above the normalized max must drop every hit"
+        );
     }
 }

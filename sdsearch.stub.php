@@ -90,8 +90,14 @@ namespace SdSearch {
          *   "min_score": 0.0
          * }
          * ```
-         * - `id_field`/`id_value` identify the reference document (resolved via `<id_field>_key`).
-         * - `fields` are the stored text fields to extract candidate terms from.
+         * - `id_field`/`id_value` identify the reference document. `id_field` is a LOGICAL
+         *   name: the engine appends `_key` (so `"id"` resolves against the indexed `id_key`).
+         * - `fields` are the stored text fields to mine candidate terms from. A field that is
+         *   not stored as text (typo, keyword-only, indexed-but-not-stored) is silently ignored;
+         *   if none of the requested fields is found, the result is `[]` (same as "no match").
+         * - `term_filters[].field` is used VERBATIM — unlike `id_field`, no `_key` is appended.
+         *   Pass the already-suffixed indexed name (e.g. `"status_key"`); a wrong name matches
+         *   nothing and silently empties the result set.
          * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
          * - `max_doc_freq`/`posting_budget`/`timeout_ms` of `0` mean unbounded/off.
          * - `posting_budget` caps Σ doc-frequency over selected terms (deterministic cost guard);
