@@ -270,4 +270,25 @@ mod tests {
         assert!(ids.contains(&1), "doc 1 is open: {ids:?}");
         assert!(!ids.contains(&2), "doc 2 is closed, filtered out: {ids:?}");
     }
+
+    #[test]
+    fn zero_timeout_returns_early_without_error() {
+        use std::time::Duration;
+        // source doc shares two distinct terms with two different docs; a zero deadline
+        // must still process the single top term (best effort), not panic or return empty.
+        let mut m = MemoryIndex::new();
+        for text in ["zebra quokka", "zebra only", "quokka only", "unrelated"] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        let mut p = params(&["body"]);
+        p.timeout = Some(Duration::from_millis(0));
+        let hits = more_like_this(&m, 0, &p);
+        assert!(
+            !hits.is_empty(),
+            "best-effort timeout must still return the top term's matches"
+        );
+        assert!(hits.iter().all(|h| h.id != 0), "source still excluded");
+    }
 }
