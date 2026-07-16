@@ -4,13 +4,15 @@
 
 use ext_php_rs::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::time::Duration;
 
+use sdsearch_core::mlt::MltParams;
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::zsl::index::ZslIndex;
-use sdsearch_core::zsl::runner::search_index;
+use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
 
 // ---- JSON contract with PHP ----
@@ -50,6 +52,52 @@ struct HitDto {
     id: u64,
     score: f32,
     fields: HashMap<String, String>,
+}
+
+fn default_min_term_freq() -> u32 {
+    2
+}
+fn default_max_query_terms() -> u64 {
+    25
+}
+fn default_min_doc_freq() -> u64 {
+    5
+}
+
+#[derive(Deserialize)]
+struct MltTermFilterDto {
+    field: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct MltParamsDto {
+    id_field: String,
+    id_value: String,
+    #[serde(default)]
+    fields: Vec<String>,
+    #[serde(default)]
+    source_fields: Vec<String>,
+    #[serde(default)]
+    term_filters: Vec<MltTermFilterDto>,
+    #[serde(default = "default_min_term_freq")]
+    min_term_freq: u32,
+    #[serde(default = "default_max_query_terms")]
+    max_query_terms: u64,
+    #[serde(default = "default_min_doc_freq")]
+    min_doc_freq: u64,
+    #[serde(default)]
+    max_doc_freq: u64,
+    #[serde(default)]
+    posting_budget: u64,
+    #[serde(default)]
+    timeout_ms: u64,
+    #[serde(default)]
+    field_weights: HashMap<String, f32>,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    min_score: f32,
 }
 
 fn occur_from(s: &str) -> Occur {
@@ -108,6 +156,54 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
 }
 
+/// fallible core of `Engine::more_like_this`: parses MLT params, runs the query, projects
+/// `source_fields` (if any), serializes hits. Errors returned as String (boundary -> PhpException).
+fn run_mlt(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: MltParamsDto = serde_json::from_str(params_json)
+        .map_err(|e| format!("sdsearch: bad mlt params json: {e}"))?;
+    let params = MltParams {
+        fields: dto.fields,
+        min_term_freq: dto.min_term_freq,
+        max_query_terms: dto.max_query_terms as usize,
+        min_doc_freq: dto.min_doc_freq as usize,
+        max_doc_freq: dto.max_doc_freq as usize,
+        posting_budget: dto.posting_budget as usize,
+        timeout: if dto.timeout_ms > 0 {
+            Some(Duration::from_millis(dto.timeout_ms))
+        } else {
+            None
+        },
+        term_filters: dto
+            .term_filters
+            .into_iter()
+            .map(|f| (f.field, f.value))
+            .collect(),
+        field_weights: dto.field_weights,
+        size: dto.size as usize,
+        min_score: dto.min_score,
+    };
+    let hits = more_like_this_index(Path::new(index_dir), &dto.id_field, &dto.id_value, &params)
+        .map_err(|e| format!("sdsearch: {e}"))?;
+    let project = !dto.source_fields.is_empty();
+    let allow: HashSet<String> = dto.source_fields.into_iter().collect();
+    let out: Vec<HitDto> = hits
+        .into_iter()
+        .map(|h| HitDto {
+            id: h.id as u64,
+            score: h.score,
+            fields: if project {
+                h.fields
+                    .into_iter()
+                    .filter(|(k, _)| allow.contains(k))
+                    .collect()
+            } else {
+                h.fields
+            },
+        })
+        .collect();
+    serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
+}
+
 /// engine version; smoke test that the extension loads.
 #[php_function]
 pub fn sdsearch_version() -> String {
@@ -133,6 +229,19 @@ impl Engine {
             Ok(Err(msg)) => Err(PhpException::default(msg)),
             Err(_) => Err(PhpException::default(
                 "sdsearch: panic during search".to_string(),
+            )),
+        }
+    }
+
+    /// More Like This: given a reference doc (by id-field value), returns similar docs as a
+    /// JSON hit array. Panic-safe boundary, like `search`.
+    pub fn more_like_this(&self, index_dir: String, params_json: String) -> PhpResult<String> {
+        let result = catch_unwind(AssertUnwindSafe(|| run_mlt(&index_dir, &params_json)));
+        match result {
+            Ok(Ok(json)) => Ok(json),
+            Ok(Err(msg)) => Err(PhpException::default(msg)),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic during more_like_this".to_string(),
             )),
         }
     }

@@ -67,6 +67,46 @@ namespace SdSearch {
          *                    internal engine error.
          */
         public function search(string $indexDir, string $paramsJson): string {}
+
+        /**
+         * More Like This: returns documents similar to a reference document as a JSON hit array.
+         *
+         * `$paramsJson` is a JSON object:
+         * ```json
+         * {
+         *   "id_field": "id",
+         *   "id_value": "12345",
+         *   "fields": ["title", "description"],
+         *   "source_fields": ["id"],
+         *   "term_filters": [ { "field": "status_key", "value": "open" } ],
+         *   "min_term_freq": 2,
+         *   "max_query_terms": 25,
+         *   "min_doc_freq": 5,
+         *   "max_doc_freq": 0,
+         *   "posting_budget": 0,
+         *   "timeout_ms": 0,
+         *   "field_weights": { "title": 3.0 },
+         *   "size": 10,
+         *   "min_score": 0.0
+         * }
+         * ```
+         * - `id_field`/`id_value` identify the reference document (resolved via `<id_field>_key`).
+         * - `fields` are the stored text fields to extract candidate terms from.
+         * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
+         * - `max_doc_freq`/`posting_budget`/`timeout_ms` of `0` mean unbounded/off.
+         * - `posting_budget` caps Σ doc-frequency over selected terms (deterministic cost guard);
+         *   `timeout_ms` is a best-effort wall-clock guard (approximate scores if it fires).
+         *
+         * Returns a JSON array of hits `[ { "id": 42, "score": 1.0, "fields": {…} } ]`;
+         * an unknown reference id returns `[]`.
+         *
+         * @param string $indexDir   Path to the ZSL index directory.
+         * @param string $paramsJson JSON-encoded MLT parameters (see above).
+         * @return string JSON-encoded array of hits.
+         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
+         *                    internal engine error.
+         */
+        public function more_like_this(string $indexDir, string $paramsJson): string {}
     }
 
     /**
