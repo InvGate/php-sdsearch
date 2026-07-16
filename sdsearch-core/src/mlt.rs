@@ -155,6 +155,10 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
     // checked_add: an absurd timeout (Instant + huge Duration overflows) yields None,
     // which we treat as "no deadline" rather than panicking.
     let deadline = p.timeout.and_then(|d| Instant::now().checked_add(d));
+    // Only pay for the per-doc match-count bookkeeping (a second map of the same cardinality
+    // as `score`) when minimum-should-match is actually on. 0/1 never reads it, so the common
+    // path allocates nothing extra (an unused empty HashMap does not allocate).
+    let track_msm = p.min_should_match > 1;
     let mut score: HashMap<usize, f32> = HashMap::new();
     let mut matched: HashMap<usize, u32> = HashMap::new();
     for (i, s) in selected.iter().enumerate() {
@@ -168,7 +172,9 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
         let w = weight_of(&p.field_weights, &s.field);
         for (id, sc) in term_scores(index, &s.field, &s.term) {
             *score.entry(id).or_insert(0.0) += sc * w;
-            *matched.entry(id).or_insert(0) += 1;
+            if track_msm {
+                *matched.entry(id).or_insert(0) += 1;
+            }
         }
     }
 
@@ -176,8 +182,8 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
 
     // minimum-should-match: keep only docs that matched at least this many selected terms.
     // 0/1 is a no-op (a doc is in `score` only if ≥1 term hit it). Under an early timeout the
-    // counts reflect only the terms processed (best-effort, like the scores).
-    if p.min_should_match > 1 {
+    // counts reflect only the terms processed, so msm can empty the result set (best-effort).
+    if track_msm {
         score.retain(|id, _| matched.get(id).copied().unwrap_or(0) >= p.min_should_match);
     }
 
@@ -666,5 +672,33 @@ mod tests {
         let mut p = params(&["body"]);
         p.min_should_match = 3;
         assert!(more_like_this(&m, 0, &p).is_empty());
+    }
+
+    #[test]
+    fn min_should_match_one_is_a_noop() {
+        let m = msm_idx();
+        let mut p = params(&["body"]);
+        p.min_should_match = 1;
+        let one: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        let off: Vec<usize> = more_like_this(&m, 0, &params(&["body"]))
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(one, off, "msm=1 must behave exactly like off (0)");
+    }
+
+    #[test]
+    fn min_should_match_under_timeout_can_empty_results() {
+        use std::time::Duration;
+        // A zero deadline processes only the top term, so every match count tops at 1;
+        // msm=2 then filters everything out. Pins the (surprising) msm+timeout interaction.
+        let m = msm_idx();
+        let mut p = params(&["body"]);
+        p.min_should_match = 2;
+        p.timeout = Some(Duration::from_millis(0));
+        assert!(
+            more_like_this(&m, 0, &p).is_empty(),
+            "under a zero deadline only 1 term is processed, so msm=2 matches nothing"
+        );
     }
 }
