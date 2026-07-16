@@ -188,8 +188,8 @@ $params = [
     'min_term_freq'   => 2,
     'max_query_terms' => 25,
     'min_doc_freq'    => 5,
-    'max_doc_freq'    => 0,         // 0 = unbounded
-    'posting_budget'  => 0,         // 0 = off; caps Σ doc-frequency of selected terms
+    // max_doc_freq / posting_budget: OMIT for a safety default inferred from the index size;
+    // 0 = explicitly unbounded/off; a positive number = explicit cap.
     'timeout_ms'      => 0,         // 0 = off; best-effort wall-clock guard
     'field_weights'   => ['title' => 3.0],
     'size'            => 10,
@@ -212,8 +212,8 @@ $hits = json_decode($json, true);   // same shape as search(); [] if the referen
 | `min_term_freq` | int | Ignore reference terms occurring fewer than this many times (default 2). |
 | `max_query_terms` | int | Keep at most this many candidate terms (default 25; `0` = no cap). |
 | `min_doc_freq` | int | Ignore terms rarer than this across the collection (default 5). |
-| `max_doc_freq` | int | Ignore terms more common than this (`0` = unbounded). |
-| `posting_budget` | int | Cap on Σ doc-frequency of selected terms — a deterministic cost guard (`0` = off). |
+| `max_doc_freq` | int | Ignore terms more common than this. **Omit** → safety default of ~half the collection size (skips non-discriminative, memory-heavy terms); `0` = unbounded. |
+| `posting_budget` | int | Cap on Σ doc-frequency of selected terms — a deterministic cost guard. **Omit** → safety default of ~the collection size; `0` = off. |
 | `timeout_ms` | int | Best-effort wall-clock guard; approximate scores if it fires (`0` = off). |
 | `field_weights` | object | Per-field score multipliers, as in `search`. |
 | `size` | int | Maximum hits to return (`0` = unlimited). |

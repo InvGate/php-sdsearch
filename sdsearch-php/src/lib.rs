@@ -86,10 +86,12 @@ struct MltParamsDto {
     max_query_terms: u64,
     #[serde(default = "default_min_doc_freq")]
     min_doc_freq: u64,
+    // absent -> None -> engine infers a safety default from the index size;
+    // 0 -> explicitly unbounded/off; n -> explicit cap.
     #[serde(default)]
-    max_doc_freq: u64,
+    max_doc_freq: Option<u64>,
     #[serde(default)]
-    posting_budget: u64,
+    posting_budget: Option<u64>,
     #[serde(default)]
     timeout_ms: u64,
     #[serde(default)]
@@ -166,8 +168,8 @@ fn run_mlt(index_dir: &str, params_json: &str) -> Result<String, String> {
         min_term_freq: dto.min_term_freq,
         max_query_terms: dto.max_query_terms as usize,
         min_doc_freq: dto.min_doc_freq as usize,
-        max_doc_freq: dto.max_doc_freq as usize,
-        posting_budget: dto.posting_budget as usize,
+        max_doc_freq: dto.max_doc_freq.map(|v| v as usize),
+        posting_budget: dto.posting_budget.map(|v| v as usize),
         timeout: if dto.timeout_ms > 0 {
             Some(Duration::from_millis(dto.timeout_ms))
         } else {

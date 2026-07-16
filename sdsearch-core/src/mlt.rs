@@ -8,16 +8,19 @@ use crate::search::{Hit, finalize, term_scores};
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// Parameters for a More Like This query. `max_doc_freq == 0` = unbounded;
-/// `max_query_terms == 0` = no cap; `posting_budget == 0` = off; `size == 0` = unlimited.
+/// Parameters for a More Like This query.
+///
+/// `max_doc_freq` and `posting_budget` are three-state: `None` = infer a safety default from
+/// the collection size (see `select_terms`); `Some(0)` = explicitly unbounded/off;
+/// `Some(n)` = explicit limit. `max_query_terms == 0` = no cap; `size == 0` = unlimited.
 #[derive(Debug, Clone)]
 pub struct MltParams {
     pub fields: Vec<String>,
     pub min_term_freq: u32,
     pub max_query_terms: usize,
     pub min_doc_freq: usize,
-    pub max_doc_freq: usize,
-    pub posting_budget: usize,
+    pub max_doc_freq: Option<usize>,
+    pub posting_budget: Option<usize>,
     pub timeout: Option<std::time::Duration>,
     pub term_filters: Vec<(String, String)>,
     pub field_weights: HashMap<String, f32>,
@@ -43,7 +46,18 @@ pub(crate) fn select_terms(
     p: &MltParams,
 ) -> Vec<Selected> {
     let stored = index.stored_fields(source_doc);
-    let n = index.total_docs() as f32;
+    let n_docs = index.total_docs();
+    let n = n_docs as f32;
+
+    // Safety defaults inferred from the (O(1)) collection size when the caller leaves them
+    // unset — so a single request can't load memory proportional to the whole collection:
+    // - max_doc_freq -> N/2: a term in more than half the docs is not discriminative and is
+    //   the memory bomb if selected (its posting list is ~O(N)); drop it from the candidates.
+    // - posting_budget -> N: cap Σ doc_freq of the selected terms at ~one collection's worth.
+    // `Some(0)` means the caller explicitly opted out (unbounded); `Some(n)` is an explicit cap.
+    let max_doc_freq = p.max_doc_freq.unwrap_or(n_docs / 2);
+    let posting_budget = p.posting_budget.unwrap_or(n_docs);
+
     let mut scored: Vec<(f32, Selected)> = Vec::new();
 
     for field in &p.fields {
@@ -62,7 +76,7 @@ pub(crate) fn select_terms(
             if df < p.min_doc_freq {
                 continue;
             }
-            if p.max_doc_freq > 0 && df > p.max_doc_freq {
+            if max_doc_freq > 0 && df > max_doc_freq {
                 continue;
             }
             let sel = freq as f32 * idf(n, df as f32);
@@ -92,9 +106,9 @@ pub(crate) fn select_terms(
     let mut out: Vec<Selected> = Vec::new();
     let mut spent = 0usize;
     for (_, s) in scored {
-        if p.posting_budget > 0
+        if posting_budget > 0
             && !out.is_empty()
-            && spent.saturating_add(s.doc_freq) > p.posting_budget
+            && spent.saturating_add(s.doc_freq) > posting_budget
         {
             break;
         }
@@ -174,8 +188,8 @@ mod tests {
             min_term_freq: 1,
             max_query_terms: 25,
             min_doc_freq: 1,
-            max_doc_freq: 0,
-            posting_budget: 0,
+            max_doc_freq: Some(0),
+            posting_budget: Some(0),
             timeout: None,
             term_filters: Vec::new(),
             field_weights: HashMap::new(),
@@ -242,7 +256,7 @@ mod tests {
     fn posting_budget_keeps_at_least_the_top_term() {
         let m = idx();
         let mut p = params(&["body"]);
-        p.posting_budget = 1; // tiny budget; still keep the single top term
+        p.posting_budget = Some(1); // tiny budget; still keep the single top term
         let terms = select_terms(&m, 0, &p);
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].term, "zebra");
@@ -372,7 +386,7 @@ mod tests {
         // idx(): "zebra" df 1, "the" df 6. Cap at 1 -> "the" dropped, "zebra" kept.
         let m = idx();
         let mut p = params(&["body"]);
-        p.max_doc_freq = 1;
+        p.max_doc_freq = Some(1);
         let picked: Vec<String> = select_terms(&m, 0, &p)
             .into_iter()
             .map(|t| t.term)
@@ -428,7 +442,7 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
 
-        p.posting_budget = 5;
+        p.posting_budget = Some(5);
         let five: Vec<String> = select_terms(&m, 0, &p)
             .into_iter()
             .map(|t| t.term)
@@ -439,7 +453,7 @@ mod tests {
             "budget 5 stops before 'the'"
         );
 
-        p.posting_budget = 7;
+        p.posting_budget = Some(7);
         let seven: Vec<String> = select_terms(&m, 0, &p)
             .into_iter()
             .map(|t| t.term)
@@ -484,6 +498,25 @@ mod tests {
         assert!(
             ids.contains(&1),
             "runs fully despite absurd timeout: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_default_max_doc_freq_drops_over_common_terms() {
+        // With max_doc_freq unset (None) the engine infers total_docs/2. In idx() (N=6) that
+        // is 3, so "the" (df 6, in every doc) is dropped as too common while "zebra" (df 1)
+        // survives — no explicit cap from the caller. This is the memory safety default.
+        let m = idx();
+        let mut p = params(&["body"]);
+        p.max_doc_freq = None; // infer from index size
+        let picked: Vec<String> = select_terms(&m, 0, &p)
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert!(picked.contains(&"zebra".to_string()), "got {picked:?}");
+        assert!(
+            !picked.contains(&"the".to_string()),
+            "dynamic default must drop >50%-of-docs terms: {picked:?}"
         );
     }
 }

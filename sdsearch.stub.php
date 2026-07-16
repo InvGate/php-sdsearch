@@ -82,8 +82,8 @@ namespace SdSearch {
          *   "min_term_freq": 2,
          *   "max_query_terms": 25,
          *   "min_doc_freq": 5,
-         *   "max_doc_freq": 0,
-         *   "posting_budget": 0,
+         *   "max_doc_freq": null,     // omit for a safety default from index size
+         *   "posting_budget": null,   // omit for a safety default from index size
          *   "timeout_ms": 0,
          *   "field_weights": { "title": 3.0 },
          *   "size": 10,
@@ -99,9 +99,12 @@ namespace SdSearch {
          *   Pass the already-suffixed indexed name (e.g. `"status_key"`); a wrong name matches
          *   nothing and silently empties the result set.
          * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
-         * - `max_doc_freq`/`posting_budget`/`timeout_ms` of `0` mean unbounded/off.
+         * - `max_doc_freq` and `posting_budget` are tri-state: **omit** (or `null`) → the engine
+         *   infers a safety default from the index size (max_doc_freq ≈ half the docs;
+         *   posting_budget ≈ the doc count) so a single request can't load memory proportional
+         *   to the whole collection; `0` → explicitly unbounded/off; a positive number → explicit cap.
          * - `posting_budget` caps Σ doc-frequency over selected terms (deterministic cost guard);
-         *   `timeout_ms` is a best-effort wall-clock guard (approximate scores if it fires).
+         *   `timeout_ms` (`0` = off) is a best-effort wall-clock guard (approximate scores if it fires).
          *
          * Returns a JSON array of hits `[ { "id": 42, "score": 1.0, "fields": {…} } ]`;
          * an unknown reference id returns `[]`.
