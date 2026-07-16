@@ -188,6 +188,7 @@ $params = [
     'range_filters' => [            // numeric range over a stored field (inclusive, half-open ok)
         ['field' => 'created_at_key', 'from' => 1_700_000_000, 'to' => 1_800_000_000],
     ],
+    'min_should_match' => 2,        // a hit must match >= N of the selected terms (0/1 = off)
     'min_term_freq'   => 2,
     'max_query_terms' => 25,
     'min_doc_freq'    => 5,
@@ -213,6 +214,7 @@ $hits = json_decode($json, true);   // same shape as search(); [] if the referen
 | `source_fields` | array | Optional projection of returned stored fields (`[]` = all). |
 | `term_filters` | array | Each `{field, value}`; a hit must match all. `field` is used **verbatim** (no `_key` appended, unlike `id_field`). |
 | `range_filters` | array | Each `{field, from?, to?}`; a hit's stored `field` must parse as a number within `[from, to]` (inclusive; either bound optional). Missing/non-numeric field → excluded. `field` verbatim. |
+| `min_should_match` | int | A hit must match at least this many of the selected terms. `0`/`1` = off; a value above the selected-term count matches nothing. |
 | `min_term_freq` | int | Ignore reference terms occurring fewer than this many times (default 2). |
 | `max_query_terms` | int | Keep at most this many candidate terms (default 25; `0` = no cap). |
 | `min_doc_freq` | int | Ignore terms rarer than this across the collection (default 5). |

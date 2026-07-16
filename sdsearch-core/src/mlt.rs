@@ -34,6 +34,10 @@ pub struct MltParams {
     pub timeout: Option<std::time::Duration>,
     pub term_filters: Vec<(String, String)>,
     pub range_filters: Vec<RangeFilter>,
+    /// Require a hit to match at least this many of the selected terms. `0`/`1` = off (the
+    /// default Should union already requires ≥1); a value above the selected-term count
+    /// matches nothing.
+    pub min_should_match: u32,
     pub field_weights: HashMap<String, f32>,
     pub size: usize,
     pub min_score: f32,
@@ -152,6 +156,7 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
     // which we treat as "no deadline" rather than panicking.
     let deadline = p.timeout.and_then(|d| Instant::now().checked_add(d));
     let mut score: HashMap<usize, f32> = HashMap::new();
+    let mut matched: HashMap<usize, u32> = HashMap::new();
     for (i, s) in selected.iter().enumerate() {
         if i > 0 {
             if let Some(dl) = deadline {
@@ -163,10 +168,18 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
         let w = weight_of(&p.field_weights, &s.field);
         for (id, sc) in term_scores(index, &s.field, &s.term) {
             *score.entry(id).or_insert(0.0) += sc * w;
+            *matched.entry(id).or_insert(0) += 1;
         }
     }
 
     score.remove(&source_doc);
+
+    // minimum-should-match: keep only docs that matched at least this many selected terms.
+    // 0/1 is a no-op (a doc is in `score` only if ≥1 term hit it). Under an early timeout the
+    // counts reflect only the terms processed (best-effort, like the scores).
+    if p.min_should_match > 1 {
+        score.retain(|id, _| matched.get(id).copied().unwrap_or(0) >= p.min_should_match);
+    }
 
     for (field, value) in &p.term_filters {
         // postings_for returns doc-ids ascending, so membership is a binary search over the
@@ -220,6 +233,7 @@ mod tests {
             timeout: None,
             term_filters: Vec::new(),
             range_filters: Vec::new(),
+            min_should_match: 0,
             field_weights: HashMap::new(),
             size: 10,
             min_score: 0.0,
@@ -611,5 +625,46 @@ mod tests {
             "inclusive upper bound keeps 1500: {ids2:?}"
         );
         assert!(!ids2.contains(&2), "2500 > 1500 dropped: {ids2:?}");
+    }
+
+    // source "alpha beta" -> 2 selected terms. doc 1 shares both, doc 2 shares only "alpha".
+    fn msm_idx() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in ["alpha beta", "alpha beta", "alpha zzz", "gamma delta"] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn min_should_match_requires_multiple_term_hits() {
+        let m = msm_idx();
+        // msm = 2 keeps only docs matching both selected terms (alpha AND beta).
+        let mut p = params(&["body"]);
+        p.min_should_match = 2;
+        let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(ids.contains(&1), "doc 1 matches alpha+beta: {ids:?}");
+        assert!(!ids.contains(&2), "doc 2 matches only alpha: {ids:?}");
+
+        // off (default 0) keeps the single-term match too.
+        let off: Vec<usize> = more_like_this(&m, 0, &params(&["body"]))
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert!(
+            off.contains(&2),
+            "without msm the single-term match survives: {off:?}"
+        );
+    }
+
+    #[test]
+    fn min_should_match_above_selected_count_yields_empty() {
+        let m = msm_idx();
+        // only 2 terms are selected, so requiring 3 matches nothing.
+        let mut p = params(&["body"]);
+        p.min_should_match = 3;
+        assert!(more_like_this(&m, 0, &p).is_empty());
     }
 }

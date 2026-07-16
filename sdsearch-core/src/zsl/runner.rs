@@ -166,6 +166,7 @@ mod tests {
             timeout: None,
             term_filters: Vec::new(),
             range_filters: Vec::new(),
+            min_should_match: 0,
             field_weights: StdHashMap::new(),
             size: 10,
             min_score: 0.0,

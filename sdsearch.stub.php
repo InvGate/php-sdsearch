@@ -80,6 +80,7 @@ namespace SdSearch {
          *   "source_fields": ["id"],
          *   "term_filters": [ { "field": "status_key", "value": "open" } ],
          *   "range_filters": [ { "field": "created_at_key", "from": 1700000000, "to": 1800000000 } ],
+         *   "min_should_match": 2,
          *   "min_term_freq": 2,
          *   "max_query_terms": 25,
          *   "min_doc_freq": 5,
@@ -103,6 +104,9 @@ namespace SdSearch {
          *   number within `[from, to]` (inclusive; either bound may be omitted for a half-open
          *   range). `field` is verbatim like `term_filters`; a missing/non-numeric value on a doc
          *   excludes it. Suits epoch-int fields such as `created_at_key`.
+         * - `min_should_match` (optional, default `0`): a hit must match at least this many of the
+         *   selected terms. `0`/`1` = off; a value above the number of selected terms matches nothing.
+         *   Integer only (OpenSearch percentage syntax is not supported).
          * - `source_fields` (optional) projects the returned `fields` to just these keys; empty = all.
          * - `max_doc_freq` and `posting_budget` are tri-state: **omit** (or `null`) → the engine
          *   infers a safety default from the index size (max_doc_freq ≈ half the docs;

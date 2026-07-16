@@ -91,6 +91,8 @@ struct MltParamsDto {
     term_filters: Vec<MltTermFilterDto>,
     #[serde(default)]
     range_filters: Vec<MltRangeFilterDto>,
+    #[serde(default)]
+    min_should_match: u32,
     #[serde(default = "default_min_term_freq")]
     min_term_freq: u32,
     #[serde(default = "default_max_query_terms")]
@@ -200,6 +202,7 @@ fn run_mlt(index_dir: &str, params_json: &str) -> Result<String, String> {
                 to: f.to,
             })
             .collect(),
+        min_should_match: dto.min_should_match,
         field_weights: dto.field_weights,
         size: dto.size as usize,
         min_score: dto.min_score,
