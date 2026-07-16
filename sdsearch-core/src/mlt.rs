@@ -5,7 +5,7 @@ use crate::analysis::analyze;
 use crate::index::IndexReader;
 use crate::score::idf;
 use crate::search::{Hit, finalize, term_scores};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Parameters for a More Like This query. `max_doc_freq == 0` = unbounded;
@@ -77,7 +77,14 @@ pub(crate) fn select_terms(
         }
     }
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // score desc, then a stable tiebreak (field, term) so ties don't make the surviving
+    // set after max_query_terms/posting_budget depend on HashMap iteration order.
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.field.cmp(&b.1.field))
+            .then_with(|| a.1.term.cmp(&b.1.term))
+    });
     if p.max_query_terms > 0 {
         scored.truncate(p.max_query_terms);
     }
@@ -116,7 +123,9 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
         return Vec::new();
     }
 
-    let deadline = p.timeout.map(|d| Instant::now() + d);
+    // checked_add: an absurd timeout (Instant + huge Duration overflows) yields None,
+    // which we treat as "no deadline" rather than panicking.
+    let deadline = p.timeout.and_then(|d| Instant::now().checked_add(d));
     let mut score: HashMap<usize, f32> = HashMap::new();
     for (i, s) in selected.iter().enumerate() {
         if i > 0 {
@@ -135,12 +144,11 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
     score.remove(&source_doc);
 
     for (field, value) in &p.term_filters {
-        let matching: HashSet<usize> = index
-            .postings_for(field, value)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        score.retain(|id, _| matching.contains(id));
+        // postings_for returns doc-ids ascending, so membership is a binary search over the
+        // posting list itself — no separate O(df) HashSet just to test the (usually small)
+        // candidate set against the filter.
+        let postings = index.postings_for(field, value);
+        score.retain(|id, _| postings.binary_search_by_key(id, |&(d, _)| d).is_ok());
     }
 
     let top = score.values().copied().fold(0.0f32, f32::max);
@@ -410,6 +418,72 @@ mod tests {
         assert!(
             more_like_this(&m, 0, &p).is_empty(),
             "min_score above the normalized max must drop every hit"
+        );
+    }
+
+    #[test]
+    fn posting_budget_admits_terms_until_the_ceiling() {
+        // idx(): "zebra" df 1 (top), "the" df 6. A budget of 5 admits "zebra" (spent=1) but
+        // rejects "the" (1+6 > 5); a budget of 7 admits both (1+6 = 7).
+        let m = idx();
+        let mut p = params(&["body"]);
+
+        p.posting_budget = 5;
+        let five: Vec<String> = select_terms(&m, 0, &p)
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert_eq!(
+            five,
+            vec!["zebra".to_string()],
+            "budget 5 stops before 'the'"
+        );
+
+        p.posting_budget = 7;
+        let seven: Vec<String> = select_terms(&m, 0, &p)
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert!(
+            seven.contains(&"zebra".to_string()) && seven.contains(&"the".to_string()),
+            "budget 7 admits both: {seven:?}"
+        );
+    }
+
+    #[test]
+    fn empty_fields_yields_no_hits() {
+        // Forgetting `fields` (or passing none) selects no terms -> [] (same as "no match").
+        let m = sim_idx();
+        let p = params(&[]);
+        assert!(select_terms(&m, 0, &p).is_empty());
+        assert!(more_like_this(&m, 0, &p).is_empty());
+    }
+
+    #[test]
+    fn no_shared_terms_yields_no_hits() {
+        // Source doc's terms are unique to it, so after excluding the source the score map is
+        // empty (top == 0 branch) -> []. Guards the "nothing similar" path end to end.
+        let mut m = MemoryIndex::new();
+        for text in ["singular unique", "wholly different", "entirely separate"] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        assert!(more_like_this(&m, 0, &params(&["body"])).is_empty());
+    }
+
+    #[test]
+    fn absurd_timeout_does_not_panic() {
+        use std::time::Duration;
+        // A timeout so large that Instant::now() + it would overflow must not panic;
+        // checked_add yields None (no deadline) and the query runs to completion.
+        let m = sim_idx();
+        let mut p = params(&["body"]);
+        p.timeout = Some(Duration::from_secs(u64::MAX));
+        let ids: Vec<usize> = more_like_this(&m, 0, &p).iter().map(|h| h.id).collect();
+        assert!(
+            ids.contains(&1),
+            "runs fully despite absurd timeout: {ids:?}"
         );
     }
 }
