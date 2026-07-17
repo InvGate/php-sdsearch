@@ -5,6 +5,7 @@ pub mod distance;
 pub mod doc;
 pub mod index;
 pub mod mlt;
+pub mod prf;
 pub mod query;
 pub mod score;
 pub mod search;
