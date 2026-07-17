@@ -48,6 +48,12 @@ pub enum Query {
     Boolean {
         clauses: Vec<(Occur, Query)>,
     },
+    /// Score multiplier: evaluates `inner` and scales every score by `boost`.
+    /// Used to down-weight PRF feedback terms relative to the original query.
+    Boosted {
+        boost: f32,
+        inner: Box<Query>,
+    },
 }
 
 /// target fields of a leaf: the given one, or all indexed fields if None.
@@ -137,6 +143,13 @@ fn eval(
                 .collect()
         }
         Query::Boolean { clauses } => eval_boolean(index, clauses, weights, sim),
+        Query::Boosted { boost, inner } => {
+            let mut acc = eval(index, inner, weights, sim);
+            for s in acc.values_mut() {
+                *s *= *boost;
+            }
+            acc
+        }
     }
 }
 
@@ -880,6 +893,34 @@ mod tests {
             bm25[1].score,
             tfidf[1].score
         );
+    }
+
+    #[test]
+    fn boosted_multiplies_leaf_scores() {
+        // Boosted{boost, inner} must return inner's score map with every score * boost.
+        let idx = score_corpus();
+        let base = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
+        let plain = eval(&idx, &base, &HashMap::new(), Similarity::Bm25);
+        let boosted = eval(
+            &idx,
+            &Query::Boosted {
+                boost: 3.0,
+                inner: Box::new(base),
+            },
+            &HashMap::new(),
+            Similarity::Bm25,
+        );
+        assert_eq!(plain.len(), boosted.len());
+        for (id, s) in &plain {
+            assert!(
+                (boosted[id] - s * 3.0).abs() < 1e-6,
+                "id={id} plain={s} boosted={}",
+                boosted[id]
+            );
+        }
     }
 
     #[test]
