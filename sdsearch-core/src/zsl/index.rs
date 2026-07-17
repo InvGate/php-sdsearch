@@ -180,14 +180,8 @@ mod tests {
             .map(|d| f64::from(idx.field_len(d, "title")))
             .sum::<f64>()
             / n as f64;
-        // Tolerance is scaled to `manual`'s magnitude rather than a bare 1e-3: this fixture's
-        // real (SmallFloat-encoded) norm bytes decode, via the pre-existing (documented as
-        // approximate in zsl/writer/norms.rs) `decode_norm`, to values whose `approx_field_len`
-        // saturates near u32::MAX — an f32 cannot hold billions-scale integers to 1e-3 absolute
-        // precision. The relative check still catches a genuinely wrong aggregation.
-        let tolerance = 1e-3 * manual.abs().max(1.0);
         assert!(
-            (f64::from(avg) - manual).abs() < tolerance,
+            (f64::from(avg) - manual).abs() < 1e-3,
             "avg={avg} manual={manual}"
         );
     }
