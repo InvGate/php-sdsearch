@@ -62,20 +62,7 @@ impl Similarity {
     }
 }
 
-/// score of a doc given an already-computed idf, the term-freq, and the field length.
-/// Separates the per-term part (idf) from the per-doc part (tf, field_norm) to avoid
-/// recomputing idf/doc_freq on every posting.
-pub fn score_with_idf(idf: f32, term_freq: u32, field_len: u32) -> f32 {
-    if term_freq == 0 {
-        return 0.0;
-    }
-    let tf = (term_freq as f32).sqrt();
-    let field_norm = 1.0 / (field_len.max(1) as f32).sqrt();
-    tf * idf * idf * field_norm
-}
-
-/// tf-idf score of a (term, doc). Convenience for callers that score a single doc;
-/// the hot path uses `idf` + `score_with_idf` to hoist the idf per term.
+/// tf-idf score of a (term, doc) via the TfIdf similarity. Test/convenience helper.
 pub fn score_term(
     index: &impl IndexReader,
     field: &str,
@@ -83,11 +70,11 @@ pub fn score_term(
     doc_id: usize,
     term_freq: u32,
 ) -> f32 {
-    let idf = idf(
+    let idf = Similarity::TfIdf.idf(
         index.total_docs() as f32,
         index.doc_freq(field, term) as f32,
     );
-    score_with_idf(idf, term_freq, index.field_len(doc_id, field))
+    Similarity::TfIdf.score(idf, term_freq, index.field_len(doc_id, field), 1.0)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! and build_query: a port of Zend Lucene's boolean query builder for the surface the host application uses.
 
 use crate::index::IndexReader;
+use crate::score::Similarity;
 use crate::search::{
     Hit, accent_variant_terms, finalize, fuzzy_terms, phrase_scores, term_scores, union_scores,
     wildcard_terms,
@@ -74,7 +75,7 @@ fn eval(
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                for (id, s) in term_scores(index, &f, text) {
+                for (id, s) in term_scores(index, Similarity::Bm25, &f, text) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -86,7 +87,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = accent_variant_terms(index, &f, text);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, &f, &refs) {
+                for (id, s) in union_scores(index, Similarity::Bm25, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -102,7 +103,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, &f, &refs) {
+                for (id, s) in union_scores(index, Similarity::Bm25, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -119,7 +120,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, &f, &refs) {
+                for (id, s) in union_scores(index, Similarity::Bm25, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -128,7 +129,7 @@ fn eval(
         Query::Phrase { field, terms } => {
             let w = field_weight(weights, field);
             let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-            phrase_scores(index, field, &refs)
+            phrase_scores(index, Similarity::Bm25, field, &refs)
                 .into_iter()
                 .map(|(id, s)| (id, s * w))
                 .collect()
