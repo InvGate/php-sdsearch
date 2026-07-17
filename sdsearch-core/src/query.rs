@@ -866,6 +866,16 @@ mod tests {
         // top score is normalized to 1.0 under both similarities
         assert!((bm25[0].score - 1.0).abs() < 1e-6);
         assert!((tfidf[0].score - 1.0).abs() < 1e-6);
+        // The second hit's normalized score is where the algorithms diverge: BM25's tf
+        // saturation shrinks the high-tf short doc's dominance, so doc1 sits relatively
+        // higher under BM25 than under TF-IDF. If `sim` were ignored (always Bm25), these
+        // would be equal — so this assertion is what actually proves per-search selection works.
+        assert!(
+            bm25[1].score > tfidf[1].score,
+            "bm25[1]={} tfidf[1]={}",
+            bm25[1].score,
+            tfidf[1].score
+        );
     }
 
     #[test]
