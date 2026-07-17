@@ -47,6 +47,9 @@ struct ParamsDto {
     /// optional: per-field score multipliers (field -> weight). Omitted = {} (equal).
     #[serde(default)]
     field_weights: HashMap<String, f32>,
+    /// optional scoring algorithm: "bm25" (default) or "tfidf". Omitted = "bm25".
+    #[serde(default)]
+    similarity: Option<String>,
 }
 #[derive(Serialize)]
 struct HitDto {
@@ -153,6 +156,15 @@ fn occur_from(s: &str) -> Occur {
 fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
     let dto: ParamsDto =
         serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let similarity = match dto.similarity.as_deref() {
+        None | Some("bm25") => Similarity::Bm25,
+        Some("tfidf") => Similarity::TfIdf,
+        Some(other) => {
+            return Err(format!(
+                "sdsearch: unknown similarity {other:?} (expected \"bm25\" or \"tfidf\")"
+            ));
+        }
+    };
     let params = QueryParams {
         text: dto.text,
         where_groups: dto
@@ -177,9 +189,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         wildcard_min_prefix: 0,
         accent_insensitive: dto.accent_insensitive,
         field_weights: dto.field_weights,
-        // scoring algorithm selection is not yet exposed over the PHP boundary; Bm25 is
-        // the current default behavior (out of scope for this task).
-        similarity: Similarity::Bm25,
+        similarity,
     };
     let hits = search_index(
         Path::new(index_dir),
