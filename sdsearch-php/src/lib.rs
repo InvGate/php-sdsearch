@@ -10,10 +10,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
+use sdsearch_core::prf::PrfParams;
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
-use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
+use sdsearch_core::zsl::runner::{more_like_this_index, search_index, search_prf_index};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
 
 // ---- JSON contract with PHP ----
@@ -56,6 +57,65 @@ struct HitDto {
     id: u64,
     score: f32,
     fields: HashMap<String, String>,
+}
+
+fn default_prf_top_k() -> u64 {
+    5
+}
+fn default_prf_num_terms() -> u64 {
+    10
+}
+fn default_prf_feedback_weight() -> f32 {
+    0.3
+}
+fn default_prf_min_term_freq() -> u32 {
+    1
+}
+fn default_prf_min_doc_freq() -> u64 {
+    1
+}
+
+#[derive(Deserialize)]
+struct PrfDto {
+    #[serde(default = "default_prf_top_k")]
+    top_k: u64,
+    #[serde(default = "default_prf_num_terms")]
+    num_terms: u64,
+    #[serde(default = "default_prf_feedback_weight")]
+    feedback_weight: f32,
+    #[serde(default)]
+    fields: Vec<String>,
+    #[serde(default = "default_prf_min_term_freq")]
+    min_term_freq: u32,
+    #[serde(default = "default_prf_min_doc_freq")]
+    min_doc_freq: u64,
+    #[serde(default)]
+    max_doc_freq: Option<u64>,
+    #[serde(default)]
+    posting_budget: Option<u64>,
+}
+
+impl Default for PrfDto {
+    fn default() -> Self {
+        Self {
+            top_k: default_prf_top_k(),
+            num_terms: default_prf_num_terms(),
+            feedback_weight: default_prf_feedback_weight(),
+            fields: Vec::new(),
+            min_term_freq: default_prf_min_term_freq(),
+            min_doc_freq: default_prf_min_doc_freq(),
+            max_doc_freq: None,
+            posting_budget: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SemanticParamsDto {
+    #[serde(flatten)]
+    base: ParamsDto,
+    #[serde(default)]
+    prf: PrfDto,
 }
 
 fn default_min_term_freq() -> u32 {
@@ -151,11 +211,8 @@ fn occur_from(s: &str) -> Occur {
     }
 }
 
-/// fallible core: parses params, runs search_index, serializes hits. Errors are returned
-/// as String (the boundary converts them into PhpException).
-fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
-    let dto: ParamsDto =
-        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+/// Maps the shared search DTO into core `QueryParams` (used by both `run` and `run_semantic`).
+fn query_params_from(dto: &ParamsDto) -> Result<QueryParams, String> {
     let similarity = match dto.similarity.as_deref() {
         None | Some("bm25") => Similarity::Bm25,
         Some("tfidf") => Similarity::TfIdf,
@@ -165,37 +222,80 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
             ));
         }
     };
-    let params = QueryParams {
-        text: dto.text,
+    Ok(QueryParams {
+        text: dto.text.clone(),
         where_groups: dto
             .r#where
-            .into_iter()
+            .iter()
             .map(|w| WhereGroup {
-                field: w.field,
-                values: w.values,
+                field: w.field.clone(),
+                values: w.values.clone(),
                 occur: occur_from(&w.occur),
             })
             .collect(),
         in_groups: dto
             .r#in
-            .into_iter()
+            .iter()
             .map(|i| InGroup {
-                field: i.field,
-                values: i.values,
+                field: i.field.clone(),
+                values: i.values.clone(),
             })
             .collect(),
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
         accent_insensitive: dto.accent_insensitive,
-        field_weights: dto.field_weights,
+        field_weights: dto.field_weights.clone(),
         similarity,
-    };
+    })
+}
+
+/// fallible core: parses params, runs search_index, serializes hits. Errors are returned
+/// as String (the boundary converts them into PhpException).
+fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: ParamsDto =
+        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let params = query_params_from(&dto)?;
     let hits = search_index(
         Path::new(index_dir),
         &params,
         dto.min_score,
         dto.limit as usize,
+    )
+    .map_err(|e| format!("sdsearch: {e}"))?;
+    let out: Vec<HitDto> = hits
+        .into_iter()
+        .map(|h| HitDto {
+            id: h.id as u64,
+            score: h.score,
+            fields: h.fields,
+        })
+        .collect();
+    serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
+}
+
+/// fallible core of `Engine::semantic_query`: parses the search DTO + optional `prf`
+/// object, runs the two-pass PRF search, serializes hits. Errors as String.
+fn run_semantic(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: SemanticParamsDto =
+        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let params = query_params_from(&dto.base)?;
+    let prf = PrfParams {
+        top_k: dto.prf.top_k as usize,
+        num_terms: dto.prf.num_terms as usize,
+        feedback_weight: dto.prf.feedback_weight,
+        fields: dto.prf.fields,
+        min_term_freq: dto.prf.min_term_freq,
+        min_doc_freq: dto.prf.min_doc_freq as usize,
+        max_doc_freq: dto.prf.max_doc_freq.map(|v| v as usize),
+        posting_budget: dto.prf.posting_budget.map(|v| v as usize),
+    };
+    let hits = search_prf_index(
+        Path::new(index_dir),
+        &params,
+        &prf,
+        dto.base.min_score,
+        dto.base.limit as usize,
     )
     .map_err(|e| format!("sdsearch: {e}"))?;
     let out: Vec<HitDto> = hits
@@ -306,6 +406,19 @@ impl Engine {
             Ok(Err(msg)) => Err(PhpException::default(msg)),
             Err(_) => Err(PhpException::default(
                 "sdsearch: panic during more_like_this".to_string(),
+            )),
+        }
+    }
+
+    /// Semantic search via two-pass pseudo-relevance feedback. Same params object as
+    /// `search`, plus an optional `"prf"` object. Panic-safe boundary, like `search`.
+    pub fn semantic_query(&self, index_dir: String, params_json: String) -> PhpResult<String> {
+        let result = catch_unwind(AssertUnwindSafe(|| run_semantic(&index_dir, &params_json)));
+        match result {
+            Ok(Ok(json)) => Ok(json),
+            Ok(Err(msg)) => Err(PhpException::default(msg)),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic during semantic_query".to_string(),
             )),
         }
     }

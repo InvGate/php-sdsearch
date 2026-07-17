@@ -136,6 +136,44 @@ namespace SdSearch {
          *                    internal engine error.
          */
         public function more_like_this(string $indexDir, string $paramsJson): string {}
+
+        /**
+         * Semantic search via two-pass pseudo-relevance feedback (PRF): runs `$paramsJson`
+         * as a normal {@see Engine::search()} query, harvests feedback terms from the
+         * top hits, then re-runs an augmented query for the final result.
+         *
+         * `$paramsJson` accepts the SAME object as {@see Engine::search()}, plus an optional
+         * `"prf"` object (all keys optional, defaults shown):
+         * ```json
+         * {
+         *   "text": "free text query",
+         *   "prf": {
+         *     "top_k": 5,
+         *     "num_terms": 10,
+         *     "feedback_weight": 0.3,
+         *     "fields": [],
+         *     "min_term_freq": 1,
+         *     "min_doc_freq": 1,
+         *     "max_doc_freq": null,
+         *     "posting_budget": null
+         *   }
+         * }
+         * ```
+         * - `prf.top_k`: number of top pass-1 hits treated as pseudo-relevant.
+         * - `prf.num_terms`: max feedback terms added to the augmented query.
+         * - `prf.feedback_weight`: score multiplier for the feedback-term subtree.
+         * - `prf.fields` (optional, default `[]`): source fields to harvest terms from;
+         *   empty = all indexed fields.
+         *
+         * Returns the same JSON hit array shape as {@see Engine::search()}.
+         *
+         * @param string $indexDir   Path to the ZSL index directory.
+         * @param string $paramsJson JSON-encoded query parameters + optional `prf` object (see above).
+         * @return string JSON-encoded array of hits (see {@see Engine::search()}).
+         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
+         *                    internal engine error.
+         */
+        public function semantic_query(string $indexDir, string $paramsJson): string {}
     }
 
     /**
