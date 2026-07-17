@@ -64,18 +64,20 @@ fn field_weight(weights: &HashMap<String, f32>, field: &str) -> f32 {
 }
 
 /// evaluates a query to a doc_id -> score map (without filtering min_score or truncating).
-/// `weights` scales each field's leaf contribution (see `field_weight`).
+/// `weights` scales each field's leaf contribution (see `field_weight`); `sim` selects the
+/// scoring algorithm applied at every leaf.
 fn eval(
     index: &impl IndexReader,
     q: &Query,
     weights: &HashMap<String, f32>,
+    sim: Similarity,
 ) -> HashMap<usize, f32> {
     match q {
         Query::Term { field, text } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                for (id, s) in term_scores(index, Similarity::Bm25, &f, text) {
+                for (id, s) in term_scores(index, sim, &f, text) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -87,7 +89,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = accent_variant_terms(index, &f, text);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, Similarity::Bm25, &f, &refs) {
+                for (id, s) in union_scores(index, sim, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -103,7 +105,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, Similarity::Bm25, &f, &refs) {
+                for (id, s) in union_scores(index, sim, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -120,7 +122,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, Similarity::Bm25, &f, &refs) {
+                for (id, s) in union_scores(index, sim, &f, &refs) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -129,12 +131,12 @@ fn eval(
         Query::Phrase { field, terms } => {
             let w = field_weight(weights, field);
             let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-            phrase_scores(index, Similarity::Bm25, field, &refs)
+            phrase_scores(index, sim, field, &refs)
                 .into_iter()
                 .map(|(id, s)| (id, s * w))
                 .collect()
         }
-        Query::Boolean { clauses } => eval_boolean(index, clauses, weights),
+        Query::Boolean { clauses } => eval_boolean(index, clauses, weights, sim),
     }
 }
 
@@ -144,21 +146,22 @@ fn eval_boolean(
     index: &impl IndexReader,
     clauses: &[(Occur, Query)],
     weights: &HashMap<String, f32>,
+    sim: Similarity,
 ) -> HashMap<usize, f32> {
     let musts: Vec<HashMap<usize, f32>> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::Must)
-        .map(|(_, q)| eval(index, q, weights))
+        .map(|(_, q)| eval(index, q, weights, sim))
         .collect();
     let shoulds: Vec<HashMap<usize, f32>> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::Should)
-        .map(|(_, q)| eval(index, q, weights))
+        .map(|(_, q)| eval(index, q, weights, sim))
         .collect();
     let mustnots: Vec<HashMap<usize, f32>> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::MustNot)
-        .map(|(_, q)| eval(index, q, weights))
+        .map(|(_, q)| eval(index, q, weights, sim))
         .collect();
 
     // accumulated score and matched (should+must) clauses per doc, for the coord.
@@ -229,20 +232,29 @@ fn eval_boolean(
 /// boolean (top) level; the leaves in `search.rs` score raw, because normalizing per leaf
 /// would distort the boolean composition.
 pub fn search(index: &impl IndexReader, query: &Query, min_score: f32, limit: usize) -> Vec<Hit> {
-    search_with_weights(index, query, &HashMap::new(), min_score, limit)
+    search_with_weights(
+        index,
+        query,
+        &HashMap::new(),
+        Similarity::Bm25,
+        min_score,
+        limit,
+    )
 }
 
 /// like `search`, but applies per-field score multipliers (`weights`, field -> factor;
-/// missing = 1.0). The multiplier is applied at the leaves, BEFORE the top-hit→1.0
-/// normalization, so it only reorders and keeps the `min_score` scale intact.
+/// missing = 1.0) and a selectable scoring algorithm (`sim`). The multiplier is applied at
+/// the leaves, BEFORE the top-hit→1.0 normalization, so it only reorders and keeps the
+/// `min_score` scale intact.
 pub fn search_with_weights(
     index: &impl IndexReader,
     query: &Query,
     weights: &HashMap<String, f32>,
+    sim: Similarity,
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    let scored = eval(index, query, weights);
+    let scored = eval(index, query, weights, sim);
     let top = scored.values().copied().fold(0.0f32, f32::max);
     let normalized: Vec<(usize, f32)> = if top > 0.0 {
         scored.into_iter().map(|(id, s)| (id, s / top)).collect()
@@ -266,6 +278,7 @@ pub struct InGroup {
 }
 
 /// parameters of a host-application search (the supported surface).
+#[derive(Default)]
 pub struct QueryParams {
     pub text: String,
     pub where_groups: Vec<WhereGroup>,
@@ -279,6 +292,8 @@ pub struct QueryParams {
     /// optional per-field score multipliers (field -> weight); missing field = 1.0.
     /// Empty map = every field weighted equally (current behavior).
     pub field_weights: HashMap<String, f32>,
+    /// scoring algorithm; defaults to Bm25.
+    pub similarity: Similarity,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -562,10 +577,11 @@ mod tests {
             m
         };
         // weighting `title` heavily brings the title doc (0) to the top...
-        let hits = search_with_weights(&idx, &q, &weight("title", 10.0), 0.0, 100);
+        let hits =
+            search_with_weights(&idx, &q, &weight("title", 10.0), Similarity::Bm25, 0.0, 100);
         assert_eq!(hits[0].id, 0);
         // ...and weighting `body` flips it to the body doc (1).
-        let hits = search_with_weights(&idx, &q, &weight("body", 10.0), 0.0, 100);
+        let hits = search_with_weights(&idx, &q, &weight("body", 10.0), Similarity::Bm25, 0.0, 100);
         assert_eq!(hits[0].id, 1);
     }
 
@@ -576,7 +592,7 @@ mod tests {
             field: None,
             text: "vpn".into(),
         };
-        let weighted = search_with_weights(&idx, &q, &HashMap::new(), 0.0, 100);
+        let weighted = search_with_weights(&idx, &q, &HashMap::new(), Similarity::Bm25, 0.0, 100);
         let plain = search(&idx, &q, 0.0, 100);
         let w_ids: Vec<usize> = weighted.iter().map(|h| h.id).collect();
         let p_ids: Vec<usize> = plain.iter().map(|h| h.id).collect();
@@ -674,6 +690,7 @@ mod tests {
             wildcard_min_prefix: 0,
             accent_insensitive: false,
             field_weights: HashMap::new(),
+            similarity: Similarity::Bm25,
         }
     }
 
@@ -817,6 +834,48 @@ mod tests {
             "resto en (0,1), got {}",
             hits[1].score
         );
+    }
+
+    #[test]
+    fn bm25_and_tfidf_can_rank_differently() {
+        // doc0 "vpn vpn vpn" (tf=3, len=3); doc1 "vpn a b c d e f g" (tf=1, len=8).
+        // TF-IDF (sqrt(tf), unsaturated) favors the high-tf short doc even more than
+        // BM25 does; both must return both docs, on the normalized [0,1] scale.
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
+        let bm25 = search_with_weights(
+            &score_corpus(),
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            100,
+        );
+        let tfidf = search_with_weights(
+            &score_corpus(),
+            &q,
+            &HashMap::new(),
+            Similarity::TfIdf,
+            0.0,
+            100,
+        );
+        assert_eq!(bm25.len(), 2);
+        assert_eq!(tfidf.len(), 2);
+        // top score is normalized to 1.0 under both similarities
+        assert!((bm25[0].score - 1.0).abs() < 1e-6);
+        assert!((tfidf[0].score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_query_params_use_bm25() {
+        // building QueryParams with ..Default::default() yields Bm25
+        let p = QueryParams {
+            text: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.similarity, Similarity::Bm25);
     }
 
     #[test]

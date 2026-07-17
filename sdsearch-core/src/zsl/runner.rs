@@ -22,10 +22,24 @@ pub fn search_index(
     let index = ZslIndex::open(index_dir)?;
     let query = build_query(params)?;
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let mut hits = search_with_weights(&index, &query, &params.field_weights, min_score, lim);
+    let mut hits = search_with_weights(
+        &index,
+        &query,
+        &params.field_weights,
+        params.similarity,
+        min_score,
+        lim,
+    );
     if hits.is_empty() {
         if let Some(fb) = fallback_query(&params.text) {
-            hits = search_with_weights(&index, &fb, &params.field_weights, min_score, lim);
+            hits = search_with_weights(
+                &index,
+                &fb,
+                &params.field_weights,
+                params.similarity,
+                min_score,
+                lim,
+            );
         }
     }
     Ok(hits)
@@ -73,6 +87,7 @@ fn resolve_reference_doc(
         wildcard_min_prefix: 0,
         accent_insensitive: false,
         field_weights: std::collections::HashMap::new(),
+        similarity: crate::score::Similarity::Bm25,
     };
     let query = build_query(&params)?;
     let hits = search(index, &query, 0.0, 1);
@@ -116,6 +131,7 @@ mod tests {
             wildcard_min_prefix: 0,
             accent_insensitive: false,
             field_weights: std::collections::HashMap::new(),
+            similarity: crate::score::Similarity::Bm25,
         }
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {

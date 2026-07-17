@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
+use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
@@ -176,6 +177,9 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         wildcard_min_prefix: 0,
         accent_insensitive: dto.accent_insensitive,
         field_weights: dto.field_weights,
+        // scoring algorithm selection is not yet exposed over the PHP boundary; Bm25 is
+        // the current default behavior (out of scope for this task).
+        similarity: Similarity::Bm25,
     };
     let hits = search_index(
         Path::new(index_dir),
@@ -372,6 +376,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         wildcard_min_prefix: 0,
         accent_insensitive: false,
         field_weights: HashMap::new(),
+        similarity: Similarity::Bm25,
     };
     let query = build_query(&params).map_err(|e| format!("sdsearch: build_query: {e}"))?;
     let hits = search(index, &query, 0.0, 1);

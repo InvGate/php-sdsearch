@@ -51,6 +51,7 @@ fn base(text: &str) -> QueryParams {
         wildcard_min_prefix: 0,
         accent_insensitive: false,
         field_weights: std::collections::HashMap::new(),
+        similarity: sdsearch_core::score::Similarity::Bm25,
     }
 }
 
