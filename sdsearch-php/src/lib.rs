@@ -285,6 +285,8 @@ fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
         accent_insensitive: dto.accent_insensitive,
+        // TODO(task 6): wire this to a DTO field once the PHP surface exposes it.
+        synonyms: false,
         field_weights: dto.field_weights,
         similarity,
     })
@@ -579,6 +581,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
         accent_insensitive: false,
+        synonyms: false,
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
     };

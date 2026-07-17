@@ -306,6 +306,10 @@ pub struct QueryParams {
     /// when true, the per-token text clauses become accent-insensitive (Spanish):
     /// `avion` also matches `avión` and vice-versa. Off = current ZSL behavior.
     pub accent_insensitive: bool,
+    /// when true, each analyzed query token is additionally expanded with its
+    /// bundled synonyms/translations (cross-lingual ES↔EN), each added as a
+    /// down-weighted `Should` clause. Off = current behavior. See `synonyms.rs`.
+    pub synonyms: bool,
     /// optional per-field score multipliers (field -> weight); missing field = 1.0.
     /// Empty map = every field weighted equally (current behavior).
     pub field_weights: HashMap<String, f32>,
@@ -331,10 +335,20 @@ impl std::fmt::Display for QueryError {
 }
 impl std::error::Error for QueryError {}
 
+/// Score multiplier applied to every expanded (non-literal) synonym term. A synonym
+/// is weaker evidence than the literal token the user typed, so it ranks below it.
+pub const SYNONYM_BOOST: f32 = 0.6;
+
 /// text subtree (port of the host's fuzzy-text subquery builder): per-word fuzzy + phrase
 /// fuzzy + prefix wildcard (all over the lowercased and escaped text), plus the
 /// QueryParser::parse piece (one all-fields term per ANALYZER token over the RAW text). All Should.
 fn text_subquery(p: &QueryParams) -> Query {
+    text_subquery_with_dict(p, crate::synonyms::global())
+}
+
+/// Testable core of `text_subquery`: takes the synonym dictionary explicitly so
+/// unit tests can inject a fixture instead of the bundled global.
+fn text_subquery_with_dict(p: &QueryParams, dict: &crate::synonyms::SynonymDict) -> Query {
     let lc = p.text.to_lowercase();
     // escaping mirrors the host's query builder: str_replace ':', ',', '-' -> '\:', '\,', '\-'.
     let esc = lc
@@ -378,18 +392,25 @@ fn text_subquery(p: &QueryParams) -> Query {
     // one all-fields term (default-OR) per token. With accent_insensitive on, the
     // per-token clause becomes an AccentTerm so `avion` also reaches `avión`.
     for tok in crate::analysis::analyze(&p.text) {
-        let leaf = if p.accent_insensitive {
-            Query::AccentTerm {
-                field: None,
-                text: tok,
-            }
-        } else {
-            Query::Term {
-                field: None,
-                text: tok,
+        let leaf = |text: String| {
+            if p.accent_insensitive {
+                Query::AccentTerm { field: None, text }
+            } else {
+                Query::Term { field: None, text }
             }
         };
-        clauses.push((Occur::Should, leaf));
+        clauses.push((Occur::Should, leaf(tok.clone())));
+        if p.synonyms {
+            for syn in dict.expand(&tok) {
+                clauses.push((
+                    Occur::Should,
+                    Query::Boosted {
+                        boost: SYNONYM_BOOST,
+                        inner: Box::new(leaf(syn.clone())),
+                    },
+                ));
+            }
+        }
     }
     Query::Boolean { clauses }
 }
@@ -528,6 +549,7 @@ mod tests {
         match q {
             Query::AccentTerm { .. } => true,
             Query::Boolean { clauses } => clauses.iter().any(|(_, c)| query_has_accent_term(c)),
+            Query::Boosted { inner, .. } => query_has_accent_term(inner),
             _ => false,
         }
     }
@@ -706,6 +728,7 @@ mod tests {
             fuzzy_prefix_len: 3,
             wildcard_min_prefix: 0,
             accent_insensitive: false,
+            synonyms: false,
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
         }
@@ -940,5 +963,53 @@ mod tests {
             search(&score_corpus(), &q, 1.0001, 100).is_empty(),
             "no normalized score should exceed 1.0"
         );
+    }
+
+    fn count_boosted_terms(q: &Query, boost: f32) -> usize {
+        match q {
+            Query::Boosted { boost: b, .. } if (*b - boost).abs() < f32::EPSILON => 1,
+            Query::Boolean { clauses } => clauses
+                .iter()
+                .map(|(_, c)| count_boosted_terms(c, boost))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn synonyms_off_adds_no_boosted_clauses() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
+        let p = params("laptop"); // synonyms defaults to false in the helper
+        let q = text_subquery_with_dict(&p, &dict);
+        assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 0);
+    }
+
+    #[test]
+    fn synonyms_on_adds_one_boosted_should_per_expansion() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook", "portátil"])]);
+        let mut p = params("laptop");
+        p.synonyms = true;
+        let q = text_subquery_with_dict(&p, &dict);
+        assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 2);
+    }
+
+    #[test]
+    fn synonym_leaf_is_plain_term_when_accents_off() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
+        let mut p = params("laptop");
+        p.synonyms = true; // accent_insensitive stays false
+        let q = text_subquery_with_dict(&p, &dict);
+        assert!(!query_has_accent_term(&q));
+    }
+
+    #[test]
+    fn synonym_leaf_is_accent_term_when_accents_on() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
+        let mut p = params("laptop");
+        p.synonyms = true;
+        p.accent_insensitive = true;
+        let q = text_subquery_with_dict(&p, &dict);
+        // the boosted synonym clause must contain an AccentTerm
+        assert!(query_has_accent_term(&q));
     }
 }

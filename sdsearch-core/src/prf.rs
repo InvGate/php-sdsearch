@@ -178,6 +178,7 @@ mod tests {
             fuzzy_prefix_len: 3,
             wildcard_min_prefix: 0,
             accent_insensitive: false,
+            synonyms: false,
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
         }
