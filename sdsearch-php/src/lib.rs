@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
+use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
@@ -46,6 +47,9 @@ struct ParamsDto {
     /// optional: per-field score multipliers (field -> weight). Omitted = {} (equal).
     #[serde(default)]
     field_weights: HashMap<String, f32>,
+    /// optional scoring algorithm: "bm25" (default) or "tfidf". Omitted = "bm25".
+    #[serde(default)]
+    similarity: Option<String>,
 }
 #[derive(Serialize)]
 struct HitDto {
@@ -152,6 +156,15 @@ fn occur_from(s: &str) -> Occur {
 fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
     let dto: ParamsDto =
         serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let similarity = match dto.similarity.as_deref() {
+        None | Some("bm25") => Similarity::Bm25,
+        Some("tfidf") => Similarity::TfIdf,
+        Some(other) => {
+            return Err(format!(
+                "sdsearch: unknown similarity {other:?} (expected \"bm25\" or \"tfidf\")"
+            ));
+        }
+    };
     let params = QueryParams {
         text: dto.text,
         where_groups: dto
@@ -176,6 +189,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         wildcard_min_prefix: 0,
         accent_insensitive: dto.accent_insensitive,
         field_weights: dto.field_weights,
+        similarity,
     };
     let hits = search_index(
         Path::new(index_dir),
@@ -372,6 +386,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         wildcard_min_prefix: 0,
         accent_insensitive: false,
         field_weights: HashMap::new(),
+        similarity: Similarity::Bm25,
     };
     let query = build_query(&params).map_err(|e| format!("sdsearch: build_query: {e}"))?;
     let hits = search(index, &query, 0.0, 1);

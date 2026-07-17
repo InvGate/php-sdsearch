@@ -82,6 +82,22 @@ impl IndexReader for ZslIndex {
         }
     }
 
+    fn avg_field_len(&self, field: &str) -> f32 {
+        // weighted mean: each segment's avg * its doc count, over the total doc count.
+        // (seg.avg_field_len is over the segment's max_doc, so weight by max_doc.)
+        let mut total_len = 0.0f64;
+        let mut total_docs = 0usize;
+        for e in &self.entries {
+            total_len += f64::from(e.seg.avg_field_len(field)) * e.max_doc as f64;
+            total_docs += e.max_doc;
+        }
+        if total_docs == 0 || total_len == 0.0 {
+            1.0
+        } else {
+            (total_len / total_docs as f64) as f32
+        }
+    }
+
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
         match self.locate(doc_id) {
             Some((e, local)) => e.seg.stored_fields(local),
@@ -150,5 +166,55 @@ mod tests {
         // stored routing: the same doc returns the same id_key
         let d0 = idx.postings_for("title", "vpn")[0].0;
         assert_eq!(idx.stored_fields(d0), seg.stored_fields(d0));
+    }
+
+    #[test]
+    fn zsl_index_avg_field_len_positive_and_matches_manual() {
+        let idx = ZslIndex::open(&kb()).unwrap();
+        let avg = idx.avg_field_len("title");
+        assert!(avg >= 1.0, "avg must be at least 1.0, got {avg}");
+
+        // manual average over every live+deleted doc's field_len must match the reader.
+        let n = idx.total_docs();
+        let manual: f64 = (0..n)
+            .map(|d| f64::from(idx.field_len(d, "title")))
+            .sum::<f64>()
+            / n as f64;
+        assert!(
+            (f64::from(avg) - manual).abs() < 1e-3,
+            "avg={avg} manual={manual}"
+        );
+    }
+
+    #[test]
+    fn zsl_index_avg_field_len_aggregates_across_segments() {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ));
+        let idx = ZslIndex::open(&dir).unwrap();
+        // must be multi-segment, or the weighted-mean path isn't exercised
+        assert!(
+            idx.entries.len() > 1,
+            "fixture must be multi-segment, got {}",
+            idx.entries.len()
+        );
+        let field = idx
+            .indexed_fields()
+            .into_iter()
+            .next()
+            .expect("an indexed field");
+        let avg = idx.avg_field_len(&field);
+        assert!(avg >= 1.0, "avg must be >= 1.0, got {avg}");
+        // the weighted mean must equal the manual average of field_len over all docs
+        let n = idx.total_docs();
+        let manual: f64 = (0..n)
+            .map(|d| f64::from(idx.field_len(d, &field)))
+            .sum::<f64>()
+            / n as f64;
+        assert!(
+            (f64::from(avg) - manual).abs() < 1e-3,
+            "avg={avg} manual={manual} field={field}"
+        );
     }
 }

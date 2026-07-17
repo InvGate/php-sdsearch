@@ -1,5 +1,5 @@
 //! ZslSegment: implements IndexReader over a single-segment ZSL index.
-use crate::index::IndexReader;
+use crate::index::{IndexReader, sampled_avg_field_len};
 use crate::zsl::cfs::CompoundFile;
 use crate::zsl::deletes::DeletedDocs;
 use crate::zsl::fields::{FieldInfo, read_field_infos};
@@ -17,6 +17,9 @@ pub struct ZslSegment {
     fields: Vec<FieldInfo>,
     dict: TermDict,
     norms: HashMap<String, Vec<u8>>,
+    /// per-field average length over num_docs_total, precomputed once at open from
+    /// the norm bytes already in RAM (folded into the open path; no per-query cost).
+    avg_field_len: HashMap<String, f32>,
     deletes: DeletedDocs,
     cfs: CompoundFile,
     fdx_name: String,
@@ -183,6 +186,17 @@ impl ZslSegment {
             Some(n) => read_norms(cfs.sub(&n).unwrap(), &indexed, num_docs_total),
             None => HashMap::new(),
         };
+        // Bounded sample, NOT an O(num_docs) fold: this reader opens per request, so an
+        // O(N) pass here would tax every low-hit query (see `sampled_avg_field_len`).
+        let avg_field_len = norms
+            .iter()
+            .map(|(field, bytes)| {
+                (
+                    field.clone(),
+                    sampled_avg_field_len(bytes.len(), |i| approx_field_len(bytes[i])),
+                )
+            })
+            .collect::<HashMap<String, f32>>();
 
         // .del lives OUTSIDE the .cfs; we load it only if the file exists. A corrupt or
         // unsupported (sparse) .del surfaces as an error at open time rather than a crash.
@@ -208,6 +222,7 @@ impl ZslSegment {
             fields,
             dict,
             norms,
+            avg_field_len,
             deletes,
             cfs,
             fdx_name,
@@ -251,6 +266,10 @@ impl IndexReader for ZslSegment {
             .get(field)
             .and_then(|v| v.get(doc_id))
             .map_or(1, |b| approx_field_len(*b))
+    }
+
+    fn avg_field_len(&self, field: &str) -> f32 {
+        self.avg_field_len.get(field).copied().unwrap_or(1.0)
     }
 
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
@@ -353,6 +372,17 @@ mod tests {
             s.stored_fields(0).get("id_key").map(String::as_str),
             Some("165")
         );
+    }
+
+    #[test]
+    fn zsl_segment_avg_field_len_is_precomputed_positive() {
+        use std::path::PathBuf;
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        let s = ZslSegment::open(&dir).unwrap();
+        assert!(s.avg_field_len("title") >= 1.0);
     }
 
     #[test]

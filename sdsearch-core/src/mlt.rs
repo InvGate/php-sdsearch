@@ -3,7 +3,7 @@
 
 use crate::analysis::analyze;
 use crate::index::IndexReader;
-use crate::score::idf;
+use crate::score::{Similarity, idf};
 use crate::search::{Hit, finalize, term_scores};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -195,7 +195,9 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
             }
         }
         let w = weight_of(&p.field_weights, &s.field);
-        for (id, sc) in term_scores(index, &s.field, &s.term) {
+        // MLT keeps its legacy TF-IDF scoring (out of scope for the BM25 feature); the
+        // configurable Similarity applies to the main search path only.
+        for (id, sc) in term_scores(index, Similarity::TfIdf, &s.field, &s.term) {
             *score.entry(id).or_insert(0.0) += sc * w;
             if track_msm {
                 *matched.entry(id).or_insert(0) += 1;

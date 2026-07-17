@@ -20,14 +20,14 @@ pub fn read_norms(
 }
 
 /// Decodes Lucene's norm byte-float (SmallFloat / Similarity::decodeNorm).
-/// byte -> float; then field_len ≈ 1/norm² (inverse of encodeNorm(1/sqrt(len))).
+/// `byte b>0 -> f32::from_bits((b << 21) + 0x30000000)`. The `0x30000000` term is the
+/// exponent bias (48 << 24); omitting it saturated `approx_field_len` to u32::MAX.
+/// Byte-exact inverse of `zsl/writer/norms.rs` NORM_TABLE.
 pub fn decode_norm(b: u8) -> f32 {
     if b == 0 {
         return 0.0;
     }
-    let mantissa = u32::from(b & 0x07);
-    let exponent = u32::from((b >> 3) & 0x1F);
-    let bits = (exponent << 24) | (mantissa << 21);
+    let bits = (u32::from(b) << 21).wrapping_add(0x3000_0000);
     f32::from_bits(bits)
 }
 
@@ -59,5 +59,28 @@ mod tests {
     fn approx_field_len_is_positive() {
         // a valid norm byte decodes to a length >= 1
         assert!(approx_field_len(0x7C) >= 1);
+    }
+
+    #[test]
+    fn decode_norm_has_the_smallfloat_bias() {
+        // In ZSL's SmallFloat table, byte 124 == 1.0 and byte 120 == 0.5
+        // (see zsl/writer/norms.rs NORM_TABLE / encode_norm tests).
+        assert!(
+            (decode_norm(124) - 1.0).abs() < 1e-6,
+            "got {}",
+            decode_norm(124)
+        );
+        assert!(
+            (decode_norm(120) - 0.5).abs() < 1e-6,
+            "got {}",
+            decode_norm(120)
+        );
+    }
+
+    #[test]
+    fn approx_field_len_recovers_small_token_counts() {
+        // decode(124)=1.0 => 1/1^2 = 1 token; decode(120)=0.5 => 1/0.5^2 = 4 tokens.
+        assert_eq!(approx_field_len(124), 1);
+        assert_eq!(approx_field_len(120), 4);
     }
 }

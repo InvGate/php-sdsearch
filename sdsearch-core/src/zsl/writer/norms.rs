@@ -3,8 +3,10 @@
 //! The byte = `encodeNorm(lengthNorm(numTerms) · docBoost)` (ZSL's SmallFloat);
 //! a field absent/empty in a doc => `lengthNorm(0)` => byte 255.
 //!
-//! NOTE: `zsl::norms::decode_norm` is APPROXIMATE (it misses the SmallFloat bias), so it
-//! is NOT usable to derive the encode. Here we replicate ZSL's REAL SmallFloat:
+//! NOTE: `zsl::norms::decode_norm` now applies the correct SmallFloat exponent bias and is
+//! the exact byte-for-byte inverse of the `NORM_TABLE` below (SmallFloat itself is still an
+//! 8-bit lossy quantization of the length — that imprecision is inherent to the format, not
+//! a bug in the decode). Here we replicate ZSL's REAL SmallFloat:
 //! `byte b>0 -> f32::from_bits((b<<21) + 0x30000000)`, and `_floatToByte` (binary search +
 //! round to nearest) identical to `Zend_Search_Lucene_Search_Similarity`.
 

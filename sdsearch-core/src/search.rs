@@ -9,7 +9,7 @@
 
 use crate::distance::levenshtein_bytes;
 use crate::index::IndexReader;
-use crate::score::{idf, score_with_idf};
+use crate::score::Similarity;
 use std::collections::HashMap;
 
 pub struct Hit {
@@ -20,18 +20,24 @@ pub struct Hit {
 
 /// raw scores (doc_id, score) of a term in a field. No sort/filter/hydration.
 /// The idf is computed ONCE (constant over the posting list), not per doc.
-pub(crate) fn term_scores(index: &impl IndexReader, field: &str, term: &str) -> Vec<(usize, f32)> {
-    let idf = idf(
+pub(crate) fn term_scores(
+    index: &impl IndexReader,
+    sim: Similarity,
+    field: &str,
+    term: &str,
+) -> Vec<(usize, f32)> {
+    let idf = sim.idf(
         index.total_docs() as f32,
         index.doc_freq(field, term) as f32,
     );
+    let avg = index.avg_field_len(field);
     index
         .postings_for(field, term)
         .into_iter()
         .map(|(doc_id, tf)| {
             (
                 doc_id,
-                score_with_idf(idf, tf, index.field_len(doc_id, field)),
+                sim.score(idf, tf, index.field_len(doc_id, field), avg),
             )
         })
         .collect()
@@ -41,18 +47,20 @@ pub(crate) fn term_scores(index: &impl IndexReader, field: &str, term: &str) -> 
 /// idf hoisted per term.
 pub(crate) fn union_scores(
     index: &impl IndexReader,
+    sim: Similarity,
     field: &str,
     terms: &[&str],
 ) -> HashMap<usize, f32> {
     let mut scored: HashMap<usize, f32> = HashMap::new();
+    let avg = index.avg_field_len(field);
     for term in terms {
-        let idf = idf(
+        let idf = sim.idf(
             index.total_docs() as f32,
             index.doc_freq(field, term) as f32,
         );
         for (doc_id, tf) in index.postings_for(field, term) {
             *scored.entry(doc_id).or_insert(0.0) +=
-                score_with_idf(idf, tf, index.field_len(doc_id, field));
+                sim.score(idf, tf, index.field_len(doc_id, field), avg);
         }
     }
     scored
@@ -154,6 +162,7 @@ pub(crate) fn fuzzy_terms(
 /// positions (p, p+1, ...) and in order, in the same field/doc.
 pub(crate) fn phrase_scores(
     index: &impl IndexReader,
+    sim: Similarity,
     field: &str,
     terms: &[&str],
 ) -> HashMap<usize, f32> {
@@ -161,13 +170,14 @@ pub(crate) fn phrase_scores(
     if terms.is_empty() {
         return scored;
     }
+    let avg = index.avg_field_len(field);
     // decode doc->positions of each term ONCE (avoids re-walking the posting per doc),
     // and hoist the idf per term.
     let per_term: Vec<(HashMap<usize, Vec<u32>>, f32)> = terms
         .iter()
         .map(|t| {
             let positions = index.positions_all(field, t);
-            let idf = idf(index.total_docs() as f32, index.doc_freq(field, t) as f32);
+            let idf = sim.idf(index.total_docs() as f32, index.doc_freq(field, t) as f32);
             (positions, idf)
         })
         .collect();
@@ -194,7 +204,7 @@ pub(crate) fn phrase_scores(
             let s: f32 = (0..terms.len())
                 .map(|i| {
                     let tf = per_term[i].0.get(&doc).map_or(0, |v| v.len() as u32);
-                    score_with_idf(per_term[i].1, tf, index.field_len(doc, field))
+                    sim.score(per_term[i].1, tf, index.field_len(doc, field), avg)
                 })
                 .sum();
             scored.insert(doc, s);
@@ -239,7 +249,12 @@ pub fn term_query(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    finalize(index, term_scores(index, field, term), min_score, limit)
+    finalize(
+        index,
+        term_scores(index, Similarity::Bm25, field, term),
+        min_score,
+        limit,
+    )
 }
 
 /// MultiTerm: union of docs matching any term of the field (scores summed).
@@ -250,7 +265,12 @@ pub fn multi_term_query(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    finalize(index, union_scores(index, field, terms), min_score, limit)
+    finalize(
+        index,
+        union_scores(index, Similarity::Bm25, field, terms),
+        min_score,
+        limit,
+    )
 }
 
 /// Wildcard query: terms matching the pattern, joined as a MultiTerm.
@@ -264,7 +284,12 @@ pub fn wildcard_query(
 ) -> Vec<Hit> {
     let terms = wildcard_terms(index, field, pattern, min_prefix_len);
     let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-    finalize(index, union_scores(index, field, &refs), min_score, limit)
+    finalize(
+        index,
+        union_scores(index, Similarity::Bm25, field, &refs),
+        min_score,
+        limit,
+    )
 }
 
 /// Fuzzy query: terms within the similarity, joined as a MultiTerm.
@@ -279,7 +304,12 @@ pub fn fuzzy_query(
 ) -> Vec<Hit> {
     let terms = fuzzy_terms(index, field, term, min_similarity, prefix_length);
     let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-    finalize(index, union_scores(index, field, &refs), min_score, limit)
+    finalize(
+        index,
+        union_scores(index, Similarity::Bm25, field, &refs),
+        min_score,
+        limit,
+    )
 }
 
 /// terms in `field` that are accent variants of `token` and actually exist in the
@@ -306,7 +336,12 @@ pub fn phrase_query(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    finalize(index, phrase_scores(index, field, terms), min_score, limit)
+    finalize(
+        index,
+        phrase_scores(index, Similarity::Bm25, field, terms),
+        min_score,
+        limit,
+    )
 }
 
 #[cfg(test)]
