@@ -4,6 +4,7 @@
 
 use crate::analysis::analyze;
 use crate::mlt::{MltParams, more_like_this};
+use crate::prf::{PrfParams, search_prf};
 use crate::query::{InGroup, Occur, Query, QueryParams, build_query, search, search_with_weights};
 use crate::search::Hit;
 use crate::zsl::index::ZslIndex;
@@ -43,6 +44,19 @@ pub fn search_index(
         }
     }
     Ok(hits)
+}
+
+/// Opens a ZSL index and runs a two-pass PRF (semantic) search. `limit == 0` = unlimited.
+/// Degrades to a plain search internally when PRF cannot contribute (see `search_prf`).
+pub fn search_prf_index(
+    index_dir: &Path,
+    params: &QueryParams,
+    prf: &PrfParams,
+    min_score: f32,
+    limit: usize,
+) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
+    let index = ZslIndex::open(index_dir)?;
+    Ok(search_prf(&index, params, prf, min_score, limit))
 }
 
 /// Search-adapter fallback: an all-fields Boolean of terms (Should) over the UNIQUE
@@ -138,6 +152,26 @@ mod tests {
         let mut v: Vec<usize> = hits.iter().map(|h| h.id).collect();
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn search_prf_index_off_matches_plain() {
+        // top_k = 0 (PRF disabled) must return exactly what search_index returns over the
+        // same fixture — proves the runner wires PrfParams through and the plain path is intact.
+        // ("vpn" is used, not "the": no title in this fixture contains "the", and
+        // text_only_matches_across_segments below already proves "vpn" yields ids [0, 2].)
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let p = params("vpn");
+        let off = PrfParams {
+            top_k: 0,
+            ..PrfParams::default()
+        };
+        let plain = search_index(&dir, &p, 0.0, 100).unwrap();
+        let prf = search_prf_index(&dir, &p, &off, 0.0, 100).unwrap();
+        let plain_ids: Vec<usize> = plain.iter().map(|h| h.id).collect();
+        let prf_ids: Vec<usize> = prf.iter().map(|h| h.id).collect();
+        assert_eq!(prf_ids, plain_ids);
     }
 
     #[test]
