@@ -161,7 +161,7 @@ foreach ($hits as $hit) {
 | `limit` | int | Maximum hits to return (`0` = unlimited). |
 | `accent_insensitive` | bool | Optional (default `false`). When `true`, text matching is Spanish accent-insensitive (`avion` also matches `avión` and vice-versa). |
 | `field_weights` | object | Optional (default `{}`). Per-field score multipliers (`{"title": 3.0}`); a field not listed weighs `1.0`. |
-| `similarity` | string | Optional scoring algorithm: `"bm25"` (default) or `"tfidf"`. Unknown value → error. As of 0.2.0 BM25 is the default ranking; pass `"similarity": "tfidf"` to restore the pre-0.2.0 (TF-IDF) ranking. |
+| `similarity` | string | Optional scoring algorithm: `"bm25"` (default) or `"tfidf"`. Unknown value → error. As of 0.2.0 BM25 is the default ranking; pass `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25. |
 
 Each hit is `{ "id": int, "score": float, "fields": { name: value, ... } }`, where `id` is
 the global internal document id and `fields` are the document's stored fields.

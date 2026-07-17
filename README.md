@@ -32,7 +32,7 @@ feature set.
   phrase, and "more like this" (similar-document) queries through the same query engine
   used by the rest of `sdsearch-core`, with optional Spanish accent-insensitive matching
   and per-field score weighting. Scoring defaults to BM25 as of 0.2.0; pass
-  `"similarity": "tfidf"` in the search params to restore the pre-0.2.0 (TF-IDF) ranking
+  `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25
   (see [`docs/API.md`](docs/API.md)).
 - **Writer** (`sdsearch-core::zsl::writer`) — a streaming `IndexWriter` that adds
   documents, deletes documents, commits, and merges/optimizes segments, producing index

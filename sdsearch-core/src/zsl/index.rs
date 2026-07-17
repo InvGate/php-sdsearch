@@ -185,4 +185,36 @@ mod tests {
             "avg={avg} manual={manual}"
         );
     }
+
+    #[test]
+    fn zsl_index_avg_field_len_aggregates_across_segments() {
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ));
+        let idx = ZslIndex::open(&dir).unwrap();
+        // must be multi-segment, or the weighted-mean path isn't exercised
+        assert!(
+            idx.entries.len() > 1,
+            "fixture must be multi-segment, got {}",
+            idx.entries.len()
+        );
+        let field = idx
+            .indexed_fields()
+            .into_iter()
+            .next()
+            .expect("an indexed field");
+        let avg = idx.avg_field_len(&field);
+        assert!(avg >= 1.0, "avg must be >= 1.0, got {avg}");
+        // the weighted mean must equal the manual average of field_len over all docs
+        let n = idx.total_docs();
+        let manual: f64 = (0..n)
+            .map(|d| f64::from(idx.field_len(d, &field)))
+            .sum::<f64>()
+            / n as f64;
+        assert!(
+            (f64::from(avg) - manual).abs() < 1e-3,
+            "avg={avg} manual={manual} field={field}"
+        );
+    }
 }

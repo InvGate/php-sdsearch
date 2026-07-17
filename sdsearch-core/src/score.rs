@@ -24,8 +24,10 @@ impl Similarity {
     pub fn idf(self, total_docs: f32, doc_freq: f32) -> f32 {
         match self {
             Similarity::TfIdf => idf(total_docs, doc_freq),
-            // BM25 probabilistic idf. `.max(0.0)` guards the rare df > N/2 case
-            // (would go slightly negative) so a matched term never subtracts.
+            // BM25 probabilistic idf. `.max(0.0)` is defensive only: with the leading
+            // `1.0 +` the idf is already non-negative for every valid 0 <= df <= N; it
+            // can go negative only if df > N (an accounting inconsistency), which the
+            // floor absorbs.
             Similarity::Bm25 => (1.0 + (total_docs - doc_freq + 0.5) / (doc_freq + 0.5))
                 .ln()
                 .max(0.0),

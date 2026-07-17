@@ -56,7 +56,7 @@ namespace SdSearch {
          *   listed weighs `1.0`. Empty = every field weighed equally (current behavior).
          * - `similarity` (optional, default `"bm25"`): scoring algorithm, `"bm25"` or `"tfidf"`;
          *   an unknown value throws. As of 0.2.0 BM25 is the default ranking; pass
-         *   `"similarity": "tfidf"` to restore the pre-0.2.0 (TF-IDF) ranking.
+         *   `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25.
          *
          * The return value is a JSON array of hits:
          * ```json

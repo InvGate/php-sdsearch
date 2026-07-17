@@ -27,7 +27,8 @@ pub trait IndexReader {
     fn field_len(&self, doc_id: usize, field: &str) -> u32;
     /// Collection-wide average field length (BM25 length normalization). Default
     /// `1.0` = "no length signal" for readers that do not track lengths; the real
-    /// readers override it. Computed once per open, not per query.
+    /// readers override it. The real (on-disk) readers precompute this at open;
+    /// `MemoryIndex` computes it on demand.
     fn avg_field_len(&self, field: &str) -> f32 {
         let _ = field;
         1.0
