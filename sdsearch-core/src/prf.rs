@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use crate::doc::{Document, FieldKind};
     use crate::index::MemoryIndex;
-    use crate::query::search;
+    use crate::query::{WhereGroup, search};
     use crate::score::Similarity;
 
     /// doc0 has the query term "printer" plus jargon; doc1 has only the jargon
@@ -336,6 +336,415 @@ mod tests {
             1,
             "posting_budget=1 must bound feedback terms to just the top-scoring one: {:?}",
             tight.iter().map(|s| &s.term).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invalid_query_propagates_err() {
+        // Empty text -> QueryError::Empty (mirrors build_query itself). PRF must not
+        // swallow an invalid query into an empty Ok(vec![]) result.
+        let idx = corpus();
+        let empty_text = search_prf(&idx, &params(""), &PrfParams::default(), 0.0, 100);
+        assert!(matches!(empty_text, Err(QueryError::Empty)));
+
+        // Empty WHERE-group field name -> QueryError::EmptyField (mirrors query.rs's
+        // own build_query_empty_field_is_error test).
+        let mut p = params("printer");
+        p.where_groups = vec![WhereGroup {
+            field: String::new(),
+            values: vec!["x".into()],
+            occur: Occur::Should,
+        }];
+        let empty_field = search_prf(&idx, &p, &PrfParams::default(), 0.0, 100);
+        assert!(matches!(empty_field, Err(QueryError::EmptyField)));
+    }
+
+    #[test]
+    fn feedback_weight_increases_vocabulary_mismatch_score() {
+        // doc1 (vocabulary mismatch, no "printer") only enters the result through the
+        // feedback subtree, which is scaled by feedback_weight. If feedback_weight were
+        // not actually threaded into the augmented query (e.g. hardcoded, or applied to
+        // the wrong subtree), doc1's normalized score would stay flat as it's varied.
+        let idx = corpus();
+        let low = PrfParams {
+            feedback_weight: 0.05,
+            ..PrfParams::default()
+        };
+        let high = PrfParams {
+            feedback_weight: 5.0,
+            ..PrfParams::default()
+        };
+        let low_hits = search_prf(&idx, &params("printer"), &low, 0.0, 100).expect("valid query");
+        let high_hits = search_prf(&idx, &params("printer"), &high, 0.0, 100).expect("valid query");
+        let score_of = |hits: &[Hit], id: usize| {
+            hits.iter()
+                .find(|h| h.id == id)
+                .unwrap_or_else(|| panic!("doc{id} missing: {:?}", ids(hits)))
+                .score
+        };
+        let low_score = score_of(&low_hits, 1);
+        let high_score = score_of(&high_hits, 1);
+        assert!(
+            high_score > low_score,
+            "doc1's score must strictly increase with feedback_weight: low(0.05)={low_score} high(5.0)={high_score}"
+        );
+    }
+
+    /// Corpus for the coord-dilution test: doc0 is the sole base match for "widget" and
+    /// contributes NOTHING else to its own stored text, so its own harvested vocabulary
+    /// (from doc1..4, the other pass-1 docs) never includes a term doc0 itself contains.
+    /// doc1..4 each add "widget" plus one unique "extraN" term; the fillers keep
+    /// "widget"'s doc frequency (5) under n_docs/2 (=4) so it's NOT excluded by the
+    /// default max_doc_freq guard, i.e. it does get selected — but only doc1..4 (its
+    /// origin docs) can match on it, never doc0.
+    fn dilution_corpus() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in [
+            "widget",        // doc0: target — contributes nothing but the base term itself
+            "widget extra1", // doc1
+            "widget extra2", // doc2
+            "widget extra3", // doc3
+            "widget extra4", // doc4 (5 pass-1 docs -> df(widget) = 5)
+            "filler5",
+            "filler6",
+            "filler7",
+            "filler8", // n_docs=9 -> max_doc_freq=4
+        ] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn feedback_weight_zero_is_not_top_k_zero() {
+        // Pins the documented footgun: feedback_weight=0.0 is NOT one of the documented
+        // degrade-to-plain conditions (top_k==0, num_terms==0, no pass-1 hits, no
+        // surviving feedback terms) — the augmented Boolean is still built and evaluated,
+        // it just zeroes the feedback subtree's score contribution. Since doc0 only
+        // matches ONE of the pass-2 augmented query's two top-level Should clauses (base;
+        // it never shares a harvested term with itself, by construction of
+        // dilution_corpus), the boolean coord factor (matched/total = 1/2) dilutes its
+        // score relative to a TRUE plain search (top_k=0), which has no Boolean coord at
+        // all for a single-term query.
+        let idx = dilution_corpus();
+        let true_plain = PrfParams {
+            top_k: 0,
+            ..PrfParams::default()
+        };
+        let fw_zero = PrfParams {
+            feedback_weight: 0.0,
+            ..PrfParams::default()
+        };
+        let a = search_prf(&idx, &params("widget"), &true_plain, 0.0, 100).expect("valid query");
+        let b = search_prf(&idx, &params("widget"), &fw_zero, 0.0, 100).expect("valid query");
+        let doc0_a = a
+            .iter()
+            .find(|h| h.id == 0)
+            .expect("doc0 present (a)")
+            .score;
+        let doc0_b = b
+            .iter()
+            .find(|h| h.id == 0)
+            .expect("doc0 present (b)")
+            .score;
+        assert!(
+            doc0_b < doc0_a,
+            "feedback_weight=0.0 must coord-dilute doc0 relative to true plain (top_k=0): \
+             top_k=0 -> {doc0_a}, feedback_weight=0.0 -> {doc0_b}"
+        );
+    }
+
+    /// Corpus for the rerank-contract test: docA is a long, single "zx" (base) match
+    /// padded with a repeated filler ("pad") that ALSO appears in a few other docs (so
+    /// its collection doc frequency exceeds the low `max_doc_freq` cap used below and it
+    /// is excluded from the harvest — it only exists to lengthen docA and depress its
+    /// BM25 per-term scores via length normalization). docB shares "common1" with docA
+    /// but is very short and has no "zx" at all (feedback-only, vocabulary mismatch). The
+    /// many one-token "noise" docs pull the collection's average field length down,
+    /// amplifying docA's length penalty and docB's length bonus.
+    fn rerank_corpus() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        let pad = "pad ".repeat(50);
+        let mut texts: Vec<String> = vec![
+            format!("zx common1 {pad}"), // docA (id0): base match, long -> modest per-term score
+            "common1".to_string(), // docB (id1): feedback-only, short -> strong per-term score
+            "pad".to_string(),
+            "pad".to_string(),
+            "pad".to_string(), // push df(pad) up; excluded via max_doc_freq below regardless
+        ];
+        for i in 0..30 {
+            texts.push(format!("noise{i}")); // short fillers depress the collection's avg field length
+        }
+        for text in &texts {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn binding_limit_can_drop_a_plain_hit() {
+        // Pins the documented rerank contract: with a binding limit, PRF may omit a hit
+        // that plain search would have returned. Plain search for "zx" (limit=1) can only
+        // ever return docA (the sole doc containing "zx"). Under PRF with a large enough
+        // feedback_weight, docB's boosted score (via the shared "common1" harvest term)
+        // overtakes docA's, so the SAME limit=1 call returns docB instead — docA, which
+        // plain search guarantees, is dropped from the top-1.
+        let idx = rerank_corpus();
+        let plain = search(&idx, &build_query(&params("zx")).unwrap(), 0.0, 1);
+        assert_eq!(
+            ids(&plain),
+            vec![0],
+            "plain search limit=1 must return docA: {:?}",
+            ids(&plain)
+        );
+
+        let prf = PrfParams {
+            feedback_weight: 10.0,
+            max_doc_freq: Some(2), // exclude "pad" (df well above 2); "zx"/"common1" (df<=2) survive
+            ..PrfParams::default()
+        };
+        let reranked = search_prf(&idx, &params("zx"), &prf, 0.0, 1).expect("valid query");
+        assert_eq!(
+            ids(&reranked),
+            vec![1],
+            "PRF limit=1 must drop docA in favor of the reranked docB: {:?}",
+            ids(&reranked)
+        );
+    }
+
+    #[test]
+    fn max_doc_freq_bounds_prf_feedback_terms() {
+        // Mirrors posting_budget_bounds_prf_feedback_terms's structure and reasoning, but
+        // varies max_doc_freq instead: builds the same pass-1 doc set search_prf computes
+        // for "printer" (doc0 only: printer/paper/jam/toner, doc_freq 1/2/2/2), then calls
+        // select_terms twice with the exact MltParams shape search_prf constructs, varying
+        // only max_doc_freq. A cap of 1 must exclude every doc_freq=2 candidate
+        // (paper/jam/toner), leaving only "printer" (doc_freq=1) — proving the guard is
+        // wired into PRF's own selection call, not just exercised by mlt.rs in isolation.
+        let idx = corpus();
+        let pass1 = search(&idx, &build_query(&params("printer")).unwrap(), 0.0, 5);
+        let doc_ids: Vec<usize> = pass1.iter().map(|h| h.id).collect();
+        assert_eq!(
+            doc_ids,
+            vec![0],
+            "pass 1 for \"printer\" must be doc0 only: {doc_ids:?}"
+        );
+
+        let base_cfg = MltParams {
+            fields: idx.indexed_fields(),
+            min_term_freq: 1,
+            max_query_terms: 10,
+            min_doc_freq: 1,
+            max_doc_freq: None,
+            posting_budget: Some(9999), // unbounded for this tiny corpus: isolate max_doc_freq
+            timeout: None,
+            term_filters: Vec::new(),
+            range_filters: Vec::new(),
+            min_should_match: None,
+            field_weights: HashMap::new(),
+            size: 0,
+            min_score: 0.0,
+        };
+        let loose = select_terms(&idx, &doc_ids, &base_cfg);
+        let tight_cfg = MltParams {
+            max_doc_freq: Some(1),
+            ..base_cfg.clone()
+        };
+        let tight = select_terms(&idx, &doc_ids, &tight_cfg);
+
+        assert!(
+            loose.len() > 1,
+            "need >1 terms normally selected to prove the guard actually shrinks the set: {:?}",
+            loose.iter().map(|s| &s.term).collect::<Vec<_>>()
+        );
+        assert!(
+            tight.len() < loose.len(),
+            "max_doc_freq=1 must shrink the selected-term count: loose={:?} tight={:?}",
+            loose.iter().map(|s| &s.term).collect::<Vec<_>>(),
+            tight.iter().map(|s| &s.term).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tight.iter().map(|s| s.term.as_str()).collect::<Vec<_>>(),
+            vec!["printer"],
+            "max_doc_freq=1 must leave only the doc_freq=1 candidate: {:?}",
+            tight.iter().map(|s| &s.term).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two-field corpus: doc0 (base match) has "printer" in `title` and a distinctive
+    /// bridge term ("jamword") ONLY in `body`. doc1 shares "jamword" in `body` but has no
+    /// "printer" anywhere (vocabulary mismatch, reachable only via that bridge term).
+    fn fields_corpus() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for (title, body) in [
+            ("printer", "jamword"),    // doc0: base match; bridge term lives only in body
+            ("unrelated1", "jamword"), // doc1: mismatch, reachable only via body's "jamword"
+            ("unrelated2", "otherbody1"),
+            ("unrelated3", "otherbody2"),
+        ] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("body", body, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn fields_restricts_harvest_source() {
+        let idx = fields_corpus();
+        // fields: [] (default) harvests from every indexed field, including body, and
+        // reaches doc1 via "jamword".
+        let all_fields = search_prf(&idx, &params("printer"), &PrfParams::default(), 0.0, 100)
+            .expect("valid query");
+        assert!(
+            ids(&all_fields).contains(&1),
+            "fields=[] must harvest from body and retrieve doc1: {:?}",
+            ids(&all_fields)
+        );
+
+        // fields: ["title"] restricts the harvest to title only ("printer" alone, already
+        // in the base query) and must NOT reach doc1's body-only bridge term.
+        let title_only = PrfParams {
+            fields: vec!["title".to_string()],
+            ..PrfParams::default()
+        };
+        let title_restricted =
+            search_prf(&idx, &params("printer"), &title_only, 0.0, 100).expect("valid query");
+        assert!(
+            !ids(&title_restricted).contains(&1),
+            "fields=[\"title\"] must NOT reach doc1 (its bridge term lives only in body): {:?}",
+            ids(&title_restricted)
+        );
+    }
+
+    /// doc0 (base match) has 4 distinctive candidate terms (termA..D), each shared with
+    /// exactly one otherwise-unrelated vocabulary-mismatch doc (doc1..4). doc_freq(termA..D)
+    /// = 2 each, at (not over) the default max_doc_freq (n_docs/2 = 2), so none are
+    /// excluded by that guard — isolating num_terms as the only variable in play.
+    fn num_terms_corpus() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in [
+            "trigger termA termB termC termD", // doc0: base match, many candidate terms
+            "termA",                           // doc1: mismatch bridged by termA
+            "termB",                           // doc2: mismatch bridged by termB
+            "termC",                           // doc3: mismatch bridged by termC
+            "termD",                           // doc4: mismatch bridged by termD
+        ] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn num_terms_caps_feedback_terms() {
+        // "trigger" (doc_freq=1) outranks termA..D (doc_freq=2, lower idf) in the
+        // tf*idf selection order, so num_terms=1 keeps ONLY "trigger" — which bridges to
+        // no other doc (doc1..4 don't contain it), so PRF retrieves just doc0. A cap of
+        // 10 (default) comfortably fits all 5 candidates, so all 4 mismatch docs surface.
+        // posting_budget is pinned high on both sides to isolate num_terms specifically
+        // (this tiny corpus's inferred default would otherwise also cap the loose run).
+        let idx = num_terms_corpus();
+        let tight = PrfParams {
+            num_terms: 1,
+            posting_budget: Some(9999),
+            ..PrfParams::default()
+        };
+        let loose = PrfParams {
+            num_terms: 10,
+            posting_budget: Some(9999),
+            ..PrfParams::default()
+        };
+        let tight_hits =
+            search_prf(&idx, &params("trigger"), &tight, 0.0, 100).expect("valid query");
+        let loose_hits =
+            search_prf(&idx, &params("trigger"), &loose, 0.0, 100).expect("valid query");
+        assert_eq!(
+            ids(&tight_hits),
+            vec![0],
+            "num_terms=1 must retrieve only doc0 (its one selected term bridges nothing): {:?}",
+            ids(&tight_hits)
+        );
+        let mismatch_docs: Vec<usize> = loose_hits
+            .iter()
+            .map(|h| h.id)
+            .filter(|id| *id != 0)
+            .collect();
+        assert_eq!(
+            mismatch_docs.len(),
+            4,
+            "num_terms=10 must retrieve all 4 vocabulary-mismatch docs: {:?}",
+            ids(&loose_hits)
+        );
+    }
+
+    /// docX1/docX2/docX3 all match "trigger" but rank 1st/2nd/3rd (shortest to longest,
+    /// same term frequency -> BM25 favors the shortest). Each carries one unique
+    /// bridge term (term1/term2/term3) shared with a corresponding vocabulary-mismatch
+    /// doc (docY1/docY2/docY3).
+    fn top_k_corpus() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in [
+            "trigger term1",           // docX1 (id0): rank 1 (shortest)
+            "trigger term2 xpad",      // docX2 (id1): rank 2
+            "trigger term3 xpad ypad", // docX3 (id2): rank 3 (longest)
+            "term1",                   // docY1 (id3): mismatch bridged by term1
+            "term2",                   // docY2 (id4): mismatch bridged by term2
+            "term3",                   // docY3 (id5): mismatch bridged by term3
+        ] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn top_k_truncates_pass1_harvest_source() {
+        let idx = top_k_corpus();
+        // Confirm the intended pass-1 ranking before relying on it.
+        let pass1 = search(&idx, &build_query(&params("trigger")).unwrap(), 0.0, 100);
+        assert_eq!(
+            ids(&pass1),
+            vec![0, 1, 2],
+            "\"trigger\" must match exactly docX1/X2/X3, ranked shortest-first: {:?}",
+            ids(&pass1)
+        );
+
+        // max_doc_freq/posting_budget pinned high: this test isolates top_k, not the
+        // other guards (this tiny corpus's inferred defaults would otherwise interfere).
+        let top1 = PrfParams {
+            top_k: 1,
+            max_doc_freq: Some(9999),
+            posting_budget: Some(9999),
+            ..PrfParams::default()
+        };
+        let top3 = PrfParams {
+            top_k: 3,
+            max_doc_freq: Some(9999),
+            posting_budget: Some(9999),
+            ..PrfParams::default()
+        };
+        let hits_top1 = search_prf(&idx, &params("trigger"), &top1, 0.0, 100).expect("valid query");
+        let hits_top3 = search_prf(&idx, &params("trigger"), &top3, 0.0, 100).expect("valid query");
+
+        // docY3 (id5) is bridged only by "term3", harvested only from the 3rd-ranked
+        // docX3 — top_k=1 truncates pass-1 to docX1 alone, so it can never surface.
+        assert!(
+            !ids(&hits_top1).contains(&5),
+            "top_k=1 must NOT reach docY3 (its bridge term lives only on the 3rd-ranked pass-1 doc): {:?}",
+            ids(&hits_top1)
+        );
+        assert!(
+            ids(&hits_top3).contains(&5),
+            "top_k=3 must reach docY3 once its harvest source is included in pass 1: {:?}",
+            ids(&hits_top3)
         );
     }
 }

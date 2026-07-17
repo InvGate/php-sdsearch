@@ -181,6 +181,20 @@ mod tests {
     }
 
     #[test]
+    fn search_prf_index_propagates_query_error() {
+        // An invalid query (empty text) must propagate as an Err through the runner's
+        // Box<dyn Error> boundary, not get swallowed into an empty Ok(vec![]) — mirrors
+        // search_prf's own invalid_query_propagates_err test, one layer up the stack.
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let result = search_prf_index(&dir, &params(""), &PrfParams::default(), 0.0, 0);
+        assert!(
+            result.is_err(),
+            "empty-text query must propagate an error through search_prf_index"
+        );
+    }
+
+    #[test]
     fn search_prf_index_with_feedback_returns_hits_for_known_token() {
         // Real two-pass PRF (top_k>0, the default) over the multiseg fixture, driving
         // actual feedback-term harvesting through search_prf_index — the
