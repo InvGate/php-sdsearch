@@ -40,6 +40,43 @@ pub fn from_pairs(pairs: &[(&str, &[&str])]) -> SynonymDict {
     SynonymDict { map }
 }
 
+/// Minimal forward-only reader over the blob; every getter bounds-checks.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl Cursor<'_> {
+    fn take(&mut self, n: usize) -> Result<&[u8], String> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or("synonyms blob: length overflow")?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or("synonyms blob: truncated")?;
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, String> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn string_u16(&mut self) -> Result<String, String> {
+        let len = self.u16()? as usize;
+        let b = self.take(len)?;
+        String::from_utf8(b.to_vec()).map_err(|_| "synonyms blob: invalid UTF-8".to_string())
+    }
+}
+
 impl SynonymDict {
     /// Expansion terms for `token`, capped at `MAX_SYNONYMS_PER_TOKEN`. The probe is
     /// lowercased and accent-folded before lookup. Empty slice if the token is absent.
@@ -49,6 +86,55 @@ impl SynonymDict {
             Some(v) => &v[..v.len().min(MAX_SYNONYMS_PER_TOKEN)],
             None => &[],
         }
+    }
+
+    /// Serialize to the compact blob format. Keys are emitted in sorted order so the
+    /// output is byte-reproducible regardless of insertion order.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut keys: Vec<&String> = self.map.keys().collect();
+        keys.sort();
+        let mut out = Vec::new();
+        out.extend_from_slice(&u32::try_from(keys.len()).unwrap_or(u32::MAX).to_le_bytes());
+        for key in keys {
+            let values = &self.map[key];
+            let kb = key.as_bytes();
+            out.extend_from_slice(&u16::try_from(kb.len()).unwrap_or(u16::MAX).to_le_bytes());
+            out.extend_from_slice(kb);
+            let n = values.len().min(MAX_SYNONYMS_PER_TOKEN);
+            out.push(u8::try_from(n).unwrap_or(u8::MAX));
+            for v in &values[..n] {
+                let vb = v.as_bytes();
+                out.extend_from_slice(&u16::try_from(vb.len()).unwrap_or(u16::MAX).to_le_bytes());
+                out.extend_from_slice(vb);
+            }
+        }
+        out
+    }
+
+    /// Parse the compact blob format. Returns `Err` with a short message on any
+    /// truncation or invalid UTF-8 — the bundled blob is trusted, so the global
+    /// loader treats an error as a build-time invariant violation.
+    pub fn decode(bytes: &[u8]) -> Result<SynonymDict, String> {
+        let mut cur = Cursor { bytes, pos: 0 };
+        let entry_count = cur.u32()? as usize;
+        // Don't trust `entry_count` for the capacity hint: a corrupted/truncated blob can
+        // claim billions of entries while the input is only a few bytes long, which would
+        // make `with_capacity` try to allocate way more memory than the input could ever
+        // back out. Each entry needs at least 3 bytes (u16 key_len + u8 value_count), so cap
+        // the hint at the number of entries the remaining bytes could possibly contain.
+        let max_possible_entries = bytes.len() / 3 + 1;
+        let mut map = HashMap::with_capacity(entry_count.min(max_possible_entries));
+        for _ in 0..entry_count {
+            let key = cur.string_u16()?;
+            let value_count = cur.u8()? as usize;
+            let mut values = Vec::with_capacity(value_count);
+            for _ in 0..value_count {
+                values.push(cur.string_u16()?);
+            }
+            map.insert(key, values);
+        }
+        Ok(SynonymDict { map })
     }
 }
 
@@ -90,5 +176,32 @@ mod tests {
         let many: Vec<&str> = vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
         let d = from_pairs(&[("x", &many)]);
         assert_eq!(d.expand("x").len(), MAX_SYNONYMS_PER_TOKEN);
+    }
+
+    #[test]
+    fn encode_decode_round_trips() {
+        let d = from_pairs(&[
+            ("impresora", &["printer"]),
+            ("laptop", &["notebook", "portátil"]),
+        ]);
+        let bytes = d.encode();
+        let back = SynonymDict::decode(&bytes).expect("decode");
+        assert_eq!(back.expand("impresora"), &["printer".to_string()]);
+        assert_eq!(
+            back.expand("laptop"),
+            &["notebook".to_string(), "portátil".to_string()]
+        );
+    }
+
+    #[test]
+    fn encode_is_deterministic() {
+        let a = from_pairs(&[("b", &["x"]), ("a", &["y"])]);
+        let b = from_pairs(&[("a", &["y"]), ("b", &["x"])]);
+        assert_eq!(a.encode(), b.encode()); // sorted keys => insertion order irrelevant
+    }
+
+    #[test]
+    fn decode_rejects_truncated_input() {
+        assert!(SynonymDict::decode(&[0xFF, 0xFF, 0xFF, 0xFF]).is_err());
     }
 }
