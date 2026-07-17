@@ -278,7 +278,11 @@ pub struct InGroup {
 }
 
 /// parameters of a host-application search (the supported surface).
-#[derive(Default)]
+///
+/// Deliberately does NOT derive `Default`: several fields (`fuzzy_similarity`,
+/// `wildcard_min_prefix`, ...) have unsafe zero-defaults (a 0.0 fuzzy threshold
+/// matches nearly everything), so callers construct it explicitly. The scoring
+/// default (BM25) lives on `Similarity::default()`, tested in `score.rs`.
 pub struct QueryParams {
     pub text: String,
     pub where_groups: Vec<WhereGroup>,
@@ -876,16 +880,6 @@ mod tests {
             bm25[1].score,
             tfidf[1].score
         );
-    }
-
-    #[test]
-    fn default_query_params_use_bm25() {
-        // building QueryParams with ..Default::default() yields Bm25
-        let p = QueryParams {
-            text: "x".into(),
-            ..Default::default()
-        };
-        assert_eq!(p.similarity, Similarity::Bm25);
     }
 
     #[test]

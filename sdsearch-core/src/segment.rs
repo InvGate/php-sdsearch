@@ -12,7 +12,23 @@ pub struct Segment {
     fsts: HashMap<String, fst::Map<Vec<u8>>>,
     postings: HashMap<String, Vec<u8>>,
     lengths: HashMap<String, Vec<u32>>,
+    /// per-field average length, precomputed once at open from `lengths` (mirrors
+    /// `ZslSegment`), so `avg_field_len` is a lookup rather than an O(num_docs) sum per query.
+    avg_field_len: HashMap<String, f32>,
     stored: Vec<HashMap<String, String>>,
+}
+
+/// average of a field's per-doc length column; empty column or all-zero total => 1.0.
+fn avg_of(lengths: &[u32]) -> f32 {
+    if lengths.is_empty() {
+        return 1.0;
+    }
+    let total: u64 = lengths.iter().map(|&l| u64::from(l)).sum();
+    if total == 0 {
+        1.0
+    } else {
+        total as f32 / lengths.len() as f32
+    }
 }
 
 impl Segment {
@@ -44,11 +60,16 @@ impl Segment {
                 std::fs::read(dir.join(format!("postings.{field}.bin")))?,
             );
         }
+        let avg_field_len = lengths
+            .iter()
+            .map(|(field, v)| (field.clone(), avg_of(v)))
+            .collect();
         Ok(Segment {
             num_docs: meta.num_docs,
             fsts,
             postings,
             lengths,
+            avg_field_len,
             stored,
         })
     }
@@ -145,17 +166,7 @@ impl IndexReader for Segment {
     }
 
     fn avg_field_len(&self, field: &str) -> f32 {
-        match self.lengths.get(field) {
-            Some(v) if !v.is_empty() => {
-                let total: u64 = v.iter().map(|&l| u64::from(l)).sum();
-                if total == 0 {
-                    1.0
-                } else {
-                    total as f32 / v.len() as f32
-                }
-            }
-            _ => 1.0,
-        }
+        self.avg_field_len.get(field).copied().unwrap_or(1.0)
     }
 
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
