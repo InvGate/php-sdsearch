@@ -48,6 +48,12 @@ pub fn search_index(
 
 /// Opens a ZSL index and runs a two-pass PRF (semantic) search. `limit == 0` = unlimited.
 /// Degrades to a plain search internally when PRF cannot contribute (see `search_prf`).
+///
+/// In the active two-pass path the result is a RERANK, not a strict superset of a plain
+/// `search_index` call: the boolean coord factor can reduce an original-only match's score
+/// relative to plain search, so with a nonzero `min_score` or a binding `limit` this may
+/// omit a hit that `search_index` would return. Only at `min_score == 0.0` and an
+/// unlimited `limit` is the result guaranteed to be a superset of plain search.
 pub fn search_prf_index(
     index_dir: &Path,
     params: &QueryParams,
@@ -172,6 +178,40 @@ mod tests {
         let plain_ids: Vec<usize> = plain.iter().map(|h| h.id).collect();
         let prf_ids: Vec<usize> = prf.iter().map(|h| h.id).collect();
         assert_eq!(prf_ids, plain_ids);
+    }
+
+    #[test]
+    fn search_prf_index_with_feedback_returns_hits_for_known_token() {
+        // Real two-pass PRF (top_k>0, the default) over the multiseg fixture, driving
+        // actual feedback-term harvesting through search_prf_index — the
+        // search_prf_index_off_matches_plain test above only exercises the DISABLED
+        // (top_k=0) path, which never invokes select_terms at all.
+        //
+        // "vpn" is known present (text_only_matches_across_segments proves plain search
+        // yields ids [0,2]; the fixture's stored titles are "alpha vpn guide" (id 0) and
+        // "gamma vpn tutorial" (id 2), so pass 1 harvests real feedback terms from them,
+        // e.g. "alpha"/"guide"/"gamma"/"tutorial").
+        //
+        // At min_score=0.0 and an unlimited limit (limit=0), search_prf's doc comment
+        // guarantees the augmented Should-union can only ever ADD matches relative to
+        // plain search, never drop one (nothing is filtered by score or truncated by
+        // limit) — so plain's ids must be a subset of PRF's ids.
+        let dir = multiseg();
+        let p = params("vpn");
+        let plain = search_index(&dir, &p, 0.0, 0).unwrap();
+        let prf = search_prf_index(&dir, &p, &PrfParams::default(), 0.0, 0).unwrap();
+
+        assert!(
+            !prf.is_empty(),
+            "PRF must return hits for a known-present token: {:?}",
+            ids(&prf)
+        );
+        let plain_ids: HashSet<usize> = plain.iter().map(|h| h.id).collect();
+        let prf_ids: HashSet<usize> = prf.iter().map(|h| h.id).collect();
+        assert!(
+            plain_ids.is_subset(&prf_ids),
+            "at min_score=0/unlimited limit, PRF must be a superset of plain: plain={plain_ids:?} prf={prf_ids:?}"
+        );
     }
 
     #[test]

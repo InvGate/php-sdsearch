@@ -46,9 +46,17 @@ impl Default for PrfParams {
     }
 }
 
-/// Runs a two-pass PRF search. Degrades gracefully to a plain search (never errors,
-/// never worse than `query`, only slower) when PRF cannot contribute: `top_k==0`,
-/// `num_terms==0`, no pass-1 hits, or no feedback terms survive the guards.
+/// Runs a two-pass PRF search. Degrades gracefully to a plain search (never errors, only
+/// slower) when PRF cannot contribute: `top_k==0`, `num_terms==0`, no pass-1 hits, or no
+/// feedback terms survive the guards — in those cases the result is identical to `query`.
+///
+/// In the ACTIVE two-pass path the result is a RERANK, not a strict superset: the
+/// augmented query is `Boolean[Should(base), Should(Boosted(feedback))]`, so an
+/// original-only match's normalized score is reduced by the boolean coord factor
+/// (matched/total clauses) relative to plain search. With a nonzero `min_score` or a
+/// binding `limit` this can make `search_prf` omit a hit that plain search would have
+/// returned. Only at `min_score == 0.0` and an unlimited `limit` (`limit == 0`) is the
+/// result guaranteed to be a superset of plain search.
 pub fn search_prf(
     index: &impl IndexReader,
     params: &QueryParams,
@@ -109,13 +117,13 @@ pub fn search_prf(
     // down-weighted Should subtree. Feedback-only docs (vocabulary mismatch) enter
     // via the feedback subtree; docs matching both are boosted by the boolean coord.
     let feedback_clauses: Vec<(Occur, Query)> = selected
-        .iter()
+        .into_iter()
         .map(|s| {
             (
                 Occur::Should,
                 Query::Term {
-                    field: Some(s.field.clone()),
-                    text: s.term.clone(),
+                    field: Some(s.field),
+                    text: s.term,
                 },
             )
         })
@@ -259,6 +267,72 @@ mod tests {
             ids(&prf).contains(&0),
             "original match doc0 missing: {:?}",
             ids(&prf)
+        );
+    }
+
+    #[test]
+    fn posting_budget_bounds_prf_feedback_terms() {
+        // Proves the memory guard is actually wired into PRF's own feedback-selection call
+        // (not just exercised in isolation by mlt.rs's own tests): builds the exact pass-1
+        // doc set `search_prf` computes for "printer" (doc0 only), then calls
+        // `select_terms` twice with the same MltParams shape `search_prf` constructs,
+        // varying only `posting_budget`.
+        //
+        // doc0's stored text is "printer paper jam toner" — 4 distinct candidate terms.
+        // With an effectively-unbounded budget all 4 survive (proving the corpus can
+        // normally select more than one term, so a shrink is meaningful and not vacuous).
+        // `select_terms` always keeps at least the single top-scoring term regardless of
+        // budget (see its "always keeping at least the top term" doc comment), so a budget
+        // of `Some(1)` must leave EXACTLY one term. If the guard were bypassed (e.g. the
+        // budget were ignored, or applied only at some other layer), the tight run would
+        // select the same 4 terms as the loose run and this assertion would fail.
+        let idx = corpus();
+        let pass1 = search(&idx, &build_query(&params("printer")).unwrap(), 0.0, 5);
+        let doc_ids: Vec<usize> = pass1.iter().map(|h| h.id).collect();
+        assert_eq!(
+            doc_ids,
+            vec![0],
+            "pass 1 for \"printer\" must be doc0 only: {doc_ids:?}"
+        );
+
+        let base_cfg = MltParams {
+            fields: idx.indexed_fields(),
+            min_term_freq: 1,
+            max_query_terms: 10,
+            min_doc_freq: 1,
+            max_doc_freq: None,
+            posting_budget: Some(9999), // effectively unbounded for this tiny corpus
+            timeout: None,
+            term_filters: Vec::new(),
+            range_filters: Vec::new(),
+            min_should_match: None,
+            field_weights: HashMap::new(),
+            size: 0,
+            min_score: 0.0,
+        };
+        let loose = select_terms(&idx, &doc_ids, &base_cfg);
+        let tight_cfg = MltParams {
+            posting_budget: Some(1),
+            ..base_cfg.clone()
+        };
+        let tight = select_terms(&idx, &doc_ids, &tight_cfg);
+
+        assert!(
+            loose.len() > 1,
+            "need >1 terms normally selected to prove the guard actually shrinks the set: {:?}",
+            loose.iter().map(|s| &s.term).collect::<Vec<_>>()
+        );
+        assert!(
+            tight.len() < loose.len(),
+            "tight posting_budget must shrink the selected-term count: loose={:?} tight={:?}",
+            loose.iter().map(|s| &s.term).collect::<Vec<_>>(),
+            tight.iter().map(|s| &s.term).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tight.len(),
+            1,
+            "posting_budget=1 must bound feedback terms to just the top-scoring one: {:?}",
+            tight.iter().map(|s| &s.term).collect::<Vec<_>>()
         );
     }
 }

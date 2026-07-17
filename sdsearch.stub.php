@@ -165,7 +165,10 @@ namespace SdSearch {
          * - `prf.fields` (optional, default `[]`): source fields to harvest terms from;
          *   empty = all indexed fields.
          *
-         * Returns the same JSON hit array shape as {@see Engine::search()}.
+         * Returns the same JSON hit array shape as {@see Engine::search()}. The result is a
+         * RERANK of the augmented query, not strictly a superset of {@see Engine::search()}:
+         * with a nonzero `min_score` or a limit that binds, `semantic_query` may omit hits
+         * that a plain `search()` call would return.
          *
          * @param string $indexDir   Path to the ZSL index directory.
          * @param string $paramsJson JSON-encoded query parameters + optional `prf` object (see above).
