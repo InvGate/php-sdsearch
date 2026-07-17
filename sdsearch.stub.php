@@ -44,7 +44,8 @@ namespace SdSearch {
          *   "min_score": 0.0,
          *   "limit": 20,
          *   "accent_insensitive": false,
-         *   "field_weights": { "title": 3.0, "description": 1.0 }
+         *   "field_weights": { "title": 3.0, "description": 1.0 },
+         *   "similarity": "bm25"
          * }
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
@@ -53,6 +54,9 @@ namespace SdSearch {
          *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
          * - `field_weights` (optional, default `{}`): per-field score multipliers; a field not
          *   listed weighs `1.0`. Empty = every field weighed equally (current behavior).
+         * - `similarity` (optional, default `"bm25"`): scoring algorithm, `"bm25"` or `"tfidf"`;
+         *   an unknown value throws. As of 0.2.0 BM25 is the default ranking; pass
+         *   `"similarity": "tfidf"` to restore the pre-0.2.0 (TF-IDF) ranking.
          *
          * The return value is a JSON array of hits:
          * ```json
