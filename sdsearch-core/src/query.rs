@@ -554,6 +554,31 @@ mod tests {
         }
     }
 
+    /// true only if some `Boosted` subtree's inner leaf is an `AccentTerm` — unlike
+    /// `query_has_accent_term`, this ignores literal (non-boosted) clauses, so it isolates
+    /// the synonym leaf's shape specifically instead of also matching the literal token's
+    /// own (unwrapped) AccentTerm clause when `accent_insensitive` is on.
+    fn boosted_leaf_is_accent_term(q: &Query) -> bool {
+        match q {
+            Query::Boosted { inner, .. } => matches!(**inner, Query::AccentTerm { .. }),
+            Query::Boolean { clauses } => {
+                clauses.iter().any(|(_, c)| boosted_leaf_is_accent_term(c))
+            }
+            _ => false,
+        }
+    }
+
+    /// true if some `Boosted` subtree's inner leaf is a plain `Term` (used to confirm a
+    /// Boosted synonym clause exists at all, so the accompanying `!boosted_leaf_is_accent_term`
+    /// check isn't vacuously true).
+    fn has_boosted_term_leaf(q: &Query) -> bool {
+        match q {
+            Query::Boosted { inner, .. } => matches!(**inner, Query::Term { .. }),
+            Query::Boolean { clauses } => clauses.iter().any(|(_, c)| has_boosted_term_leaf(c)),
+            _ => false,
+        }
+    }
+
     #[test]
     fn build_query_accent_flag_emits_accent_terms() {
         let mut p = params("avion");
@@ -999,7 +1024,10 @@ mod tests {
         let mut p = params("laptop");
         p.synonyms = true; // accent_insensitive stays false
         let q = text_subquery_with_dict(&p, &dict);
-        assert!(!query_has_accent_term(&q));
+        // a Boosted synonym clause exists at all (not vacuously true below)...
+        assert!(has_boosted_term_leaf(&q));
+        // ...and specifically its inner leaf is a plain Term, not an AccentTerm.
+        assert!(!boosted_leaf_is_accent_term(&q));
     }
 
     #[test]
@@ -1009,7 +1037,9 @@ mod tests {
         p.synonyms = true;
         p.accent_insensitive = true;
         let q = text_subquery_with_dict(&p, &dict);
-        // the boosted synonym clause must contain an AccentTerm
-        assert!(query_has_accent_term(&q));
+        // the Boosted synonym clause's inner leaf specifically must be an AccentTerm
+        // (not just some AccentTerm anywhere in the tree, which the literal per-token
+        // clause already provides when accent_insensitive is on).
+        assert!(boosted_leaf_is_accent_term(&q));
     }
 }
