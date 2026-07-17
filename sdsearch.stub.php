@@ -177,6 +177,39 @@ namespace SdSearch {
          *                    internal engine error.
          */
         public function semantic_query(string $indexDir, string $paramsJson): string {}
+
+        /**
+         * Hybrid search: runs the query through both the lexical retriever ({@see Engine::search()})
+         * and the semantic retriever ({@see Engine::semantic_query()}, two-pass PRF), then fuses
+         * the two rankings with Reciprocal Rank Fusion (RRF) — rank-based, so the retrievers'
+         * non-comparable score scales never mix.
+         *
+         * `$paramsJson` accepts the SAME object as {@see Engine::search()}, plus an optional
+         * `"prf"` object (see {@see Engine::semantic_query()}) and an optional `"hybrid"` object
+         * (all keys optional, defaults shown):
+         * ```json
+         * {
+         *   "text": "free text query",
+         *   "prf": { "top_k": 5, "num_terms": 10, "feedback_weight": 0.3 },
+         *   "hybrid": { "k": 60, "depth": 100 }
+         * }
+         * ```
+         * - `hybrid.k`: RRF constant; damps the weight of top ranks (canonical default 60).
+         * - `hybrid.depth`: candidate pool fetched per retriever before fusion (0 = unlimited).
+         *
+         * `min_score` is applied inside each retriever on its own native score scale before
+         * fusion; `limit` truncates the fused result (`limit == 0` = unlimited). Each returned
+         * hit's `score` is the RRF fused score (small, ~0.01-0.03 per matching retriever) and is
+         * NOT comparable to a plain `search()` score. Because the lexical retriever enters fusion
+         * in full, hybrid search fixes the PRF wart: a strong plain hit is always represented.
+         *
+         * @param string $indexDir   Path to the ZSL index directory.
+         * @param string $paramsJson JSON query params + optional `prf` and `hybrid` objects.
+         * @return string JSON-encoded array of hits (see {@see Engine::search()}).
+         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
+         *                    internal engine error.
+         */
+        public function hybrid_query(string $indexDir, string $paramsJson): string {}
     }
 
     /**
