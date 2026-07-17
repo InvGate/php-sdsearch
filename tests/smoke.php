@@ -24,4 +24,19 @@ if (!\is_array($decoded)) {
 }
 \fwrite(\STDOUT, "hybrid_query OK: " . \count($decoded) . " hits\n");
 
+// smoke test: Engine::hybrid_query with explicit "prf"/"hybrid" keys — catches a mistyped
+// serde field name at the PHP boundary (e.g. k/depth/top_k), since sdsearch-php is cdylib
+// (0 unit tests) and this is the only place the explicit-keys path is exercised.
+$hybridExplicit = $engine->hybrid_query($indexDir, \json_encode([
+    'text' => 'vpn',
+    'prf' => ['top_k' => 3, 'num_terms' => 5],
+    'hybrid' => ['k' => 10, 'depth' => 5],
+]));
+$decodedExplicit = \json_decode($hybridExplicit, true);
+if (!\is_array($decodedExplicit)) {
+    \fwrite(\STDERR, "FAIL: hybrid_query with explicit prf/hybrid keys did not return a JSON array\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "hybrid_query explicit-keys OK: " . \count($decodedExplicit) . " hits\n");
+
 exit(0);

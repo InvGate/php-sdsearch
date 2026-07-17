@@ -28,6 +28,13 @@ pub fn fuse_rrf(rankings: &[Vec<Hit>], k: usize, limit: usize) -> Vec<Hit> {
     let mut scores: HashMap<usize, f32> = HashMap::new();
     let mut repr: HashMap<usize, Hit> = HashMap::new();
     for list in rankings {
+        debug_assert!(
+            {
+                let mut seen = std::collections::HashSet::new();
+                list.iter().all(|h| seen.insert(h.id))
+            },
+            "fuse_rrf: each ranking list must have unique doc ids (got a duplicate)"
+        );
         for (i, hit) in list.iter().enumerate() {
             let rank = i + 1;
             let contribution = 1.0 / (k as f32 + rank as f32);
@@ -114,6 +121,16 @@ mod tests {
         // both empty: empty result.
         let none = fuse_rrf(&[Vec::new(), Vec::new()], 60, 0);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "unique doc ids")]
+    fn duplicate_id_in_one_list_panics_debug_assert() {
+        // a single list with a duplicate id violates fuse_rrf's per-list uniqueness
+        // precondition; the debug_assert should fire (only active with debug_assertions,
+        // which cargo test enables by default).
+        let dup = vec![hit(1), hit(1)];
+        fuse_rrf(&[dup], 60, 0);
     }
 
     #[test]
