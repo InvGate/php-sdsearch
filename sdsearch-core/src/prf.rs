@@ -391,12 +391,13 @@ mod tests {
     }
 
     /// Corpus for the coord-dilution test: doc0 is the sole base match for "widget" and
-    /// contributes NOTHING else to its own stored text, so its own harvested vocabulary
-    /// (from doc1..4, the other pass-1 docs) never includes a term doc0 itself contains.
-    /// doc1..4 each add "widget" plus one unique "extraN" term; the fillers keep
-    /// "widget"'s doc frequency (5) under n_docs/2 (=4) so it's NOT excluded by the
-    /// default max_doc_freq guard, i.e. it does get selected — but only doc1..4 (its
-    /// origin docs) can match on it, never doc0.
+    /// contributes NOTHING else to its own stored text. doc1..4 each add "widget" plus one
+    /// unique "extraN" term. Crucially, "widget"'s doc frequency (5) EXCEEDS the default
+    /// max_doc_freq guard (n_docs/2 = 9/2 = 4), so "widget" is EXCLUDED from the harvest —
+    /// only the extraN terms are selected. That exclusion is what makes the test valid:
+    /// doc0's only term never enters the feedback subtree, so doc0 can match ONLY the base
+    /// clause and gets coord-diluted (matched/total = 1/2). If "widget" were harvested
+    /// instead, doc0 would match both clauses and would NOT be diluted.
     fn dilution_corpus() -> MemoryIndex {
         let mut m = MemoryIndex::new();
         for text in [
