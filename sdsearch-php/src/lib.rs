@@ -13,6 +13,7 @@ use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::prf::PrfParams;
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::score::Similarity;
+use sdsearch_core::search::Hit;
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index, search_prf_index};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
@@ -212,7 +213,9 @@ fn occur_from(s: &str) -> Occur {
 }
 
 /// Maps the shared search DTO into core `QueryParams` (used by both `run` and `run_semantic`).
-fn query_params_from(dto: &ParamsDto) -> Result<QueryParams, String> {
+/// Takes `dto` by value and moves its fields — callers that still need `dto.min_score` /
+/// `dto.limit` afterward must read those (both `Copy`) before calling this.
+fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
     let similarity = match dto.similarity.as_deref() {
         None | Some("bm25") => Similarity::Bm25,
         Some("tfidf") => Similarity::TfIdf,
@@ -223,46 +226,36 @@ fn query_params_from(dto: &ParamsDto) -> Result<QueryParams, String> {
         }
     };
     Ok(QueryParams {
-        text: dto.text.clone(),
+        text: dto.text,
         where_groups: dto
             .r#where
-            .iter()
+            .into_iter()
             .map(|w| WhereGroup {
-                field: w.field.clone(),
-                values: w.values.clone(),
+                field: w.field,
+                values: w.values,
                 occur: occur_from(&w.occur),
             })
             .collect(),
         in_groups: dto
             .r#in
-            .iter()
+            .into_iter()
             .map(|i| InGroup {
-                field: i.field.clone(),
-                values: i.values.clone(),
+                field: i.field,
+                values: i.values,
             })
             .collect(),
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0,
         accent_insensitive: dto.accent_insensitive,
-        field_weights: dto.field_weights.clone(),
+        field_weights: dto.field_weights,
         similarity,
     })
 }
 
-/// fallible core: parses params, runs search_index, serializes hits. Errors are returned
-/// as String (the boundary converts them into PhpException).
-fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
-    let dto: ParamsDto =
-        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
-    let params = query_params_from(&dto)?;
-    let hits = search_index(
-        Path::new(index_dir),
-        &params,
-        dto.min_score,
-        dto.limit as usize,
-    )
-    .map_err(|e| format!("sdsearch: {e}"))?;
+/// Maps a `Vec<Hit>` into the JSON hit-array contract shared by `run` and `run_semantic`.
+/// `run_mlt` has a different (projecting) variant and is not covered by this helper.
+fn hits_to_json(hits: Vec<Hit>) -> Result<String, String> {
     let out: Vec<HitDto> = hits
         .into_iter()
         .map(|h| HitDto {
@@ -274,12 +267,27 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
     serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
 }
 
+/// fallible core: parses params, runs search_index, serializes hits. Errors are returned
+/// as String (the boundary converts them into PhpException).
+fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: ParamsDto =
+        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let min_score = dto.min_score;
+    let limit = dto.limit;
+    let params = query_params_from(dto)?;
+    let hits = search_index(Path::new(index_dir), &params, min_score, limit as usize)
+        .map_err(|e| format!("sdsearch: {e}"))?;
+    hits_to_json(hits)
+}
+
 /// fallible core of `Engine::semantic_query`: parses the search DTO + optional `prf`
 /// object, runs the two-pass PRF search, serializes hits. Errors as String.
 fn run_semantic(index_dir: &str, params_json: &str) -> Result<String, String> {
     let dto: SemanticParamsDto =
         serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
-    let params = query_params_from(&dto.base)?;
+    let min_score = dto.base.min_score;
+    let limit = dto.base.limit;
+    let params = query_params_from(dto.base)?;
     let prf = PrfParams {
         top_k: dto.prf.top_k as usize,
         num_terms: dto.prf.num_terms as usize,
@@ -294,19 +302,11 @@ fn run_semantic(index_dir: &str, params_json: &str) -> Result<String, String> {
         Path::new(index_dir),
         &params,
         &prf,
-        dto.base.min_score,
-        dto.base.limit as usize,
+        min_score,
+        limit as usize,
     )
     .map_err(|e| format!("sdsearch: {e}"))?;
-    let out: Vec<HitDto> = hits
-        .into_iter()
-        .map(|h| HitDto {
-            id: h.id as u64,
-            score: h.score,
-            fields: h.fields,
-        })
-        .collect();
-    serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
+    hits_to_json(hits)
 }
 
 /// fallible core of `Engine::more_like_this`: parses MLT params, runs the query, projects

@@ -7,7 +7,7 @@
 
 use crate::index::IndexReader;
 use crate::mlt::{MltParams, select_terms};
-use crate::query::{Occur, Query, QueryParams, build_query, search_with_weights};
+use crate::query::{Occur, Query, QueryError, QueryParams, build_query, search_with_weights};
 use crate::search::Hit;
 use std::collections::HashMap;
 
@@ -46,9 +46,11 @@ impl Default for PrfParams {
     }
 }
 
-/// Runs a two-pass PRF search. Degrades gracefully to a plain search (never errors, only
-/// slower) when PRF cannot contribute: `top_k==0`, `num_terms==0`, no pass-1 hits, or no
-/// feedback terms survive the guards — in those cases the result is identical to `query`.
+/// Runs a two-pass PRF search. An invalid query (empty text, empty where/in field —
+/// see `QueryError`) propagates its error, mirroring `search_index`. PRF itself degrades
+/// gracefully to a plain search (never errors, only slower) when it cannot contribute:
+/// `top_k==0`, `num_terms==0`, no pass-1 hits, or no feedback terms survive the guards —
+/// in those cases the result is identical to `query`.
 ///
 /// In the ACTIVE two-pass path the result is a RERANK, not a strict superset: the
 /// augmented query is `Boolean[Should(base), Should(Boosted(feedback))]`, so an
@@ -63,11 +65,9 @@ pub fn search_prf(
     prf: &PrfParams,
     min_score: f32,
     limit: usize,
-) -> Vec<Hit> {
+) -> Result<Vec<Hit>, QueryError> {
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let Ok(base) = build_query(params) else {
-        return Vec::new();
-    };
+    let base = build_query(params)?;
 
     // Plain search closure (the graceful-degradation fallback and the final pass share it).
     let plain = |q: &Query, ms: f32, l: usize| {
@@ -75,14 +75,14 @@ pub fn search_prf(
     };
 
     if prf.top_k == 0 || prf.num_terms == 0 {
-        return plain(&base, min_score, lim);
+        return Ok(plain(&base, min_score, lim));
     }
 
     // Pass 1: take the top_k best hits as pseudo-relevant (min_score 0.0 so feedback
     // isn't starved; the real min_score is applied on pass 2).
     let pass1 = plain(&base, 0.0, prf.top_k);
     if pass1.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let doc_ids: Vec<usize> = pass1.iter().map(|h| h.id).collect();
 
@@ -110,7 +110,7 @@ pub fn search_prf(
     };
     let selected = select_terms(index, &doc_ids, &cfg);
     if selected.is_empty() {
-        return plain(&base, min_score, lim);
+        return Ok(plain(&base, min_score, lim));
     }
 
     // Augmented query: original at full weight (Should), feedback terms as a
@@ -137,7 +137,7 @@ pub fn search_prf(
     let augmented = Query::Boolean {
         clauses: vec![(Occur::Should, base), (Occur::Should, feedback)],
     };
-    plain(&augmented, min_score, lim)
+    Ok(plain(&augmented, min_score, lim))
 }
 
 #[cfg(test)]
@@ -198,7 +198,8 @@ mod tests {
             ids(&plain)
         );
         // PRF harvests paper/jam/toner from doc0 and surfaces doc1.
-        let prf = search_prf(&idx, &params("printer"), &PrfParams::default(), 0.0, 100);
+        let prf = search_prf(&idx, &params("printer"), &PrfParams::default(), 0.0, 100)
+            .expect("valid query");
         assert!(
             ids(&prf).contains(&1),
             "PRF must retrieve doc1: {:?}",
@@ -214,7 +215,7 @@ mod tests {
             top_k: 0,
             ..PrfParams::default()
         };
-        let prf = search_prf(&idx, &params("printer"), &off, 0.0, 100);
+        let prf = search_prf(&idx, &params("printer"), &off, 0.0, 100).expect("valid query");
         let plain = search(&idx, &build_query(&params("printer")).unwrap(), 0.0, 100);
         assert_eq!(ids(&prf), ids(&plain));
     }
@@ -226,7 +227,7 @@ mod tests {
             num_terms: 0,
             ..PrfParams::default()
         };
-        let prf = search_prf(&idx, &params("printer"), &off, 0.0, 100);
+        let prf = search_prf(&idx, &params("printer"), &off, 0.0, 100).expect("valid query");
         let plain = search(&idx, &build_query(&params("printer")).unwrap(), 0.0, 100);
         assert_eq!(ids(&prf), ids(&plain));
     }
@@ -240,7 +241,8 @@ mod tests {
             &PrfParams::default(),
             0.0,
             100,
-        );
+        )
+        .expect("valid query");
         assert!(prf.is_empty());
     }
 
@@ -253,7 +255,7 @@ mod tests {
             min_doc_freq: 9999,
             ..PrfParams::default()
         };
-        let prf = search_prf(&idx, &params("printer"), &strict, 0.0, 100);
+        let prf = search_prf(&idx, &params("printer"), &strict, 0.0, 100).expect("valid query");
         let plain = search(&idx, &build_query(&params("printer")).unwrap(), 0.0, 100);
         assert_eq!(ids(&prf), ids(&plain));
     }
@@ -262,7 +264,8 @@ mod tests {
     fn original_match_still_present() {
         // The doc that matched the original term must never be dropped by PRF.
         let idx = corpus();
-        let prf = search_prf(&idx, &params("printer"), &PrfParams::default(), 0.0, 100);
+        let prf = search_prf(&idx, &params("printer"), &PrfParams::default(), 0.0, 100)
+            .expect("valid query");
         assert!(
             ids(&prf).contains(&0),
             "original match doc0 missing: {:?}",

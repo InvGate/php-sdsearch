@@ -104,7 +104,7 @@ pub(crate) fn select_terms(
         for stored in &stored_per_doc {
             if let Some(text) = stored.get(field) {
                 for tok in analyze(text) {
-                    *tf.entry(tok).or_insert(0) += 1;
+                    *tf.entry(tok).or_default() += 1;
                 }
             }
         }

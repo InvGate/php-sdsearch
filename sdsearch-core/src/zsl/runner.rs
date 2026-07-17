@@ -62,7 +62,7 @@ pub fn search_prf_index(
     limit: usize,
 ) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
     let index = ZslIndex::open(index_dir)?;
-    Ok(search_prf(&index, params, prf, min_score, limit))
+    Ok(search_prf(&index, params, prf, min_score, limit)?)
 }
 
 /// Search-adapter fallback: an all-fields Boolean of terms (Should) over the UNIQUE
