@@ -144,6 +144,20 @@ impl IndexReader for Segment {
             .unwrap_or(0)
     }
 
+    fn avg_field_len(&self, field: &str) -> f32 {
+        match self.lengths.get(field) {
+            Some(v) if !v.is_empty() => {
+                let total: u64 = v.iter().map(|&l| u64::from(l)).sum();
+                if total == 0 {
+                    1.0
+                } else {
+                    total as f32 / v.len() as f32
+                }
+            }
+            _ => 1.0,
+        }
+    }
+
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
         self.stored.get(doc_id).cloned().unwrap_or_default()
     }
@@ -217,6 +231,29 @@ mod tests {
             Some("hello hello world")
         );
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn segment_avg_field_len_matches_memory_index() {
+        use crate::doc::{Document, FieldKind};
+        use crate::index::MemoryIndex;
+        let mut mem = MemoryIndex::new();
+        for text in ["a b c", "a", "a b"] {
+            // lengths 3, 1, 2 => avg 2.0
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            mem.add_document(d);
+        }
+        let dir = std::env::temp_dir().join(format!("sdsearch_avg_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        mem.write_to(&dir).unwrap();
+        let seg = Segment::open(&dir).unwrap();
+        assert!(
+            (seg.avg_field_len("body") - 2.0).abs() < 1e-6,
+            "got {}",
+            seg.avg_field_len("body")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
