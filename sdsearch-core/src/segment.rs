@@ -1,6 +1,6 @@
 //! read-only reader of an on-disk index (format v2, build-once).
 
-use crate::index::{IndexReader, SegmentMeta};
+use crate::index::{IndexReader, SegmentMeta, sampled_avg_field_len};
 use crate::serialize::read_vint;
 use crate::zsl::bytes::checked_capacity;
 use fst::{IntoStreamer, Streamer};
@@ -16,19 +16,6 @@ pub struct Segment {
     /// `ZslSegment`), so `avg_field_len` is a lookup rather than an O(num_docs) sum per query.
     avg_field_len: HashMap<String, f32>,
     stored: Vec<HashMap<String, String>>,
-}
-
-/// average of a field's per-doc length column; empty column or all-zero total => 1.0.
-fn avg_of(lengths: &[u32]) -> f32 {
-    if lengths.is_empty() {
-        return 1.0;
-    }
-    let total: u64 = lengths.iter().map(|&l| u64::from(l)).sum();
-    if total == 0 {
-        1.0
-    } else {
-        total as f32 / lengths.len() as f32
-    }
 }
 
 impl Segment {
@@ -62,7 +49,7 @@ impl Segment {
         }
         let avg_field_len = lengths
             .iter()
-            .map(|(field, v)| (field.clone(), avg_of(v)))
+            .map(|(field, v)| (field.clone(), sampled_avg_field_len(v.len(), |i| v[i])))
             .collect();
         Ok(Segment {
             num_docs: meta.num_docs,

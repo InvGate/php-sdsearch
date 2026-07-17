@@ -1,5 +1,5 @@
 //! ZslSegment: implements IndexReader over a single-segment ZSL index.
-use crate::index::IndexReader;
+use crate::index::{IndexReader, sampled_avg_field_len};
 use crate::zsl::cfs::CompoundFile;
 use crate::zsl::deletes::DeletedDocs;
 use crate::zsl::fields::{FieldInfo, read_field_infos};
@@ -186,16 +186,15 @@ impl ZslSegment {
             Some(n) => read_norms(cfs.sub(&n).unwrap(), &indexed, num_docs_total),
             None => HashMap::new(),
         };
+        // Bounded sample, NOT an O(num_docs) fold: this reader opens per request, so an
+        // O(N) pass here would tax every low-hit query (see `sampled_avg_field_len`).
         let avg_field_len = norms
             .iter()
             .map(|(field, bytes)| {
-                let total: u64 = bytes.iter().map(|&b| u64::from(approx_field_len(b))).sum();
-                let avg = if bytes.is_empty() || total == 0 {
-                    1.0
-                } else {
-                    total as f32 / bytes.len() as f32
-                };
-                (field.clone(), avg)
+                (
+                    field.clone(),
+                    sampled_avg_field_len(bytes.len(), |i| approx_field_len(bytes[i])),
+                )
             })
             .collect::<HashMap<String, f32>>();
 

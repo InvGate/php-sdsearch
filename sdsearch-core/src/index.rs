@@ -50,6 +50,34 @@ pub trait IndexReader {
     }
 }
 
+/// Uniform-stride sampled mean of a field's per-doc lengths, bounded to at most
+/// `AVG_SAMPLE_CAP` samples. Computing the collection's average field length at open
+/// must stay O(1): the on-disk readers open per request (PHP is shared-nothing), so an
+/// O(num_docs) fold there would tax every low-hit query. The average is a stable
+/// statistic (and the ZSL norm byte is already an 8-bit approximation), so a bounded
+/// sample estimates it with negligible error. `n` is the doc count; `value(i)` yields
+/// the i-th length. Returns 1.0 for an empty population or an all-zero total.
+pub(crate) fn sampled_avg_field_len(n: usize, value: impl Fn(usize) -> u32) -> f32 {
+    const AVG_SAMPLE_CAP: usize = 8192;
+    if n == 0 {
+        return 1.0;
+    }
+    let stride = (n / AVG_SAMPLE_CAP).max(1);
+    let mut total: u64 = 0;
+    let mut count: u64 = 0;
+    let mut i = 0;
+    while i < n {
+        total += u64::from(value(i));
+        count += 1;
+        i += stride;
+    }
+    if total == 0 {
+        1.0
+    } else {
+        total as f32 / count as f32
+    }
+}
+
 /// on-disk segment metadata (format v2).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct SegmentMeta {
@@ -363,5 +391,17 @@ mod tests {
     fn avg_field_len_unknown_field_is_one() {
         let idx = MemoryIndex::new();
         assert_eq!(idx.avg_field_len("nope"), 1.0);
+    }
+
+    #[test]
+    fn sampled_avg_field_len_guards_and_estimates() {
+        // empty population and all-zero total both fall back to 1.0
+        assert_eq!(sampled_avg_field_len(0, |_| 0), 1.0);
+        assert_eq!(sampled_avg_field_len(100, |_| 0), 1.0);
+        // constant length: the sample equals the exact mean at any size (past the cap)
+        assert_eq!(sampled_avg_field_len(1_000_000, |_| 7), 7.0);
+        // two blocks past the cap: stride sampling recovers the true mean (6.0) closely
+        let est = sampled_avg_field_len(1_000_000, |i| if i < 500_000 { 4 } else { 8 });
+        assert!((est - 6.0).abs() < 0.1, "est={est}");
     }
 }
