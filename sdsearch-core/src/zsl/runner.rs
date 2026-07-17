@@ -3,13 +3,51 @@
 //! limit==0 = unlimited).
 
 use crate::analysis::analyze;
+use crate::hybrid::{HybridParams, fuse_rrf};
+use crate::index::IndexReader;
 use crate::mlt::{MltParams, more_like_this};
 use crate::prf::{PrfParams, search_prf};
-use crate::query::{InGroup, Occur, Query, QueryParams, build_query, search, search_with_weights};
+use crate::query::{
+    InGroup, Occur, Query, QueryError, QueryParams, build_query, search, search_with_weights,
+};
 use crate::search::Hit;
 use crate::zsl::index::ZslIndex;
 use std::collections::HashSet;
 use std::path::Path;
+
+/// Lexical retriever shared by `search_index` and `search_hybrid_index`: builds the query,
+/// runs it, and falls back to an all-fields Boolean over the text when the primary result is
+/// empty. `limit == 0` = unlimited. An invalid query propagates as `QueryError`.
+fn lexical_search(
+    index: &impl IndexReader,
+    params: &QueryParams,
+    min_score: f32,
+    limit: usize,
+) -> Result<Vec<Hit>, QueryError> {
+    let query = build_query(params)?;
+    let lim = if limit == 0 { usize::MAX } else { limit };
+    let mut hits = search_with_weights(
+        index,
+        &query,
+        &params.field_weights,
+        params.similarity,
+        min_score,
+        lim,
+    );
+    if hits.is_empty() {
+        if let Some(fb) = fallback_query(&params.text) {
+            hits = search_with_weights(
+                index,
+                &fb,
+                &params.field_weights,
+                params.similarity,
+                min_score,
+                lim,
+            );
+        }
+    }
+    Ok(hits)
+}
 
 /// Searches a ZSL index reproducing the host application's Zend Lucene search adapter:
 /// build_query -> executor -> if empty, all-fields fallback; filters min_score (`>=`),
@@ -21,29 +59,7 @@ pub fn search_index(
     limit: usize,
 ) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
     let index = ZslIndex::open(index_dir)?;
-    let query = build_query(params)?;
-    let lim = if limit == 0 { usize::MAX } else { limit };
-    let mut hits = search_with_weights(
-        &index,
-        &query,
-        &params.field_weights,
-        params.similarity,
-        min_score,
-        lim,
-    );
-    if hits.is_empty() {
-        if let Some(fb) = fallback_query(&params.text) {
-            hits = search_with_weights(
-                &index,
-                &fb,
-                &params.field_weights,
-                params.similarity,
-                min_score,
-                lim,
-            );
-        }
-    }
-    Ok(hits)
+    Ok(lexical_search(&index, params, min_score, limit)?)
 }
 
 /// Opens a ZSL index and runs a two-pass PRF (semantic) search. `limit == 0` = unlimited.
@@ -63,6 +79,39 @@ pub fn search_prf_index(
 ) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
     let index = ZslIndex::open(index_dir)?;
     Ok(search_prf(&index, params, prf, min_score, limit)?)
+}
+
+/// Opens a ZSL index once and runs a HYBRID search: the lexical retriever (`search_index`'s
+/// logic, fallback included) and the semantic retriever (`search_prf`) are run as two
+/// independent rankers and fused by Reciprocal Rank Fusion (`fuse_rrf`).
+///
+/// `min_score` filters each leg on its own native score scale BEFORE fusion. Each leg fetches
+/// up to `hybrid.depth` candidates (0 = unlimited; raised to `limit` when a larger final
+/// `limit` binds). `limit == 0` = unlimited final result. The returned `Hit.score` is the RRF
+/// fused score (scale ~0.01-0.03 per matching leg), NOT comparable to a plain `search` score.
+///
+/// Because the lexical leg enters fusion in full, at `min_score == 0.0` and an unlimited
+/// `limit` the result is a superset of a plain `search_index` call — this fixes the PRF wart
+/// where a binding `min_score`/`limit` could drop a hit that plain search returned.
+pub fn search_hybrid_index(
+    index_dir: &Path,
+    params: &QueryParams,
+    prf: &PrfParams,
+    hybrid: &HybridParams,
+    min_score: f32,
+    limit: usize,
+) -> Result<Vec<Hit>, Box<dyn std::error::Error>> {
+    let index = ZslIndex::open(index_dir)?;
+    // Candidate depth per retriever: unlimited if either the pool or the final limit is
+    // unlimited; otherwise the larger of the two so fusion has room to reorder.
+    let depth = match (hybrid.depth, limit) {
+        (0, _) | (_, 0) => 0,
+        (d, l) => d.max(l),
+    };
+    let k = hybrid.k.max(1);
+    let lexical = lexical_search(&index, params, min_score, depth)?;
+    let semantic = search_prf(&index, params, prf, min_score, depth)?;
+    Ok(fuse_rrf(&[lexical, semantic], k, limit))
 }
 
 /// Search-adapter fallback: an all-fields Boolean of terms (Should) over the UNIQUE
@@ -334,5 +383,128 @@ mod tests {
         assert!(none.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_hybrid_index_is_superset_of_lexical() {
+        // At min_score=0 / unlimited, the lexical leg enters fusion in full, so every id a
+        // plain search returns must appear in the fused output (the PRF wart-fix).
+        use crate::hybrid::HybridParams;
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let p = params("vpn");
+        let lexical = search_index(&dir, &p, 0.0, 0).unwrap();
+        let hybrid = search_hybrid_index(
+            &dir,
+            &p,
+            &PrfParams::default(),
+            &HybridParams::default(),
+            0.0,
+            0,
+        )
+        .unwrap();
+        assert!(
+            !hybrid.is_empty(),
+            "hybrid must return hits for a known token"
+        );
+        let lex_ids: HashSet<usize> = lexical.iter().map(|h| h.id).collect();
+        let hyb_ids: HashSet<usize> = hybrid.iter().map(|h| h.id).collect();
+        assert!(
+            lex_ids.is_subset(&hyb_ids),
+            "hybrid must represent every lexical hit: lex={lex_ids:?} hyb={hyb_ids:?}"
+        );
+    }
+
+    #[test]
+    fn search_hybrid_index_propagates_query_error() {
+        // Empty-text query is invalid and must propagate as Err, not an empty Ok.
+        use crate::hybrid::HybridParams;
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let r = search_hybrid_index(
+            &dir,
+            &params(""),
+            &PrfParams::default(),
+            &HybridParams::default(),
+            0.0,
+            0,
+        );
+        assert!(r.is_err(), "empty-text query must propagate an error");
+    }
+
+    #[test]
+    fn search_hybrid_index_limit_truncates() {
+        use crate::hybrid::HybridParams;
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let full = search_hybrid_index(
+            &dir,
+            &params("vpn"),
+            &PrfParams::default(),
+            &HybridParams::default(),
+            0.0,
+            0,
+        )
+        .unwrap();
+        assert!(
+            full.len() >= 2,
+            "expected >=2 fused hits for vpn: {:?}",
+            ids(&full)
+        );
+        let limited = search_hybrid_index(
+            &dir,
+            &params("vpn"),
+            &PrfParams::default(),
+            &HybridParams::default(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(limited.len(), 1, "limit=1 must truncate the fused list");
+    }
+
+    #[test]
+    fn search_hybrid_index_min_score_filters_each_leg() {
+        // Scores are normalized to <=1.0 per leg; a min_score above that filters BOTH legs
+        // before fusion => empty fused result. Proves min_score is applied inside the legs
+        // (fusion itself has no min_score knob).
+        use crate::hybrid::HybridParams;
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let r = search_hybrid_index(
+            &dir,
+            &params("vpn"),
+            &PrfParams::default(),
+            &HybridParams::default(),
+            2.0,
+            0,
+        )
+        .unwrap();
+        assert!(
+            r.is_empty(),
+            "min_score above normalized max must empty both legs: {:?}",
+            ids(&r)
+        );
+    }
+
+    #[test]
+    fn search_hybrid_index_prf_off_equals_lexical_ids() {
+        // With PRF disabled (top_k=0) the semantic leg returns the plain base query, so both
+        // legs cover the same docs; the fused id-set must equal the lexical id-set.
+        use crate::hybrid::HybridParams;
+        use crate::prf::PrfParams;
+        let dir = multiseg();
+        let p = params("vpn");
+        let off = PrfParams {
+            top_k: 0,
+            ..PrfParams::default()
+        };
+        let lexical = search_index(&dir, &p, 0.0, 0).unwrap();
+        let hybrid = search_hybrid_index(&dir, &p, &off, &HybridParams::default(), 0.0, 0).unwrap();
+        assert_eq!(
+            ids(&hybrid),
+            ids(&lexical),
+            "PRF-off fused id-set must equal lexical id-set"
+        );
     }
 }
