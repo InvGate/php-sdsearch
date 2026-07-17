@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod distance;
 pub mod doc;
+pub mod hybrid;
 pub mod index;
 pub mod mlt;
 pub mod prf;
