@@ -17,6 +17,9 @@ pub struct ZslSegment {
     fields: Vec<FieldInfo>,
     dict: TermDict,
     norms: HashMap<String, Vec<u8>>,
+    /// per-field average length over num_docs_total, precomputed once at open from
+    /// the norm bytes already in RAM (folded into the open path; no per-query cost).
+    avg_field_len: HashMap<String, f32>,
     deletes: DeletedDocs,
     cfs: CompoundFile,
     fdx_name: String,
@@ -183,6 +186,18 @@ impl ZslSegment {
             Some(n) => read_norms(cfs.sub(&n).unwrap(), &indexed, num_docs_total),
             None => HashMap::new(),
         };
+        let avg_field_len = norms
+            .iter()
+            .map(|(field, bytes)| {
+                let total: u64 = bytes.iter().map(|&b| u64::from(approx_field_len(b))).sum();
+                let avg = if bytes.is_empty() || total == 0 {
+                    1.0
+                } else {
+                    total as f32 / bytes.len() as f32
+                };
+                (field.clone(), avg)
+            })
+            .collect::<HashMap<String, f32>>();
 
         // .del lives OUTSIDE the .cfs; we load it only if the file exists. A corrupt or
         // unsupported (sparse) .del surfaces as an error at open time rather than a crash.
@@ -208,6 +223,7 @@ impl ZslSegment {
             fields,
             dict,
             norms,
+            avg_field_len,
             deletes,
             cfs,
             fdx_name,
@@ -251,6 +267,10 @@ impl IndexReader for ZslSegment {
             .get(field)
             .and_then(|v| v.get(doc_id))
             .map_or(1, |b| approx_field_len(*b))
+    }
+
+    fn avg_field_len(&self, field: &str) -> f32 {
+        self.avg_field_len.get(field).copied().unwrap_or(1.0)
     }
 
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
@@ -353,6 +373,17 @@ mod tests {
             s.stored_fields(0).get("id_key").map(String::as_str),
             Some("165")
         );
+    }
+
+    #[test]
+    fn zsl_segment_avg_field_len_is_precomputed_positive() {
+        use std::path::PathBuf;
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        let s = ZslSegment::open(&dir).unwrap();
+        assert!(s.avg_field_len("title") >= 1.0);
     }
 
     #[test]
