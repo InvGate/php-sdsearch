@@ -110,17 +110,29 @@ impl SynonymDict {
         let mut keys: Vec<&String> = self.map.keys().collect();
         keys.sort();
         let mut out = Vec::new();
-        out.extend_from_slice(&u32::try_from(keys.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(keys.len())
+                .expect("synonyms: too many entries for u32")
+                .to_le_bytes(),
+        );
         for key in keys {
             let values = &self.map[key];
             let kb = key.as_bytes();
-            out.extend_from_slice(&u16::try_from(kb.len()).unwrap_or(u16::MAX).to_le_bytes());
+            out.extend_from_slice(
+                &u16::try_from(kb.len())
+                    .expect("synonyms: key too long for u16 blob field")
+                    .to_le_bytes(),
+            );
             out.extend_from_slice(kb);
             let n = values.len().min(MAX_SYNONYMS_PER_TOKEN);
-            out.push(u8::try_from(n).unwrap_or(u8::MAX));
+            out.push(u8::try_from(n).expect("synonyms: value_count exceeds u8"));
             for v in &values[..n] {
                 let vb = v.as_bytes();
-                out.extend_from_slice(&u16::try_from(vb.len()).unwrap_or(u16::MAX).to_le_bytes());
+                out.extend_from_slice(
+                    &u16::try_from(vb.len())
+                        .expect("synonyms: value too long for u16 blob field")
+                        .to_le_bytes(),
+                );
                 out.extend_from_slice(vb);
             }
         }
@@ -221,12 +233,20 @@ mod tests {
     }
 
     #[test]
-    fn global_loads_seed_bundle() {
+    fn global_loads_bundle() {
         let d = global();
         // seed cross-lingual pairs must resolve in both directions
         assert!(d.expand("impresora").iter().any(|s| s == "printer"));
         assert!(d.expand("printer").iter().any(|s| s == "impresora"));
         // accent/case-insensitive lookup against the bundled data
         assert!(!d.expand("Portatil").is_empty());
+        // spot-checks against the full OMW bundle
+        assert!(
+            global()
+                .expand("ordenador")
+                .iter()
+                .any(|s| s == "computer" || s == "computadora")
+        );
+        assert!(global().expand("laptop").iter().any(|s| s == "portátil"));
     }
 }
