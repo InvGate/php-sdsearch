@@ -343,12 +343,17 @@ pub const SYNONYM_BOOST: f32 = 0.6;
 /// fuzzy + prefix wildcard (all over the lowercased and escaped text), plus the
 /// QueryParser::parse piece (one all-fields term per ANALYZER token over the RAW text). All Should.
 fn text_subquery(p: &QueryParams) -> Query {
-    text_subquery_with_dict(p, crate::synonyms::global())
+    // .then(...) short-circuits: crate::synonyms::global() (and its first-call
+    // OnceLock::get_or_init decode of the bundled dictionary) only runs when synonyms
+    // is on. synonyms:false must cost nothing, including "nothing parsed" — see synonyms.rs.
+    let dict = p.synonyms.then(crate::synonyms::global);
+    text_subquery_with_dict(p, dict)
 }
 
-/// Testable core of `text_subquery`: takes the synonym dictionary explicitly so
+/// Testable core of `text_subquery`: takes the synonym dictionary explicitly (as an
+/// `Option` so callers/tests can pass `None` without forcing the global to resolve) so
 /// unit tests can inject a fixture instead of the bundled global.
-fn text_subquery_with_dict(p: &QueryParams, dict: &crate::synonyms::SynonymDict) -> Query {
+fn text_subquery_with_dict(p: &QueryParams, dict: Option<&crate::synonyms::SynonymDict>) -> Query {
     let lc = p.text.to_lowercase();
     // escaping mirrors the host's query builder: str_replace ':', ',', '-' -> '\:', '\,', '\-'.
     let esc = lc
@@ -401,14 +406,16 @@ fn text_subquery_with_dict(p: &QueryParams, dict: &crate::synonyms::SynonymDict)
         };
         clauses.push((Occur::Should, leaf(tok.clone())));
         if p.synonyms {
-            for syn in dict.expand(&tok) {
-                clauses.push((
-                    Occur::Should,
-                    Query::Boosted {
-                        boost: SYNONYM_BOOST,
-                        inner: Box::new(leaf(syn.clone())),
-                    },
-                ));
+            if let Some(d) = dict {
+                for syn in d.expand(&tok) {
+                    clauses.push((
+                        Occur::Should,
+                        Query::Boosted {
+                            boost: SYNONYM_BOOST,
+                            inner: Box::new(leaf(syn.clone())),
+                        },
+                    ));
+                }
             }
         }
     }
@@ -1005,7 +1012,21 @@ mod tests {
     fn synonyms_off_adds_no_boosted_clauses() {
         let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
         let p = params("laptop"); // synonyms defaults to false in the helper
-        let q = text_subquery_with_dict(&p, &dict);
+        let q = text_subquery_with_dict(&p, Some(&dict));
+        assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 0);
+    }
+
+    /// Structural proxy for laziness: `text_subquery_with_dict` must work with `dict: None`
+    /// and produce the exact same (no-Boosted) clause structure as the `Some(&dict)` case
+    /// above, i.e. it never dereferences `dict` when `p.synonyms` is false. This is what
+    /// `text_subquery` actually passes in production (`p.synonyms.then(crate::synonyms::global)`
+    /// short-circuits to `None` without calling `global()`), so this proves the call site
+    /// can go through the off path without ever touching (and therefore never parsing) the
+    /// bundled dictionary.
+    #[test]
+    fn synonyms_off_never_touches_the_dict_even_as_none() {
+        let p = params("laptop"); // synonyms defaults to false in the helper
+        let q = text_subquery_with_dict(&p, None);
         assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 0);
     }
 
@@ -1014,7 +1035,7 @@ mod tests {
         let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook", "portátil"])]);
         let mut p = params("laptop");
         p.synonyms = true;
-        let q = text_subquery_with_dict(&p, &dict);
+        let q = text_subquery_with_dict(&p, Some(&dict));
         assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 2);
     }
 
@@ -1023,7 +1044,7 @@ mod tests {
         let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
         let mut p = params("laptop");
         p.synonyms = true; // accent_insensitive stays false
-        let q = text_subquery_with_dict(&p, &dict);
+        let q = text_subquery_with_dict(&p, Some(&dict));
         // a Boosted synonym clause exists at all (not vacuously true below)...
         assert!(has_boosted_term_leaf(&q));
         // ...and specifically its inner leaf is a plain Term, not an AccentTerm.
@@ -1036,7 +1057,7 @@ mod tests {
         let mut p = params("laptop");
         p.synonyms = true;
         p.accent_insensitive = true;
-        let q = text_subquery_with_dict(&p, &dict);
+        let q = text_subquery_with_dict(&p, Some(&dict));
         // the Boosted synonym clause's inner leaf specifically must be an AccentTerm
         // (not just some AccentTerm anywhere in the tree, which the literal per-token
         // clause already provides when accent_insensitive is on).
