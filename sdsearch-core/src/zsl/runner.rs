@@ -140,6 +140,45 @@ mod tests {
         dir
     }
 
+    // Bootstrap from the KB fixture and add a doc whose body carries a colon-bearing token.
+    // The analyzer keeps ':' inside a token, so "c:drive" is a SINGLE indexed term.
+    fn temp_index_with_punct_doc(tag: &str) -> PathBuf {
+        let src = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        let dir = std::env::temp_dir().join(format!("sdsearch_punct_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("body", "c:drive restore")],
+        })
+        .unwrap();
+        w.commit().unwrap();
+        dir
+    }
+
+    #[test]
+    fn prefix_reaches_a_colon_bearing_token() {
+        // Dropping the query-operator escaping lets a prefix like "c:dr" reach the indexed
+        // token "c:drive" through the wildcard leaf. The old escaping (`c\:dr*`) suppressed
+        // this because no indexed term carries a backslash.
+        let dir = temp_index_with_punct_doc("colon");
+        let hits = search_index(&dir, &params("c:dr"), 0.0, 0).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "prefix 'c:dr' should reach the 'c:drive' token via the wildcard leaf"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn text_only_matches_across_segments() {
         // "vpn" crosses segments -> [0,2] (same doc-set as the text-only boolean oracle).
