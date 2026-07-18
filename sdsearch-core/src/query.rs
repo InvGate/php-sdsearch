@@ -339,9 +339,18 @@ impl std::error::Error for QueryError {}
 /// is weaker evidence than the literal token the user typed, so it ranks below it.
 pub const SYNONYM_BOOST: f32 = 0.6;
 
-/// text subtree (port of the host's fuzzy-text subquery builder): per-word fuzzy + phrase
-/// fuzzy + prefix wildcard (all over the lowercased and escaped text), plus the
-/// QueryParser::parse piece (one all-fields term per ANALYZER token over the RAW text). All Should.
+/// text subtree (port of the host's fuzzy-text subquery builder): per-word fuzzy + prefix
+/// wildcard, plus one all-fields analyzer term per token. All Should.
+///
+/// We intentionally drop two vestiges of the host port: (1) the `:`/`,`/`-` escaping — the
+/// host escaped these as query operators, but our analyzer keeps them INSIDE tokens
+/// (`c:drive`, `back-up` are single terms), so escaping them only inserted backslashes that
+/// no indexed term carries; and (2) the whole-text fuzzy/wildcard for multi-word input, which
+/// could never match (no indexed term spans the whitespace). Removing them lets the fuzzy and
+/// wildcard leaves work on punctuation-bearing tokens, consistently with the analyzer.
+///
+/// When `synonyms` is on, each analyzer token additionally emits a down-weighted
+/// (`SYNONYM_BOOST`) Should clause per bundled synonym/translation (see `synonyms.rs`).
 fn text_subquery(p: &QueryParams) -> Query {
     // .then(...) short-circuits: crate::synonyms::global() (and its first-call
     // OnceLock::get_or_init decode of the bundled dictionary) only runs when synonyms
@@ -355,41 +364,28 @@ fn text_subquery(p: &QueryParams) -> Query {
 /// unit tests can inject a fixture instead of the bundled global.
 fn text_subquery_with_dict(p: &QueryParams, dict: Option<&crate::synonyms::SynonymDict>) -> Query {
     let lc = p.text.to_lowercase();
-    // escaping mirrors the host's query builder: str_replace ':', ',', '-' -> '\:', '\,', '\-'.
-    let esc = lc
-        .replace(':', "\\:")
-        .replace(',', "\\,")
-        .replace('-', "\\-");
-    let esc_words: Vec<&str> = esc.split_whitespace().collect();
     let mut clauses: Vec<(Occur, Query)> = Vec::new();
 
-    if esc_words.len() > 1 {
-        for w in &esc_words {
-            clauses.push((
-                Occur::Should,
-                Query::Fuzzy {
-                    field: None,
-                    text: (*w).to_string(),
-                    similarity: p.fuzzy_similarity,
-                    prefix_len: p.fuzzy_prefix_len,
-                },
-            ));
-        }
+    // Per-word fuzzy for typo tolerance (whitespace split matches how the analyzer keeps
+    // punctuation inside a token).
+    for w in lc.split_whitespace() {
+        clauses.push((
+            Occur::Should,
+            Query::Fuzzy {
+                field: None,
+                text: w.to_string(),
+                similarity: p.fuzzy_similarity,
+                prefix_len: p.fuzzy_prefix_len,
+            },
+        ));
     }
-    clauses.push((
-        Occur::Should,
-        Query::Fuzzy {
-            field: None,
-            text: esc.clone(),
-            similarity: p.fuzzy_similarity,
-            prefix_len: p.fuzzy_prefix_len,
-        },
-    ));
+    // Prefix wildcard over the whole text (useful for single-word prefix search; a no-op for
+    // multi-word input, where no indexed term spans the space).
     clauses.push((
         Occur::Should,
         Query::Wildcard {
             field: None,
-            pattern: format!("{esc}*"),
+            pattern: format!("{lc}*"),
             min_prefix_len: p.wildcard_min_prefix,
         },
     ));

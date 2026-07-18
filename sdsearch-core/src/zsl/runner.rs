@@ -1,18 +1,13 @@
 //! runner: orchestrates ZslIndex + build_query + executor, reproducing the host
-//! application's Zend Lucene search adapter (empty-result fallback, min_score,
-//! limit==0 = unlimited).
+//! application's Zend Lucene search adapter (min_score filtering, limit==0 = unlimited).
 
-use crate::analysis::analyze;
 use crate::hybrid::{HybridParams, fuse_rrf};
 use crate::index::IndexReader;
 use crate::mlt::{MltParams, more_like_this};
 use crate::prf::{PrfParams, search_prf};
-use crate::query::{
-    InGroup, Occur, Query, QueryError, QueryParams, build_query, search, search_with_weights,
-};
+use crate::query::{InGroup, QueryError, QueryParams, build_query, search, search_with_weights};
 use crate::search::Hit;
 use crate::zsl::index::ZslIndex;
-use std::collections::HashSet;
 use std::path::Path;
 
 /// Lexical retriever shared by `search_index` and `search_hybrid_index`: builds the query,
@@ -26,7 +21,7 @@ fn lexical_search(
 ) -> Result<Vec<Hit>, QueryError> {
     let query = build_query(params)?;
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let mut hits = search_with_weights(
+    let hits = search_with_weights(
         index,
         &query,
         &params.field_weights,
@@ -34,24 +29,18 @@ fn lexical_search(
         min_score,
         lim,
     );
-    if hits.is_empty() {
-        if let Some(fb) = fallback_query(&params.text) {
-            hits = search_with_weights(
-                index,
-                &fb,
-                &params.field_weights,
-                params.similarity,
-                min_score,
-                lim,
-            );
-        }
-    }
     Ok(hits)
 }
 
 /// Searches a ZSL index reproducing the host application's Zend Lucene search adapter:
-/// build_query -> executor -> if empty, all-fields fallback; filters min_score (`>=`),
-/// limit==0 = unlimited.
+/// build_query -> executor; filters min_score (`>=`), limit==0 = unlimited.
+///
+/// The legacy adapter had an empty-result fallback that re-parsed the query string. We do
+/// NOT reproduce it: it kept the `where`/`in` filters required (an excluding filter is never
+/// bypassed — see the oracle), and the only text it relaxed was already a subset of what
+/// `text_subquery` matches in the primary pass. So the fallback could only ever return an
+/// empty set here, while a naive text-only fallback would silently leak documents past an
+/// excluding filter — which we must never do.
 pub fn search_index(
     index_dir: &Path,
     params: &QueryParams,
@@ -82,8 +71,8 @@ pub fn search_prf_index(
 }
 
 /// Opens a ZSL index once and runs a HYBRID search: the lexical retriever (`search_index`'s
-/// logic, fallback included) and the semantic retriever (`search_prf`) are run as two
-/// independent rankers and fused by Reciprocal Rank Fusion (`fuse_rrf`).
+/// logic) and the semantic retriever (`search_prf`) are run as two independent rankers and
+/// fused by Reciprocal Rank Fusion (`fuse_rrf`).
 ///
 /// `min_score` filters each leg on its own native score scale BEFORE fusion. Each leg fetches
 /// up to `hybrid.depth` candidates (0 = unlimited; raised to `limit` when a larger final
@@ -112,29 +101,6 @@ pub fn search_hybrid_index(
     let lexical = lexical_search(&index, params, min_score, depth)?;
     let semantic = search_prf(&index, params, prf, min_score, depth)?;
     Ok(fuse_rrf(&[lexical, semantic], k, limit))
-}
-
-/// Search-adapter fallback: an all-fields Boolean of terms (Should) over the UNIQUE
-/// tokens of the text (dedup by text, like the re-parsed MultiTerm in the search adapter).
-fn fallback_query(text: &str) -> Option<Query> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut clauses: Vec<(Occur, Query)> = Vec::new();
-    for tok in analyze(text) {
-        if seen.insert(tok.clone()) {
-            clauses.push((
-                Occur::Should,
-                Query::Term {
-                    field: None,
-                    text: tok,
-                },
-            ));
-        }
-    }
-    if clauses.is_empty() {
-        None
-    } else {
-        Some(Query::Boolean { clauses })
-    }
 }
 
 /// Resolves an id-field value to an internal doc id via an `InGroup` over
@@ -183,6 +149,7 @@ pub fn more_like_this_index(
 mod tests {
     use super::*;
     use crate::query::InGroup;
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     fn multiseg() -> PathBuf {
@@ -209,6 +176,77 @@ mod tests {
         let mut v: Vec<usize> = hits.iter().map(|h| h.id).collect();
         v.sort_unstable();
         v
+    }
+
+    // Bootstrap from the KB fixture (the writer only appends) and add two docs carrying a
+    // `cat_key` keyword filter field and a `body` text field: cat 1 -> "alpha", cat 2 ->
+    // "zebra". So "zebra" exists ONLY outside cat 1 -> a cat=1 filter must exclude it.
+    fn temp_index_with_cat_docs(tag: &str) -> PathBuf {
+        let src = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        let dir =
+            std::env::temp_dir().join(format!("sdsearch_catfilter_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        for (cat, body) in [("1", "alpha"), ("2", "zebra")] {
+            w.add_document(WriterDoc {
+                fields: vec![
+                    WriterField::keyword("cat_key", cat),
+                    WriterField::text("body", body),
+                ],
+            })
+            .unwrap();
+        }
+        w.commit().unwrap();
+        dir
+    }
+
+    // Bootstrap from the KB fixture and add a doc whose body carries a colon-bearing token.
+    // The analyzer keeps ':' inside a token, so "c:drive" is a SINGLE indexed term.
+    fn temp_index_with_punct_doc(tag: &str) -> PathBuf {
+        let src = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        let dir = std::env::temp_dir().join(format!("sdsearch_punct_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+        w.add_document(WriterDoc {
+            fields: vec![WriterField::text("body", "c:drive restore")],
+        })
+        .unwrap();
+        w.commit().unwrap();
+        dir
+    }
+
+    #[test]
+    fn prefix_reaches_a_colon_bearing_token() {
+        // Dropping the query-operator escaping lets a prefix like "c:dr" reach the indexed
+        // token "c:drive" through the wildcard leaf. The old escaping (`c\:dr*`) suppressed
+        // this because no indexed term carries a backslash.
+        let dir = temp_index_with_punct_doc("colon");
+        let hits = search_index(&dir, &params("c:dr"), 0.0, 0).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "prefix 'c:dr' should reach the 'c:drive' token via the wildcard leaf"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -287,16 +325,54 @@ mod tests {
     }
 
     #[test]
-    fn empty_primary_triggers_fallback() {
-        // text "vpn" (Must) + in cat=999 (Must, no doc) => empty primary;
-        // the all-fields fallback "vpn" recovers [0,2].
+    fn empty_primary_with_excluding_filter_stays_empty() {
+        // text "vpn" (Must) + in cat=999 (Must, no doc) => empty primary. An excluding
+        // filter must NOT be relaxed: the result stays empty rather than leaking the
+        // text-only "vpn" matches [0,2] (which is what the removed fallback used to do).
         let mut p = params("vpn");
         p.in_groups = vec![InGroup {
             field: "cat".into(),
             values: vec!["999".into()],
         }];
         let hits = search_index(&multiseg(), &p, 0.0, 0).unwrap();
-        assert_eq!(ids(&hits), vec![0, 2]);
+        assert!(
+            hits.is_empty(),
+            "excluding filter must not be bypassed: {:?}",
+            ids(&hits)
+        );
+    }
+
+    #[test]
+    fn empty_primary_never_bypasses_an_in_filter() {
+        // "zebra" lives ONLY in the cat=2 doc; a cat=1 filter must exclude it.
+        // The empty-primary path must NOT relax the filter and leak the cat=2 doc
+        // (parity with the legacy Zend adapter, whose fallback keeps the filter required).
+        let dir = temp_index_with_cat_docs("infilter");
+        let mut p = params("zebra");
+        p.in_groups = vec![InGroup {
+            field: "cat".into(),
+            values: vec!["1".into()],
+        }];
+        let hits = search_index(&dir, &p, 0.0, 0).unwrap();
+        assert!(
+            hits.is_empty(),
+            "cat=1 filter must exclude the cat=2 'zebra' doc, got {} hit(s)",
+            hits.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_matches_the_cat_doc_when_unfiltered() {
+        // Guard for the test above: proves "zebra" really does match a doc, so the
+        // empty result there comes from the filter, not from the term being absent.
+        let dir = temp_index_with_cat_docs("unfiltered");
+        let hits = search_index(&dir, &params("zebra"), 0.0, 0).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "zebra should match the cat=2 doc unfiltered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
