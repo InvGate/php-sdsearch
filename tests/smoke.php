@@ -39,4 +39,16 @@ if (!\is_array($decodedExplicit)) {
 }
 \fwrite(\STDOUT, "hybrid_query explicit-keys OK: " . \count($decodedExplicit) . " hits\n");
 
+// smoke test: Engine::search with "synonyms" => true marshals through serde without
+// panicking. This doesn't assert on the expansion changing hits (the fixture's "vpn" term
+// has no bundled synonym counterpart) — it just proves the DTO field round-trips at the
+// PHP boundary, mirroring the explicit-keys check above for hybrid_query.
+$synonyms = $engine->search($indexDir, \json_encode(['text' => 'vpn', 'synonyms' => true]));
+$decodedSynonyms = \json_decode($synonyms, true);
+if (!\is_array($decodedSynonyms)) {
+    \fwrite(\STDERR, "FAIL: search with synonyms=true did not return a JSON array\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "search synonyms OK: " . \count($decodedSynonyms) . " hits\n");
+
 exit(0);

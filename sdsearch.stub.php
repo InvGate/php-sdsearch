@@ -44,6 +44,7 @@ namespace SdSearch {
          *   "min_score": 0.0,
          *   "limit": 20,
          *   "accent_insensitive": false,
+         *   "synonyms": false,
          *   "field_weights": { "title": 3.0, "description": 1.0 },
          *   "similarity": "bm25"
          * }
@@ -52,6 +53,9 @@ namespace SdSearch {
          * - `in[]` matches a field against any of the literal values (already-suffixed key fields).
          * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
          *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
+         * - `synonyms` (optional, default `false`): when `true`, each query token is
+         *   also matched against its bundled synonyms and cross-lingual translations
+         *   (Spanish↔English), scored below the literal token. Widens recall.
          * - `field_weights` (optional, default `{}`): per-field score multipliers; a field not
          *   listed weighs `1.0`. Empty = every field weighed equally (current behavior).
          * - `similarity` (optional, default `"bm25"`): scoring algorithm, `"bm25"` or `"tfidf"`;

@@ -144,6 +144,7 @@ pub fn search_prf(
 mod tests {
     use super::*;
     use crate::doc::{Document, FieldKind};
+    use crate::hybrid::fuse_rrf;
     use crate::index::MemoryIndex;
     use crate::query::{WhereGroup, search};
     use crate::score::Similarity;
@@ -178,6 +179,7 @@ mod tests {
             fuzzy_prefix_len: 3,
             wildcard_min_prefix: 0,
             accent_insensitive: false,
+            synonyms: false,
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
         }
@@ -746,6 +748,122 @@ mod tests {
             ids(&hits_top3).contains(&5),
             "top_k=3 must reach docY3 once its harvest source is included in pass 1: {:?}",
             ids(&hits_top3)
+        );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Differential test: lexical vs PRF vs hybrid (RRF), on one synthetic corpus/query.
+    //
+    // The three modes are NESTED, not disjoint: search_prf's augmented query keeps every
+    // original lexical clause (Should(base)), so at min_score=0.0/limit=0 every lexical hit
+    // is also a PRF hit (see `original_match_still_present` above), and hybrid is just
+    // fuse_rrf([lexical, prf]) — so lexical-ids subseteq prf-ids subseteq hybrid-ids
+    // (roughly; hybrid can only add ids prf already had). Therefore "only lexical finds X"
+    // is impossible to construct here, and the honest demonstration is about RANKING and
+    // RECALL AT A CUTOFF, not binary find/no-find — see the three cases in
+    // `three_mode_comparison` below.
+    // ------------------------------------------------------------------------------------
+
+    /// Corpus for the three-mode comparison, query Q = "gadget":
+    /// - docA (id0) "gadget jam": the exact/short match — carries Q plus one jargon word
+    ///   ("jam") and nothing else. It is the ONLY doc containing "gadget", so lexical search
+    ///   trivially ranks it #1 (a large, structural margin — not a close score comparison).
+    /// - docC (id1) "jam replacement": term-disjoint from Q (no "gadget" at all) — invisible
+    ///   to lexical search, reachable only via the "jam" term PRF harvests from docA.
+    ///
+    /// A handful of unrelated filler docs keep "jam"/"gadget" from being trivially universal
+    /// (positive idf), mirroring `corpus()` above.
+    fn mode_comparison_corpus() -> MemoryIndex {
+        let mut m = MemoryIndex::new();
+        for text in [
+            "gadget jam",             // id0 docA: exact/short match + jargon
+            "jam replacement",        // id1 docC: term-disjoint, jargon bridge
+            "network cable ethernet", // filler
+            "monitor display hdmi",   // filler
+            "keyboard mouse usb",     // filler
+            "battery charger power",  // filler
+        ] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        m
+    }
+
+    #[test]
+    fn three_mode_comparison() {
+        const Q: &str = "gadget";
+        const LIMIT: usize = 100;
+        const K: usize = 60; // RRF's canonical default (hybrid.rs's own HybridParams default)
+        const DOC_A: usize = 0; // exact/short match: "gadget jam"
+        const DOC_C: usize = 1; // term-disjoint, jargon bridge: "jam replacement"
+
+        let idx = mode_comparison_corpus();
+        let lexical = search(&idx, &build_query(&params(Q)).unwrap(), 0.0, LIMIT);
+        let prf =
+            search_prf(&idx, &params(Q), &PrfParams::default(), 0.0, LIMIT).expect("valid query");
+        let hybrid = fuse_rrf(&[lexical.clone(), prf.clone()], K, LIMIT);
+
+        // --- Case (a): lexical MISSES a term-disjoint doc that PRF + hybrid recover. ---
+        // docC contains no "gadget" at all; lexical search for "gadget" cannot reach it.
+        // PRF harvests "jam" from docA (the only pass-1 hit) and re-queries, surfacing docC
+        // via that shared jargon term; hybrid inherits it from the PRF ranking.
+        assert!(
+            !ids(&lexical).contains(&DOC_C),
+            "lexical must miss the term-disjoint docC: {:?}",
+            ids(&lexical)
+        );
+        assert!(
+            ids(&prf).contains(&DOC_C),
+            "PRF must recover docC via the harvested jargon term: {:?}",
+            ids(&prf)
+        );
+        assert!(
+            ids(&hybrid).contains(&DOC_C),
+            "hybrid must inherit docC from the PRF ranking: {:?}",
+            ids(&hybrid)
+        );
+
+        // --- Case (c): lexical ranks the exact/short-match doc #1. ---
+        // docA is the ONLY doc containing "gadget" at all, so lexical trivially ranks it
+        // first — a large, structural margin (not a close score comparison).
+        assert_eq!(
+            lexical[0].id,
+            DOC_A,
+            "lexical must rank the exact/short match doc0 first: {:?}",
+            ids(&lexical)
+        );
+
+        // --- Case (b): hybrid keeps lexical's PRECISION (exact match on top) while also
+        // carrying PRF's RECALL (the term-disjoint doc present) — a combination LEXICAL
+        // ALONE never delivers. ---
+        // This is a structural presence/first-position check, not a thin rank-margin
+        // between two near-tied docs (that form is fragile under routine BM25/PRF scoring
+        // changes — see the removed rank-inversion attempt in this file's git history).
+        //   - hybrid keeps lexical's precision: the exact-match doc (docA) is still #1.
+        //   - hybrid ALSO carries PRF's recall: the term-disjoint doc (docC) is present.
+        //   - lexical alone has the precision but NOT the recall (docC is asserted absent
+        //     above — case (a)).
+        // Honesty check: this is NOT "hybrid beats PRF" — on this corpus PRF alone already
+        // has both signals too (`prf[0].id == DOC_A` and `DOC_C` is present in `prf`), since
+        // search_prf preserves the original lexical match while adding the feedback-only
+        // recall. That is expected, not a bug: the three modes are NESTED
+        // (lexical-ids ⊆ prf-ids ⊆ hybrid-ids here), which is exactly why "a case only
+        // hybrid finds" — or "hybrid robustly beats PRF" — is not constructible from a
+        // single synthetic corpus; hybrid's real value over PRF is rank-fusion robustness
+        // aggregated across many queries, not a per-query win a unit test can show. What
+        // IS robustly demonstrable, and what this asserts, is hybrid's advantage over
+        // LEXICAL alone: hybrid recovers the recall lexical structurally cannot have.
+        assert_eq!(
+            hybrid[0].id,
+            DOC_A,
+            "hybrid must keep lexical's precision: the exact match stays on top: {:?}",
+            ids(&hybrid)
+        );
+        assert!(
+            ids(&hybrid).contains(&DOC_C),
+            "hybrid must also gain PRF's recall: the term-disjoint doc is present: {:?}",
+            ids(&hybrid)
         );
     }
 }
