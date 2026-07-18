@@ -834,17 +834,26 @@ mod tests {
             ids(&lexical)
         );
 
-        // --- Case (b): hybrid combines lexical's PRECISION with PRF's RECALL — a
-        // combination neither pure mode delivers alone. ---
-        // This is the honest "hybrid wins": not a thin rank-margin between two near-tied
-        // docs (fragile under routine BM25/PRF scoring changes), but a structural
-        // presence/first-position combination with a large margin on both sides.
+        // --- Case (b): hybrid keeps lexical's PRECISION (exact match on top) while also
+        // carrying PRF's RECALL (the term-disjoint doc present) — a combination LEXICAL
+        // ALONE never delivers. ---
+        // This is a structural presence/first-position check, not a thin rank-margin
+        // between two near-tied docs (that form is fragile under routine BM25/PRF scoring
+        // changes — see the removed rank-inversion attempt in this file's git history).
         //   - hybrid keeps lexical's precision: the exact-match doc (docA) is still #1.
-        //   - hybrid ALSO gains PRF's recall: the term-disjoint doc (docC) is present.
+        //   - hybrid ALSO carries PRF's recall: the term-disjoint doc (docC) is present.
         //   - lexical alone has the precision but NOT the recall (docC is asserted absent
         //     above — case (a)).
-        // Neither pure mode gives both signals at once; hybrid does, by construction (it
-        // is the RRF fusion of exactly these two rankings).
+        // Honesty check: this is NOT "hybrid beats PRF" — on this corpus PRF alone already
+        // has both signals too (`prf[0].id == DOC_A` and `DOC_C` is present in `prf`), since
+        // search_prf preserves the original lexical match while adding the feedback-only
+        // recall. That is expected, not a bug: the three modes are NESTED
+        // (lexical-ids ⊆ prf-ids ⊆ hybrid-ids here), which is exactly why "a case only
+        // hybrid finds" — or "hybrid robustly beats PRF" — is not constructible from a
+        // single synthetic corpus; hybrid's real value over PRF is rank-fusion robustness
+        // aggregated across many queries, not a per-query win a unit test can show. What
+        // IS robustly demonstrable, and what this asserts, is hybrid's advantage over
+        // LEXICAL alone: hybrid recovers the recall lexical structurally cannot have.
         assert_eq!(
             hybrid[0].id,
             DOC_A,
