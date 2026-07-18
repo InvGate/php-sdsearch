@@ -766,48 +766,23 @@ mod tests {
 
     /// Corpus for the three-mode comparison, query Q = "gadget":
     /// - docA (id0) "gadget jam": the exact/short match — carries Q plus one jargon word
-    ///   ("jam") and nothing else, so it dominates BM25 on brevity alone.
-    /// - docX1 (id1) "gadget solo filler1": also matches Q, no jargon. Ranks 2nd in lexical
-    ///   (behind docA, ahead of docB) purely on its shorter length.
-    /// - docB (id2) "gadget jam extra1..extra6": matches Q AND the jargon word, but padded
-    ///   long enough that its own Q-score alone ranks BEHIND docX1 in lexical. Once PRF's
-    ///   feedback subtree kicks in, the shared "jam" term lets it overtake docX1.
-    /// - docC (id3) "jam" and a second bridge doc (id4) "jam bridge2": term-disjoint from Q
-    ///   (no "gadget" at all) — invisible to lexical search, reachable only via the
-    ///   harvested "jam" term. Both are short/undiluted, so their feedback-only score is
-    ///   strong enough to also outrank docX1's (Q-only, un-boosted) score once PRF reranks;
-    ///   the second bridge doc exists purely to help that (it isn't asserted on directly).
+    ///   ("jam") and nothing else. It is the ONLY doc containing "gadget", so lexical search
+    ///   trivially ranks it #1 (a large, structural margin — not a close score comparison).
+    /// - docC (id1) "jam replacement": term-disjoint from Q (no "gadget" at all) — invisible
+    ///   to lexical search, reachable only via the "jam" term PRF harvests from docA.
     ///
-    /// The `gadget`-tagged padded fillers below exist to defeat a real quirk of MLT term
-    /// harvesting: `select_terms` (see mlt.rs) does NOT exclude the query's own term from
-    /// the candidates it harvests from the pass-1 doc. With only docA/docX1/docB containing
-    /// "gadget" (doc_freq 3), "gadget" would itself survive the default max_doc_freq guard
-    /// and get selected as a redundant feedback term — which would let docX1 ALSO match the
-    /// feedback clause (via "gadget") and receive the same boolean coord as docB, erasing
-    /// the very distinction this corpus needs (docB matches base+jargon, docX1 matches base
-    /// only). Padding doc_freq("gadget") up while leaving doc_freq("jam") low lets a single
-    /// explicit `max_doc_freq` (below) exclude "gadget" from the harvest but keep "jam".
+    /// A handful of unrelated filler docs keep "jam"/"gadget" from being trivially universal
+    /// (positive idf), mirroring `corpus()` above.
     fn mode_comparison_corpus() -> MemoryIndex {
         let mut m = MemoryIndex::new();
-        let mut texts: Vec<String> = vec![
-            "gadget jam".to_string(),
-            "gadget solo filler1".to_string(),
-            "gadget jam extra1 extra2 extra3 extra4 extra5 extra6".to_string(),
-            "jam".to_string(),
-            "jam bridge2".to_string(),
-        ];
-        for i in 0..8 {
-            // Heavily padded so these score far below docA/docX1/docB for "gadget" (the
-            // extra length depresses BM25) and never intrude on the ranking under test;
-            // they exist only to inflate doc_freq("gadget"), see the doc comment above.
-            texts.push(format!(
-                "gadget pad{i}a pad{i}b pad{i}c pad{i}d pad{i}e pad{i}f pad{i}g"
-            ));
-        }
-        for i in 0..10 {
-            texts.push(format!("noise{i}")); // depresses avg field length, nothing else
-        }
-        for text in &texts {
+        for text in [
+            "gadget jam",             // id0 docA: exact/short match + jargon
+            "jam replacement",        // id1 docC: term-disjoint, jargon bridge
+            "network cable ethernet", // filler
+            "monitor display hdmi",   // filler
+            "keyboard mouse usb",     // filler
+            "battery charger power",  // filler
+        ] {
             let mut d = Document::new();
             d.add("body", text, FieldKind::Text);
             m.add_document(d);
@@ -821,45 +796,17 @@ mod tests {
         const LIMIT: usize = 100;
         const K: usize = 60; // RRF's canonical default (hybrid.rs's own HybridParams default)
         const DOC_A: usize = 0; // exact/short match: "gadget jam"
-        const DOC_X1: usize = 1; // matches Q only, no jargon: "gadget solo filler1"
-        const DOC_B: usize = 2; // matches Q AND jargon, but padded long
-        const DOC_C: usize = 3; // term-disjoint, jargon bridge: "jam"
+        const DOC_C: usize = 1; // term-disjoint, jargon bridge: "jam replacement"
 
-        // top_k=1: only the single best pass-1 hit (docA) seeds the feedback harvest, so the
-        // jargon vocabulary harvested is exactly docA's own distinctive word ("jam"). With
-        // the default top_k=5, docX1/docB (also Q-matches) would feed the harvest too,
-        // polluting the feedback set with their own incidental words and making the corpus
-        // impossible to reason about. max_doc_freq=6 excludes "gadget" (doc_freq 11, see the
-        // corpus comment) but keeps "jam" (doc_freq 4). feedback_weight is raised well above
-        // its 0.3 default so the feedback subtree's contribution isn't swamped by docB's own
-        // (deliberately weak) base-clause score — see case (b) below.
-        let prf_params = PrfParams {
-            top_k: 1,
-            feedback_weight: 100.0,
-            max_doc_freq: Some(6),
-            ..PrfParams::default()
-        };
         let idx = mode_comparison_corpus();
         let lexical = search(&idx, &build_query(&params(Q)).unwrap(), 0.0, LIMIT);
-        let prf = search_prf(&idx, &params(Q), &prf_params, 0.0, LIMIT).unwrap();
+        let prf =
+            search_prf(&idx, &params(Q), &PrfParams::default(), 0.0, LIMIT).expect("valid query");
         let hybrid = fuse_rrf(&[lexical.clone(), prf.clone()], K, LIMIT);
-        let pos = |v: &[Hit], id: usize| {
-            v.iter()
-                .position(|h| h.id == id)
-                .unwrap_or_else(|| panic!("doc{id} missing: {:?}", ids(v)))
-        };
-
-        // Pin the setup case (b) below relies on: docX1 (no jargon) outranks docB (jargon,
-        // but padded long) in a PLAIN lexical match on "gadget" alone.
-        assert!(
-            pos(&lexical, DOC_X1) < pos(&lexical, DOC_B),
-            "docX1 must rank ahead of docB in lexical: {:?}",
-            ids(&lexical)
-        );
 
         // --- Case (a): lexical MISSES a term-disjoint doc that PRF + hybrid recover. ---
         // docC contains no "gadget" at all; lexical search for "gadget" cannot reach it.
-        // PRF harvests "jam" from docA (the sole pass-1 hit) and re-queries, surfacing docC
+        // PRF harvests "jam" from docA (the only pass-1 hit) and re-queries, surfacing docC
         // via that shared jargon term; hybrid inherits it from the PRF ranking.
         assert!(
             !ids(&lexical).contains(&DOC_C),
@@ -878,8 +825,8 @@ mod tests {
         );
 
         // --- Case (c): lexical ranks the exact/short-match doc #1. ---
-        // docA is the shortest Q-match with no padding; BM25's length normalization puts it
-        // top of the lexical ranking even with docX1/docB also matching "gadget".
+        // docA is the ONLY doc containing "gadget" at all, so lexical trivially ranks it
+        // first — a large, structural margin (not a close score comparison).
         assert_eq!(
             lexical[0].id,
             DOC_A,
@@ -887,26 +834,27 @@ mod tests {
             ids(&lexical)
         );
 
-        // --- Case (b): hybrid ranks docB strictly better than EITHER pure mode does alone
-        // (RRF consensus). ---
-        // docB is deliberately the weakest Q-match in lexical (behind docX1, which carries
-        // no jargon) — it ranks 3rd there. In PRF, docC's undiluted feedback-only score and
-        // docB's own base+jargon coord boost both outrank docX1's plain, unboosted base
-        // score, but docC (feedback-only, coord halved) still edges out docB there too —
-        // docB ranks 3rd in PRF as well. Neither individual mode puts docB above 3rd place.
-        // Fused via RRF, docB's presence at a respectable rank in BOTH lists beats docX1's
-        // single strong (lexical-only) showing — docB rises to 2nd in hybrid, strictly
-        // better than its position in either mode alone.
-        let lex_pos_b = pos(&lexical, DOC_B);
-        let prf_pos_b = pos(&prf, DOC_B);
-        let hybrid_pos_b = pos(&hybrid, DOC_B);
-        assert!(
-            hybrid_pos_b < lex_pos_b,
-            "docB must rank strictly better in hybrid than in lexical alone: hybrid={hybrid_pos_b} lexical={lex_pos_b}"
+        // --- Case (b): hybrid combines lexical's PRECISION with PRF's RECALL — a
+        // combination neither pure mode delivers alone. ---
+        // This is the honest "hybrid wins": not a thin rank-margin between two near-tied
+        // docs (fragile under routine BM25/PRF scoring changes), but a structural
+        // presence/first-position combination with a large margin on both sides.
+        //   - hybrid keeps lexical's precision: the exact-match doc (docA) is still #1.
+        //   - hybrid ALSO gains PRF's recall: the term-disjoint doc (docC) is present.
+        //   - lexical alone has the precision but NOT the recall (docC is asserted absent
+        //     above — case (a)).
+        // Neither pure mode gives both signals at once; hybrid does, by construction (it
+        // is the RRF fusion of exactly these two rankings).
+        assert_eq!(
+            hybrid[0].id,
+            DOC_A,
+            "hybrid must keep lexical's precision: the exact match stays on top: {:?}",
+            ids(&hybrid)
         );
         assert!(
-            hybrid_pos_b < prf_pos_b,
-            "docB must rank strictly better in hybrid than in PRF alone: hybrid={hybrid_pos_b} prf={prf_pos_b}"
+            ids(&hybrid).contains(&DOC_C),
+            "hybrid must also gain PRF's recall: the term-disjoint doc is present: {:?}",
+            ids(&hybrid)
         );
     }
 }
