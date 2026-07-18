@@ -1042,4 +1042,24 @@ mod tests {
         // clause already provides when accent_insensitive is on).
         assert!(boosted_leaf_is_accent_term(&q));
     }
+
+    #[test]
+    fn build_query_synonyms_reach_cross_lingual_doc() {
+        // index one doc that only mentions the English term (same pattern as `accent_index`)
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("title", "the office printer is broken", FieldKind::Text);
+        idx.add_document(d);
+
+        // query the Spanish term; without synonyms it must NOT match
+        let mut p = params("impresora");
+        assert!(ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)).is_empty());
+
+        // with synonyms on, "impresora" expands to "printer" and reaches the doc
+        p.synonyms = true;
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            vec![0]
+        );
+    }
 }
