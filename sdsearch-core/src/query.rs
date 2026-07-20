@@ -179,28 +179,35 @@ fn eval_boolean(
             }
         }
     } else {
-        // Musts left-to-right, narrowing a running candidate set so each subsequent must (and
-        // the shoulds/mustnots below) only ever scores candidate docs. build_query emits the
-        // cheap filter musts first, so the expensive text must runs against a small candidate.
+        // Build a shrinking candidate set, but keep summation in DECLARED clause order so the
+        // f32 accumulation is bit-identical to the pre-optimization engine (IEEE-754 add is not
+        // associative). Evaluation order is decoupled from summation order: evaluate the first
+        // clause LAST, because build_query places the expensive text must first — scoring it
+        // against the already-narrowed candidate set is where the memory/CPU win comes from.
+        let n = must_qs.len();
+        let mut must_maps: Vec<Option<HashMap<usize, f32>>> = (0..n).map(|_| None).collect();
         let mut cand: Option<HashSet<usize>> = restrict.cloned();
-        let mut must_maps: Vec<HashMap<usize, f32>> = Vec::with_capacity(must_qs.len());
-        for q in &must_qs {
-            let m = eval(index, q, weights, sim, cand.as_ref());
+        for i in (1..n).chain(std::iter::once(0)) {
+            let m = eval(index, must_qs[i], weights, sim, cand.as_ref());
             let keys: HashSet<usize> = m.keys().copied().collect();
             cand = Some(match cand {
                 Some(prev) => prev.intersection(&keys).copied().collect(),
                 None => keys,
             });
-            must_maps.push(m);
+            must_maps[i] = Some(m);
         }
-        let final_cand = cand.unwrap_or_default(); // non-empty must set => Some
+        let final_cand = cand.unwrap_or_default();
         for &d in &final_cand {
+            // sum in index (declared) clause order
             let s: f32 = must_maps
                 .iter()
-                .map(|m| m.get(&d).copied().unwrap_or(0.0))
+                .map(|m| {
+                    m.as_ref()
+                        .map_or(0.0, |mm| mm.get(&d).copied().unwrap_or(0.0))
+                })
                 .sum();
             score.insert(d, s);
-            matched.insert(d, must_qs.len());
+            matched.insert(d, n);
         }
         // shoulds only add to docs already in the candidate set.
         for q in &should_qs {
@@ -213,16 +220,16 @@ fn eval_boolean(
         }
     }
 
-    // exclude must-not (bounded to the docs we might keep).
-    let removal_restrict: Option<HashSet<usize>> = if score.is_empty() {
-        None
-    } else {
-        Some(score.keys().copied().collect())
-    };
-    for q in &mustnot_qs {
-        for d in eval(index, q, weights, sim, removal_restrict.as_ref()).keys() {
-            score.remove(d);
-            matched.remove(d);
+    // exclude must-not (bounded to the docs we might keep). Skip entirely when the candidate
+    // set is already empty: there is nothing left to remove, and evaluating unrestricted
+    // must-not clauses against the whole collection would be wasted work.
+    if !score.is_empty() {
+        let removal_restrict: HashSet<usize> = score.keys().copied().collect();
+        for q in &mustnot_qs {
+            for d in eval(index, q, weights, sim, Some(&removal_restrict)).keys() {
+                score.remove(d);
+                matched.remove(d);
+            }
         }
     }
 
@@ -412,6 +419,10 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
 
     let mut top: Vec<(Occur, Query)> = Vec::new();
 
+    if has_text {
+        top.push((Occur::Must, text_subquery(p)));
+    }
+
     for wg in &p.where_groups {
         if wg.field.trim().is_empty() {
             return Err(QueryError::EmptyField);
@@ -463,10 +474,6 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
                 clauses: in_clauses,
             },
         ));
-    }
-
-    if has_text {
-        top.push((Occur::Must, text_subquery(p)));
     }
 
     Ok(Query::Boolean { clauses: top })
@@ -685,6 +692,46 @@ mod tests {
             ],
         };
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0]);
+    }
+
+    #[test]
+    fn three_must_score_sums_in_declared_order() {
+        // A 3-Must boolean scored via eval_boolean must sum each matching doc's must
+        // contributions in DECLARED clause order, so the (non-associative) f32 result is
+        // stable regardless of the internal evaluation order used for candidate narrowing.
+        let idx = corpus(); // doc0 = "vpn guide", lang_key "es"
+        let weights = HashMap::new();
+        let sim = Similarity::Bm25;
+        let m0 = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
+        let m1 = Query::Term {
+            field: Some("title".into()),
+            text: "guide".into(),
+        };
+        let m2 = Query::Term {
+            field: Some("lang_key".into()),
+            text: "es".into(),
+        };
+        // per-must contributions, unrestricted
+        let e0 = eval(&idx, &m0, &weights, sim, None);
+        let e1 = eval(&idx, &m1, &weights, sim, None);
+        let e2 = eval(&idx, &m2, &weights, sim, None);
+        let q = Query::Boolean {
+            clauses: vec![
+                (Occur::Must, m0.clone()),
+                (Occur::Must, m1.clone()),
+                (Occur::Must, m2.clone()),
+            ],
+        };
+        let got = eval(&idx, &q, &weights, sim, None);
+        let d = 0usize; // doc0 matches all three musts; coord = 3/3 = 1.0
+        let expected = e0[&d] + e1[&d] + e2[&d]; // declared-order f32 sum
+        assert_eq!(
+            got[&d], expected,
+            "3-must score must equal the declared-order f32 sum"
+        );
     }
 
     #[test]
