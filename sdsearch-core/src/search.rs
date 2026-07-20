@@ -66,6 +66,12 @@ pub(crate) fn union_scores(
     scored
 }
 
+/// Safety backstop: max terms a single wildcard leaf expands to, per field. With the default
+/// `wildcard_min_prefix` this essentially never fires; it exists so a pathological broad
+/// prefix (or an opted-in zero-prefix wildcard) cannot melt down. 4096 = 4× Zend's 1024
+/// terms-per-query default, for recall headroom.
+const MAX_WILDCARD_TERMS: usize = 4096;
+
 /// terms of `field` matching the wildcard pattern (without scoring). Replicates
 /// Zend_Search_Lucene Wildcard::rewrite: literal prefix before the first `*`/`?`;
 /// if (in bytes) it is shorter than `min_prefix_len` → empty. The pattern compiles to a
@@ -91,7 +97,7 @@ pub(crate) fn wildcard_terms(
         return Vec::new();
     };
     index
-        .terms_with_prefix(field, prefix)
+        .terms_with_prefix_limited(field, prefix, MAX_WILDCARD_TERMS)
         .into_iter()
         .filter(|t| re.is_match(t))
         .collect()

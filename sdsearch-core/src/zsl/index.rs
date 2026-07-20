@@ -113,6 +113,17 @@ impl IndexReader for ZslIndex {
         set.into_iter().collect()
     }
 
+    fn terms_with_prefix_limited(&self, field: &str, prefix: &str, limit: usize) -> Vec<String> {
+        // Each segment yields its lexicographic-first `limit`; their union contains the global
+        // first `limit` (a global i-th term, i<limit, is ≤ the i-th in its own segment), so the
+        // merged+sorted+truncated result is the correct global first `limit`.
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for e in &self.entries {
+            set.extend(e.seg.terms_with_prefix_limited(field, prefix, limit));
+        }
+        set.into_iter().take(limit).collect()
+    }
+
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
         match self.locate(doc_id) {
             Some((e, local)) => e.seg.positions_for(field, term, local),

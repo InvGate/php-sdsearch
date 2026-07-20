@@ -289,6 +289,13 @@ impl IndexReader for ZslSegment {
         out
     }
 
+    fn terms_with_prefix_limited(&self, field: &str, prefix: &str, limit: usize) -> Vec<String> {
+        let mut out = self.dict.terms_with_prefix_limited(field, prefix, limit);
+        out.sort();
+        out.truncate(limit);
+        out
+    }
+
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
         match self.dict.info(field, term) {
             Some(ti) if self.prx_name.is_empty() => {

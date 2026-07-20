@@ -130,6 +130,15 @@ impl EagerTermDict {
     /// Terms of `field` that start with `prefix`. Locates the range start by
     /// binary search and walks until a term stops matching the prefix.
     pub fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
+        self.terms_with_prefix_limited(field, prefix, usize::MAX)
+    }
+
+    pub fn terms_with_prefix_limited(
+        &self,
+        field: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<String> {
         let Some(ft) = self.by_field.get(field) else {
             return Vec::new();
         };
@@ -150,6 +159,9 @@ impl EagerTermDict {
             let t = ft.term(i);
             if t.starts_with(pb) {
                 out.push(String::from_utf8_lossy(t).into_owned());
+                if out.len() >= limit {
+                    break;
+                }
                 i += 1;
             } else {
                 break;
@@ -364,6 +376,16 @@ impl TermDict {
     /// scan stops as soon as `f > field` (canonical order guarantees nothing further
     /// can belong to `field`).
     pub fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
+        self.terms_with_prefix_limited(field, prefix, usize::MAX)
+    }
+
+    /// Bounded form of `terms_with_prefix`: stops after collecting `limit` terms.
+    pub fn terms_with_prefix_limited(
+        &self,
+        field: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<String> {
         let key = (field, prefix);
         // index[0] is the synthetic ("","") anchor ⇒ partition_point is always >= 1.
         let gt = self
@@ -374,6 +396,9 @@ impl TermDict {
         // the anchor itself is a real term that may already match (e.g. prefix == an index term).
         if !anchor.text.is_empty() && anchor.field == field && anchor.text.starts_with(prefix) {
             out.push(anchor.text.clone());
+            if out.len() >= limit {
+                return out;
+            }
         }
         let mut pos = anchor.tis_offset;
         let mut prev = anchor.text.clone();
@@ -396,6 +421,9 @@ impl TermDict {
             if f == field {
                 if t.starts_with(prefix) {
                     out.push(t.clone());
+                    if out.len() >= limit {
+                        return out;
+                    }
                 } else if t.as_str() > prefix {
                     break; // past the range in-field
                 }
@@ -840,6 +868,13 @@ mod tests {
                 let mut b = eager.terms_with_prefix(field, pfx);
                 b.sort();
                 assert_eq!(a, b, "prefix mismatch {field}:{pfx:?}");
+
+                // bounded variant agrees between eager oracle and production reader
+                assert_eq!(
+                    eager.terms_with_prefix_limited(field, pfx, 2),
+                    lazy.terms_with_prefix_limited(field, pfx, 2),
+                    "bounded terms_with_prefix disagree: field={field} prefix={pfx:?}"
+                );
             }
         }
     }

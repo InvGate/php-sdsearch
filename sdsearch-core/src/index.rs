@@ -35,6 +35,15 @@ pub trait IndexReader {
     }
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String>;
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String>;
+    /// Like `terms_with_prefix`, but returns at most `limit` terms (lexicographic-first).
+    /// The default collects then truncates; the on-disk ZSL readers override it to stop the
+    /// dictionary scan early, so a pathological prefix (an empty/1-char prefix over a huge
+    /// keyword field) never materializes the whole vocabulary. `usize::MAX` ≈ unbounded.
+    fn terms_with_prefix_limited(&self, field: &str, prefix: &str, limit: usize) -> Vec<String> {
+        let mut v = self.terms_with_prefix(field, prefix);
+        v.truncate(limit);
+        v
+    }
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32>;
     /// names of indexed fields (unique, ascending order); used for all-fields queries.
     fn indexed_fields(&self) -> Vec<String>;
@@ -403,5 +412,23 @@ mod tests {
         // two blocks past the cap: stride sampling recovers the true mean (6.0) closely
         let est = sampled_avg_field_len(1_000_000, |i| if i < 500_000 { 4 } else { 8 });
         assert!((est - 6.0).abs() < 0.1, "est={est}");
+    }
+
+    #[test]
+    fn terms_with_prefix_limited_bounds_and_matches_prefix() {
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", "aa ab ac ad ae bx", FieldKind::Text);
+        idx.add_document(d);
+        // lexicographic-first 3 of the "a" bucket
+        assert_eq!(
+            idx.terms_with_prefix_limited("body", "a", 3),
+            vec!["aa".to_string(), "ab".to_string(), "ac".to_string()]
+        );
+        // limit above the bucket size returns the whole bucket, matching the unbounded call
+        assert_eq!(
+            idx.terms_with_prefix_limited("body", "a", 999),
+            idx.terms_with_prefix("body", "a")
+        );
     }
 }
