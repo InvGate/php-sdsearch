@@ -225,12 +225,20 @@ pub(crate) fn finalize(
         .into_iter()
         .filter(|(_, s)| *s >= min_score)
         .collect();
-    ranked.sort_by(|a, b| {
+    // score desc, id asc — the single comparator used by both the partition and the sort.
+    let cmp = |a: &(usize, f32), b: &(usize, f32)| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
-    });
-    ranked.truncate(limit);
+    };
+    // Top-k: partition in O(M) so the best `limit` land in [0..limit], then sort only those.
+    // `select_nth_unstable_by(limit, …)` needs `limit < len`; otherwise the full sort is the
+    // whole result anyway. (`limit` can be usize::MAX for "unlimited", which takes this branch.)
+    if limit < ranked.len() {
+        ranked.select_nth_unstable_by(limit, cmp);
+        ranked.truncate(limit);
+    }
+    ranked.sort_by(cmp);
     ranked
         .into_iter()
         .map(|(id, score)| Hit {
@@ -546,5 +554,38 @@ mod tests {
         // "quick fox": in doc0 quick@0 and fox@2 are not adjacent
         let hits = phrase_query(&phrase_corpus(), "body", &["quick", "fox"], 0.0, 10);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn finalize_topk_matches_full_sort() {
+        // 6 docs so stored_fields hydrate; scores include ties (ids 1,2,5 all 0.9) to
+        // exercise the id-asc tiebreak that select_nth must preserve.
+        let mut idx = MemoryIndex::new();
+        for _ in 0..6 {
+            let mut d = Document::new();
+            d.add("body", "x", FieldKind::Text);
+            idx.add_document(d);
+        }
+        let scored = vec![
+            (0usize, 0.5f32),
+            (1, 0.9),
+            (2, 0.9),
+            (3, 0.1),
+            (4, 0.7),
+            (5, 0.9),
+        ];
+        // reference order: score desc, id asc
+        let mut reference = scored.clone();
+        reference.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        for limit in [1usize, 2, 3, 5, 6, 100] {
+            let hits = finalize(&idx, scored.clone(), 0.0, limit);
+            let got: Vec<usize> = hits.iter().map(|h| h.id).collect();
+            let want: Vec<usize> = reference.iter().take(limit).map(|(id, _)| *id).collect();
+            assert_eq!(got, want, "limit={limit}");
+        }
     }
 }
