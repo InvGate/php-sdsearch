@@ -77,7 +77,7 @@ fn eval(
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                for (id, s) in term_scores(index, sim, &f, text) {
+                for (id, s) in term_scores(index, sim, &f, text, None) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -89,7 +89,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = accent_variant_terms(index, &f, text);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs) {
+                for (id, s) in union_scores(index, sim, &f, &refs, None) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -105,7 +105,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs) {
+                for (id, s) in union_scores(index, sim, &f, &refs, None) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -122,7 +122,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs) {
+                for (id, s) in union_scores(index, sim, &f, &refs, None) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -131,7 +131,7 @@ fn eval(
         Query::Phrase { field, terms } => {
             let w = field_weight(weights, field);
             let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-            phrase_scores(index, sim, field, &refs)
+            phrase_scores(index, sim, field, &refs, None)
                 .into_iter()
                 .map(|(id, s)| (id, s * w))
                 .collect()

@@ -11,6 +11,7 @@ use crate::distance::levenshtein_bytes;
 use crate::index::IndexReader;
 use crate::score::Similarity;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub struct Hit {
     pub id: usize,
@@ -25,6 +26,7 @@ pub(crate) fn term_scores(
     sim: Similarity,
     field: &str,
     term: &str,
+    restrict: Option<&HashSet<usize>>,
 ) -> Vec<(usize, f32)> {
     let idf = sim.idf(
         index.total_docs() as f32,
@@ -34,6 +36,7 @@ pub(crate) fn term_scores(
     index
         .postings_for(field, term)
         .into_iter()
+        .filter(|(doc_id, _)| restrict.is_none_or(|r| r.contains(doc_id)))
         .map(|(doc_id, tf)| {
             (
                 doc_id,
@@ -50,6 +53,7 @@ pub(crate) fn union_scores(
     sim: Similarity,
     field: &str,
     terms: &[&str],
+    restrict: Option<&HashSet<usize>>,
 ) -> HashMap<usize, f32> {
     let mut scored: HashMap<usize, f32> = HashMap::new();
     let avg = index.avg_field_len(field);
@@ -59,6 +63,9 @@ pub(crate) fn union_scores(
             index.doc_freq(field, term) as f32,
         );
         for (doc_id, tf) in index.postings_for(field, term) {
+            if restrict.is_some_and(|r| !r.contains(&doc_id)) {
+                continue;
+            }
             *scored.entry(doc_id).or_insert(0.0) +=
                 sim.score(idf, tf, index.field_len(doc_id, field), avg);
         }
@@ -171,6 +178,7 @@ pub(crate) fn phrase_scores(
     sim: Similarity,
     field: &str,
     terms: &[&str],
+    restrict: Option<&HashSet<usize>>,
 ) -> HashMap<usize, f32> {
     let mut scored: HashMap<usize, f32> = HashMap::new();
     if terms.is_empty() {
@@ -189,7 +197,12 @@ pub(crate) fn phrase_scores(
         .collect();
 
     // candidate docs = intersection of the docs of all terms (the rarest one's first)
-    let mut candidates: Vec<usize> = per_term[0].0.keys().copied().collect();
+    let mut candidates: Vec<usize> = per_term[0]
+        .0
+        .keys()
+        .copied()
+        .filter(|d| restrict.is_none_or(|r| r.contains(d)))
+        .collect();
     for (positions, _) in &per_term[1..] {
         candidates.retain(|d| positions.contains_key(d));
     }
@@ -265,7 +278,7 @@ pub fn term_query(
 ) -> Vec<Hit> {
     finalize(
         index,
-        term_scores(index, Similarity::Bm25, field, term),
+        term_scores(index, Similarity::Bm25, field, term, None),
         min_score,
         limit,
     )
@@ -281,7 +294,7 @@ pub fn multi_term_query(
 ) -> Vec<Hit> {
     finalize(
         index,
-        union_scores(index, Similarity::Bm25, field, terms),
+        union_scores(index, Similarity::Bm25, field, terms, None),
         min_score,
         limit,
     )
@@ -300,7 +313,7 @@ pub fn wildcard_query(
     let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
     finalize(
         index,
-        union_scores(index, Similarity::Bm25, field, &refs),
+        union_scores(index, Similarity::Bm25, field, &refs, None),
         min_score,
         limit,
     )
@@ -320,7 +333,7 @@ pub fn fuzzy_query(
     let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
     finalize(
         index,
-        union_scores(index, Similarity::Bm25, field, &refs),
+        union_scores(index, Similarity::Bm25, field, &refs, None),
         min_score,
         limit,
     )
@@ -352,7 +365,7 @@ pub fn phrase_query(
 ) -> Vec<Hit> {
     finalize(
         index,
-        phrase_scores(index, Similarity::Bm25, field, terms),
+        phrase_scores(index, Similarity::Bm25, field, terms, None),
         min_score,
         limit,
     )

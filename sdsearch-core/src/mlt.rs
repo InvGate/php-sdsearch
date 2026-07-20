@@ -197,7 +197,7 @@ pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams
         let w = weight_of(&p.field_weights, &s.field);
         // MLT keeps its legacy TF-IDF scoring (out of scope for the BM25 feature); the
         // configurable Similarity applies to the main search path only.
-        for (id, sc) in term_scores(index, Similarity::TfIdf, &s.field, &s.term) {
+        for (id, sc) in term_scores(index, Similarity::TfIdf, &s.field, &s.term, None) {
             *score.entry(id).or_insert(0.0) += sc * w;
             if track_msm {
                 *matched.entry(id).or_insert(0) += 1;
