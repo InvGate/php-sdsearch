@@ -45,7 +45,8 @@ namespace SdSearch {
          *   "limit": 20,
          *   "accent_insensitive": false,
          *   "field_weights": { "title": 3.0, "description": 1.0 },
-         *   "similarity": "bm25"
+         *   "similarity": "bm25",
+         *   "wildcard_min_prefix": 2
          * }
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
@@ -57,6 +58,9 @@ namespace SdSearch {
          * - `similarity` (optional, default `"bm25"`): scoring algorithm, `"bm25"` or `"tfidf"`;
          *   an unknown value throws. As of 0.2.0 BM25 is the default ranking; pass
          *   `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25.
+         * - `wildcard_min_prefix` (optional, default `2`): minimum literal-prefix length before
+         *   the first `*`/`?` for the free-text wildcard leaf. Omitted = `2` (short single-word
+         *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
          *
          * The return value is a JSON array of hits:
          * ```json

@@ -893,4 +893,32 @@ mod tests {
             "no normalized score should exceed 1.0"
         );
     }
+
+    #[test]
+    fn build_query_wildcard_min_prefix_gates_expansion() {
+        // "abcdef" is reachable ONLY through wildcard prefix expansion of "ab*":
+        // the exact term "ab" is absent, and fuzzy("ab") can't reach it (empty term-rest
+        // gives negative similarity), so the wildcard leaf alone decides the match.
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("title", "abcdef", FieldKind::Text);
+        idx.add_document(d);
+
+        let mut p = params("ab");
+        p.wildcard_min_prefix = 2; // prefix "ab" (len 2) >= 2 => expands
+        let q = build_query(&p).unwrap();
+        assert_eq!(
+            ids(&search(&idx, &q, 0.0, 100)),
+            vec![0],
+            "min_prefix 2 must let 'ab*' expand and match 'abcdef'"
+        );
+
+        let mut p = params("ab");
+        p.wildcard_min_prefix = 3; // prefix "ab" (len 2) < 3 => wildcard leaf empty
+        let q = build_query(&p).unwrap();
+        assert!(
+            search(&idx, &q, 0.0, 100).is_empty(),
+            "min_prefix 3 must gate 'ab*' off (no other leaf matches 'abcdef')"
+        );
+    }
 }

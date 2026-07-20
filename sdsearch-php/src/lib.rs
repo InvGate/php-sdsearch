@@ -50,6 +50,11 @@ struct ParamsDto {
     /// optional scoring algorithm: "bm25" (default) or "tfidf". Omitted = "bm25".
     #[serde(default)]
     similarity: Option<String>,
+    /// optional: minimum literal-prefix length before the first `*`/`?` for the
+    /// free-text wildcard leaf. Omitted = 2 (short single-word queries no longer
+    /// scan the whole vocabulary). Pass 0/1 for typeahead surfaces.
+    #[serde(default = "default_wildcard_min_prefix")]
+    wildcard_min_prefix: usize,
 }
 #[derive(Serialize)]
 struct HitDto {
@@ -66,6 +71,9 @@ fn default_max_query_terms() -> u64 {
 }
 fn default_min_doc_freq() -> u64 {
     5
+}
+fn default_wildcard_min_prefix() -> usize {
+    2
 }
 
 #[derive(Deserialize)]
@@ -186,7 +194,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
             .collect(),
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
-        wildcard_min_prefix: 0,
+        wildcard_min_prefix: dto.wildcard_min_prefix,
         accent_insensitive: dto.accent_insensitive,
         field_weights: dto.field_weights,
         similarity,
@@ -383,7 +391,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         }],
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
-        wildcard_min_prefix: 0,
+        wildcard_min_prefix: 0, // inert: empty text => no wildcard leaf
         accent_insensitive: false,
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
