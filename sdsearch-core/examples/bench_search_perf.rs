@@ -64,10 +64,11 @@ fn gen_one(i: usize) -> WriterDoc {
         POOL[(i * 3) % np],
         POOL[(i * 7) % np]
     );
-    let body: String = (0..40)
+    let mut body: String = (0..40)
         .map(|j| POOL[(i * 7 + j * 5) % np])
         .collect::<Vec<_>>()
         .join(" ");
+    body.push_str(" widetoken"); // common token in EVERY doc: gives the filtered/common cases hits
     WriterDoc {
         fields: vec![
             WriterField {
@@ -230,12 +231,13 @@ fn main() {
     let cases: Vec<(&str, QueryParams)> = vec![
         ("short-wildcard 'vp'", params("vp", vec![])),
         ("multi-word 'vpn login'", params("vpn login", vec![])),
+        ("common 'widetoken' (big M)", params("widetoken", vec![])),
         (
-            "filtered 'vpn' + cat=3",
+            "filtered 'widetoken' + cat_key=3",
             params(
-                "vpn",
+                "widetoken",
                 vec![InGroup {
-                    field: "cat".into(),
+                    field: "cat_key".into(),
                     values: vec!["3".into()],
                 }],
             ),
