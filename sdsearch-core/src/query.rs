@@ -8,6 +8,7 @@ use crate::search::{
     wildcard_terms,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Occur {
@@ -71,13 +72,14 @@ fn eval(
     q: &Query,
     weights: &HashMap<String, f32>,
     sim: Similarity,
+    restrict: Option<&HashSet<usize>>,
 ) -> HashMap<usize, f32> {
     match q {
         Query::Term { field, text } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                for (id, s) in term_scores(index, sim, &f, text, None) {
+                for (id, s) in term_scores(index, sim, &f, text, restrict) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -89,7 +91,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = accent_variant_terms(index, &f, text);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs, None) {
+                for (id, s) in union_scores(index, sim, &f, &refs, restrict) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -105,7 +107,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs, None) {
+                for (id, s) in union_scores(index, sim, &f, &refs, restrict) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -122,7 +124,7 @@ fn eval(
                 let w = field_weight(weights, &f);
                 let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs, None) {
+                for (id, s) in union_scores(index, sim, &f, &refs, restrict) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -131,12 +133,12 @@ fn eval(
         Query::Phrase { field, terms } => {
             let w = field_weight(weights, field);
             let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-            phrase_scores(index, sim, field, &refs, None)
+            phrase_scores(index, sim, field, &refs, restrict)
                 .into_iter()
                 .map(|(id, s)| (id, s * w))
                 .collect()
         }
-        Query::Boolean { clauses } => eval_boolean(index, clauses, weights, sim),
+        Query::Boolean { clauses } => eval_boolean(index, clauses, weights, sim, restrict),
     }
 }
 
@@ -147,49 +149,62 @@ fn eval_boolean(
     clauses: &[(Occur, Query)],
     weights: &HashMap<String, f32>,
     sim: Similarity,
+    restrict: Option<&HashSet<usize>>,
 ) -> HashMap<usize, f32> {
-    let musts: Vec<HashMap<usize, f32>> = clauses
+    let must_qs: Vec<&Query> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::Must)
-        .map(|(_, q)| eval(index, q, weights, sim))
+        .map(|(_, q)| q)
         .collect();
-    let shoulds: Vec<HashMap<usize, f32>> = clauses
+    let should_qs: Vec<&Query> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::Should)
-        .map(|(_, q)| eval(index, q, weights, sim))
+        .map(|(_, q)| q)
         .collect();
-    let mustnots: Vec<HashMap<usize, f32>> = clauses
+    let mustnot_qs: Vec<&Query> = clauses
         .iter()
         .filter(|(o, _)| *o == Occur::MustNot)
-        .map(|(_, q)| eval(index, q, weights, sim))
+        .map(|(_, q)| q)
         .collect();
 
-    // accumulated score and matched (should+must) clauses per doc, for the coord.
     let mut score: HashMap<usize, f32> = HashMap::new();
     let mut matched: HashMap<usize, usize> = HashMap::new();
 
-    if musts.is_empty() {
-        // union of shoulds
-        for m in &shoulds {
-            for (&d, &s) in m {
+    if must_qs.is_empty() {
+        // union of shoulds, each already bounded by the inherited restriction.
+        for q in &should_qs {
+            for (d, s) in eval(index, q, weights, sim, restrict) {
                 *score.entry(d).or_insert(0.0) += s;
                 *matched.entry(d).or_insert(0) += 1;
             }
         }
     } else {
-        // intersection of musts
-        let mut candidates: std::collections::HashSet<usize> = musts[0].keys().copied().collect();
-        for m in &musts[1..] {
-            candidates.retain(|d| m.contains_key(d));
+        // Musts left-to-right, narrowing a running candidate set so each subsequent must (and
+        // the shoulds/mustnots below) only ever scores candidate docs. build_query emits the
+        // cheap filter musts first, so the expensive text must runs against a small candidate.
+        let mut cand: Option<HashSet<usize>> = restrict.cloned();
+        let mut must_maps: Vec<HashMap<usize, f32>> = Vec::with_capacity(must_qs.len());
+        for q in &must_qs {
+            let m = eval(index, q, weights, sim, cand.as_ref());
+            let keys: HashSet<usize> = m.keys().copied().collect();
+            cand = Some(match cand {
+                Some(prev) => prev.intersection(&keys).copied().collect(),
+                None => keys,
+            });
+            must_maps.push(m);
         }
-        for &d in &candidates {
-            let s: f32 = musts.iter().map(|m| m[&d]).sum();
+        let final_cand = cand.unwrap_or_default(); // non-empty must set => Some
+        for &d in &final_cand {
+            let s: f32 = must_maps
+                .iter()
+                .map(|m| m.get(&d).copied().unwrap_or(0.0))
+                .sum();
             score.insert(d, s);
-            matched.insert(d, musts.len());
+            matched.insert(d, must_qs.len());
         }
-        // shoulds only add to docs that are already candidates
-        for m in &shoulds {
-            for (&d, &s) in m {
+        // shoulds only add to docs already in the candidate set.
+        for q in &should_qs {
+            for (d, s) in eval(index, q, weights, sim, Some(&final_cand)) {
                 if let Some(sc) = score.get_mut(&d) {
                     *sc += s;
                     *matched.entry(d).or_insert(0) += 1;
@@ -198,16 +213,21 @@ fn eval_boolean(
         }
     }
 
-    // exclude must-not
-    for m in &mustnots {
-        for d in m.keys() {
+    // exclude must-not (bounded to the docs we might keep).
+    let removal_restrict: Option<HashSet<usize>> = if score.is_empty() {
+        None
+    } else {
+        Some(score.keys().copied().collect())
+    };
+    for q in &mustnot_qs {
+        for d in eval(index, q, weights, sim, removal_restrict.as_ref()).keys() {
             score.remove(d);
             matched.remove(d);
         }
     }
 
     // coord: multiply by (matched clauses / total should+must)
-    let total = (musts.len() + shoulds.len()).max(1) as f32;
+    let total = (must_qs.len() + should_qs.len()).max(1) as f32;
     score
         .into_iter()
         .map(|(d, s)| {
@@ -254,7 +274,7 @@ pub fn search_with_weights(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    let scored = eval(index, query, weights, sim);
+    let scored = eval(index, query, weights, sim, None);
     let top = scored.values().copied().fold(0.0f32, f32::max);
     let normalized: Vec<(usize, f32)> = if top > 0.0 {
         scored.into_iter().map(|(id, s)| (id, s / top)).collect()
@@ -392,10 +412,6 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
 
     let mut top: Vec<(Occur, Query)> = Vec::new();
 
-    if has_text {
-        top.push((Occur::Must, text_subquery(p)));
-    }
-
     for wg in &p.where_groups {
         if wg.field.trim().is_empty() {
             return Err(QueryError::EmptyField);
@@ -447,6 +463,10 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
                 clauses: in_clauses,
             },
         ));
+    }
+
+    if has_text {
+        top.push((Occur::Must, text_subquery(p)));
     }
 
     Ok(Query::Boolean { clauses: top })
@@ -920,5 +940,25 @@ mod tests {
             search(&idx, &q, 0.0, 100).is_empty(),
             "min_prefix 3 must gate 'ab*' off (no other leaf matches 'abcdef')"
         );
+    }
+
+    #[test]
+    fn eval_restrict_equals_unrestricted_then_filtered() {
+        // The restrict allow-list must yield exactly the unrestricted result filtered to the
+        // allowed docs, with identical scores (BM25 stats are collection-wide).
+        let idx = corpus(); // doc0,doc1 have "vpn"; doc2 does not
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
+        let weights = HashMap::new();
+        let full = eval(&idx, &q, &weights, Similarity::Bm25, None);
+        let allow: std::collections::HashSet<usize> = [0usize].into_iter().collect();
+        let restricted = eval(&idx, &q, &weights, Similarity::Bm25, Some(&allow));
+        let expected: HashMap<usize, f32> = full
+            .into_iter()
+            .filter(|(d, _)| allow.contains(d))
+            .collect();
+        assert_eq!(restricted, expected);
     }
 }
