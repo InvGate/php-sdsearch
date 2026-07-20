@@ -185,7 +185,7 @@ fn eval_boolean(
         // clause LAST, because build_query places the expensive text must first — scoring it
         // against the already-narrowed candidate set is where the memory/CPU win comes from.
         let n = must_qs.len();
-        let mut must_maps: Vec<Option<HashMap<usize, f32>>> = (0..n).map(|_| None).collect();
+        let mut must_maps: Vec<Option<HashMap<usize, f32>>> = vec![None; n];
         let mut cand: Option<HashSet<usize>> = restrict.cloned();
         for i in (1..n).chain(std::iter::once(0)) {
             let m = eval(index, must_qs[i], weights, sim, cand.as_ref());
@@ -258,6 +258,7 @@ fn eval_boolean(
 /// order — RANKING fidelity is a separate matter (score shape, not scale). It happens at the
 /// boolean (top) level; the leaves in `search.rs` score raw, because normalizing per leaf
 /// would distort the boolean composition.
+/// `limit == 0` returns an empty result (top-0), NOT "unlimited" — callers wanting unlimited pass `usize::MAX`.
 pub fn search(index: &impl IndexReader, query: &Query, min_score: f32, limit: usize) -> Vec<Hit> {
     search_with_weights(
         index,

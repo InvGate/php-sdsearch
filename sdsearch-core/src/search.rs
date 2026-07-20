@@ -21,6 +21,7 @@ pub struct Hit {
 
 /// raw scores (doc_id, score) of a term in a field. No sort/filter/hydration.
 /// The idf is computed ONCE (constant over the posting list), not per doc.
+/// `restrict`: `None` scores all matching docs; `Some(set)` scores only docs in `set`. It filters WHICH docs are scored, never the score — idf uses collection-wide stats, so a scored doc's value is identical either way.
 pub(crate) fn term_scores(
     index: &impl IndexReader,
     sim: Similarity,
@@ -48,6 +49,7 @@ pub(crate) fn term_scores(
 
 /// union of several terms in a field, summing scores per doc ("should" semantics).
 /// idf hoisted per term.
+/// `restrict`: `None` scores all matching docs; `Some(set)` scores only docs in `set`. It filters WHICH docs are scored, never the score — idf uses collection-wide stats, so a scored doc's value is identical either way.
 pub(crate) fn union_scores(
     index: &impl IndexReader,
     sim: Similarity,
@@ -173,6 +175,7 @@ pub(crate) fn fuzzy_terms(
 
 /// raw scores of a phrase (exact adjacency). The terms must appear at consecutive
 /// positions (p, p+1, ...) and in order, in the same field/doc.
+/// `restrict`: `None` scores all matching docs; `Some(set)` scores only docs in `set`. It filters WHICH docs are scored, never the score — idf uses collection-wide stats, so a scored doc's value is identical either way.
 pub(crate) fn phrase_scores(
     index: &impl IndexReader,
     sim: Similarity,
