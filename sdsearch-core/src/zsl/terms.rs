@@ -139,6 +139,9 @@ impl EagerTermDict {
         prefix: &str,
         limit: usize,
     ) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let Some(ft) = self.by_field.get(field) else {
             return Vec::new();
         };
@@ -386,6 +389,9 @@ impl TermDict {
         prefix: &str,
         limit: usize,
     ) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let key = (field, prefix);
         // index[0] is the synthetic ("","") anchor ⇒ partition_point is always >= 1.
         let gt = self
@@ -874,6 +880,13 @@ mod tests {
                     eager.terms_with_prefix_limited(field, pfx, 2),
                     lazy.terms_with_prefix_limited(field, pfx, 2),
                     "bounded terms_with_prefix disagree: field={field} prefix={pfx:?}"
+                );
+
+                // limit 0 must return empty for both eager and lazy
+                assert!(
+                    eager.terms_with_prefix_limited(field, pfx, 0).is_empty()
+                        && lazy.terms_with_prefix_limited(field, pfx, 0).is_empty(),
+                    "limit 0 must return no terms: field={field} prefix={pfx:?}"
                 );
             }
         }
