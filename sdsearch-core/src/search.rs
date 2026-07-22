@@ -19,6 +19,14 @@ pub struct Hit {
     pub fields: HashMap<String, String>,
 }
 
+/// Result of a paged search: the requested page of hits plus the (optionally capped) total
+/// match count. `total_capped` is true when the real match count exceeded the cap.
+pub struct SearchOutcome {
+    pub hits: Vec<Hit>,
+    pub total: usize,
+    pub total_capped: bool,
+}
+
 /// raw scores (doc_id, score) of a term in a field. No sort/filter/hydration.
 /// The idf is computed ONCE (constant over the posting list), not per doc.
 /// `restrict`: `None` scores all matching docs; `Some(set)` scores only docs in `set`. It filters WHICH docs are scored, never the score — idf uses collection-wide stats, so a scored doc's value is identical either way.
@@ -236,39 +244,66 @@ pub(crate) fn phrase_scores(
 }
 
 /// filters by min_score, sorts (score desc, id asc), truncates to `limit`, and hydrates
-/// `stored_fields` ONLY for the surviving hits.
+/// `stored_fields` ONLY for the surviving hits. Thin wrapper over `finalize_paged` with
+/// offset 0 and no total cap.
 pub(crate) fn finalize(
     index: &impl IndexReader,
     scored: impl IntoIterator<Item = (usize, f32)>,
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
+    finalize_paged(index, scored, min_score, 0, limit, None).hits
+}
+
+/// Like `finalize`, but returns the page `[offset, offset+limit)` of the ranking plus the
+/// total match count. `total_cap`: `None` = exact count; `Some(cap)` saturates `total` at
+/// `cap` and sets `total_capped` when the real count exceeds it. Only the top `offset+limit`
+/// docs are selected before the sort; stored fields hydrate for the returned page only.
+pub(crate) fn finalize_paged(
+    index: &impl IndexReader,
+    scored: impl IntoIterator<Item = (usize, f32)>,
+    min_score: f32,
+    offset: usize,
+    limit: usize,
+    total_cap: Option<usize>,
+) -> SearchOutcome {
     let mut ranked: Vec<(usize, f32)> = scored
         .into_iter()
         .filter(|(_, s)| *s >= min_score)
         .collect();
+    let count = ranked.len();
+    let total = total_cap.map_or(count, |cap| count.min(cap));
+    let total_capped = total_cap.is_some_and(|cap| count > cap);
+
     // score desc, id asc — the single comparator used by both the partition and the sort.
     let cmp = |a: &(usize, f32), b: &(usize, f32)| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     };
-    // Top-k: partition in O(M) so the best `limit` land in [0..limit], then sort only those.
-    // `select_nth_unstable_by(limit, …)` needs `limit < len`; otherwise the full sort is the
-    // whole result anyway. (`limit` can be usize::MAX for "unlimited", which takes this branch.)
-    if limit < ranked.len() {
-        ranked.select_nth_unstable_by(limit, cmp);
-        ranked.truncate(limit);
+    // Materialize only the top `offset + limit` docs before sorting the page. `saturating_add`
+    // guards `limit == usize::MAX` (the runner's "unlimited"), which then takes the full sort.
+    let need = offset.saturating_add(limit);
+    if need < ranked.len() {
+        ranked.select_nth_unstable_by(need, cmp);
+        ranked.truncate(need);
     }
     ranked.sort_by(cmp);
-    ranked
+    let hits = ranked
         .into_iter()
+        .skip(offset)
+        .take(limit)
         .map(|(id, score)| Hit {
             id,
             score,
             fields: index.stored_fields(id),
         })
-        .collect()
+        .collect();
+    SearchOutcome {
+        hits,
+        total,
+        total_capped,
+    }
 }
 
 /// Term query: docs containing `term` in `field`, ordered by score desc / id asc.
@@ -576,6 +611,52 @@ mod tests {
         // "quick fox": in doc0 quick@0 and fox@2 are not adjacent
         let hits = phrase_query(&phrase_corpus(), "body", &["quick", "fox"], 0.0, 10);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn finalize_paged_offset_total_and_cap() {
+        // 6 docs so stored_fields hydrate; scores with ties (ids 1,2,5 = 0.9) to exercise
+        // the id-asc tiebreak that select_nth must preserve across the offset boundary.
+        let mut idx = MemoryIndex::new();
+        for _ in 0..6 {
+            let mut d = Document::new();
+            d.add("body", "x", FieldKind::Text);
+            idx.add_document(d);
+        }
+        let scored = vec![
+            (0usize, 0.5f32),
+            (1, 0.9),
+            (2, 0.9),
+            (3, 0.1),
+            (4, 0.7),
+            (5, 0.9),
+        ];
+        // reference ranking: score desc, id asc => [1, 2, 5, 4, 0, 3]
+        let reference = [1usize, 2, 5, 4, 0, 3];
+
+        // page (offset=2, limit=2) => 3rd and 4th of the ranking => [5, 4]
+        let out = finalize_paged(&idx, scored.clone(), 0.0, 2, 2, None);
+        let got: Vec<usize> = out.hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, reference[2..4].to_vec(), "offset+limit page");
+        assert_eq!(out.total, 6, "no cap => exact count");
+        assert!(!out.total_capped);
+
+        // cap below the match count => total saturates and total_capped is true
+        let out = finalize_paged(&idx, scored.clone(), 0.0, 0, 2, Some(3));
+        assert_eq!(out.total, 3);
+        assert!(out.total_capped);
+        assert_eq!(out.hits.len(), 2);
+
+        // min_score filter reduces the counted total (only scores >= 0.7 => ids 1,2,5,4)
+        let out = finalize_paged(&idx, scored.clone(), 0.7, 0, 10, None);
+        assert_eq!(out.total, 4);
+        let got: Vec<usize> = out.hits.iter().map(|h| h.id).collect();
+        assert_eq!(got, vec![1, 2, 5, 4]);
+
+        // offset beyond the result set => empty page, total still reported
+        let out = finalize_paged(&idx, scored, 0.0, 99, 5, None);
+        assert!(out.hits.is_empty());
+        assert_eq!(out.total, 6);
     }
 
     #[test]
