@@ -4,8 +4,8 @@
 use crate::index::IndexReader;
 use crate::score::Similarity;
 use crate::search::{
-    Hit, accent_variant_terms, finalize, fuzzy_terms, phrase_scores, term_scores, union_scores,
-    wildcard_terms,
+    Hit, SearchOutcome, accent_variant_terms, finalize_paged, fuzzy_terms, phrase_scores,
+    term_scores, union_scores, wildcard_terms,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -282,6 +282,24 @@ pub fn search_with_weights(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
+    search_with_weights_paged(index, query, weights, sim, min_score, 0, limit, None).hits
+}
+
+/// Like `search_with_weights`, but returns a page `[offset, offset+limit)` plus the total
+/// match count (`total_cap`: `None` = exact, `Some(cap)` = saturated). The top-hit→1.0
+/// normalization is unchanged: it is monotonic, so paging and totals are computed on the
+/// same ranking as `search_with_weights`.
+#[allow(clippy::too_many_arguments)]
+pub fn search_with_weights_paged(
+    index: &impl IndexReader,
+    query: &Query,
+    weights: &HashMap<String, f32>,
+    sim: Similarity,
+    min_score: f32,
+    offset: usize,
+    limit: usize,
+    total_cap: Option<usize>,
+) -> SearchOutcome {
     let scored = eval(index, query, weights, sim, None);
     let top = scored.values().copied().fold(0.0f32, f32::max);
     let normalized: Vec<(usize, f32)> = if top > 0.0 {
@@ -289,7 +307,7 @@ pub fn search_with_weights(
     } else {
         scored.into_iter().collect()
     };
-    finalize(index, normalized, min_score, limit)
+    finalize_paged(index, normalized, min_score, offset, limit, total_cap)
 }
 
 /// WHERE group: values over a `_key` field, with the group sign (occur).
@@ -1008,5 +1026,50 @@ mod tests {
             .filter(|(d, _)| allow.contains(d))
             .collect();
         assert_eq!(restricted, expected);
+    }
+
+    #[test]
+    fn search_with_weights_paged_reports_total_and_pages() {
+        let idx = corpus(); // doc0 "vpn guide", doc1 "vpn setup", doc2 "mysql notes"
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
+        // full: two matches (docs 0 and 1), exact total
+        let full = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            None,
+        );
+        assert_eq!(full.hits.len(), 2);
+        assert_eq!(full.total, 2);
+        assert!(!full.total_capped);
+
+        // offset 1, limit 1 => the 2nd hit only; total still reflects all matches
+        let page =
+            search_with_weights_paged(&idx, &q, &HashMap::new(), Similarity::Bm25, 0.0, 1, 1, None);
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].id, full.hits[1].id);
+        assert_eq!(page.total, 2);
+
+        // cap of 1 => total saturates, total_capped set, page still honored
+        let capped = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            Some(1),
+        );
+        assert_eq!(capped.total, 1);
+        assert!(capped.total_capped);
+        assert_eq!(capped.hits.len(), 2, "cap bounds the total, not the page");
     }
 }
