@@ -124,6 +124,14 @@ impl IndexReader for ZslIndex {
         set.into_iter().take(limit).collect()
     }
 
+    fn terms_in_range(&self, field: &str, lower: Option<&str>, upper: Option<&str>) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for e in &self.entries {
+            set.extend(e.seg.terms_in_range(field, lower, upper));
+        }
+        set.into_iter().collect()
+    }
+
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
         match self.locate(doc_id) {
             Some((e, local)) => e.seg.positions_for(field, term, local),

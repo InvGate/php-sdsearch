@@ -296,6 +296,12 @@ impl IndexReader for ZslSegment {
         out
     }
 
+    fn terms_in_range(&self, field: &str, lower: Option<&str>, upper: Option<&str>) -> Vec<String> {
+        let mut out = self.dict.terms_in_range(field, lower, upper);
+        out.sort();
+        out
+    }
+
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
         match self.dict.info(field, term) {
             Some(ti) if self.prx_name.is_empty() => {
@@ -346,6 +352,8 @@ impl IndexReader for ZslSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::IndexReader;
+    use crate::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
     use std::path::PathBuf;
 
     fn seg() -> ZslSegment {
@@ -559,5 +567,66 @@ mod tests {
         let names = s.field_infos();
         let idkey = raw.iter().find(|r| names[r.field_num].name == "id_key");
         assert_eq!(idkey.map(|r| r.value.as_str()), Some("165"));
+    }
+
+    #[test]
+    fn on_disk_terms_in_range_matches_default_and_bounds() {
+        // Build a fresh single-segment index with an ordered keyword field. `IndexWriter::open`
+        // requires an existing generation on disk, so bootstrap from the KB fixture (it has no
+        // `created_at_key` field, so it cannot collide with the values added below) the same way
+        // other writer tests do (see `temp_kb_full` in writer/mod.rs and index_writer.rs).
+        let dir = std::env::temp_dir().join(format!("sdsearch_range_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_kb"
+        ));
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        {
+            let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+            for v in ["100", "200", "300", "400", "500"] {
+                w.add_document(WriterDoc {
+                    fields: vec![WriterField::keyword("created_at_key", v)],
+                })
+                .unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let seg = crate::zsl::index::ZslIndex::open(&dir).unwrap();
+
+        // explicit bounds
+        assert_eq!(
+            seg.terms_in_range("created_at_key", Some("200"), Some("400")),
+            vec!["200".to_string(), "300".to_string(), "400".to_string()]
+        );
+        // parity with the trait default logic (filter all field terms) for several bound combos
+        let all = seg.terms_with_prefix("created_at_key", "");
+        for (lo, hi) in [
+            (Some("150"), Some("450")),
+            (Some("300"), None),
+            (None, Some("250")),
+            (None, None),
+            (Some("999"), None), // empty range
+        ] {
+            let expected: Vec<String> = all
+                .iter()
+                .filter(|t| {
+                    lo.is_none_or(|l| t.as_str() >= l) && hi.is_none_or(|h| t.as_str() <= h)
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                seg.terms_in_range("created_at_key", lo, hi),
+                expected,
+                "range ({lo:?},{hi:?}) must match the filter-all reference"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

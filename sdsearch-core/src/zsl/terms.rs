@@ -439,6 +439,58 @@ impl TermDict {
         out
     }
 
+    /// Terms of `field` in the inclusive range `[lower, upper]` (either bound `None` =
+    /// unbounded), in `.tis` order. Mirrors `terms_with_prefix_limited`'s seek+forward-decode:
+    /// anchor at `(field, lower_or_empty)`, decode forward, collect in-range terms, and stop
+    /// once the field changes or the text passes `upper`. Scans only the range, not the whole
+    /// field vocabulary.
+    pub fn terms_in_range(
+        &self,
+        field: &str,
+        lower: Option<&str>,
+        upper: Option<&str>,
+    ) -> Vec<String> {
+        let in_range = |t: &str| lower.is_none_or(|lo| t >= lo) && upper.is_none_or(|hi| t <= hi);
+        let key = (field, lower.unwrap_or(""));
+        // index[0] is the synthetic ("","") anchor ⇒ partition_point is always >= 1.
+        let gt = self
+            .index
+            .partition_point(|e| (e.field.as_str(), e.text.as_str()) <= key);
+        let anchor = &self.index[gt - 1];
+        let mut out = Vec::new();
+        if !anchor.text.is_empty() && anchor.field == field && in_range(&anchor.text) {
+            out.push(anchor.text.clone());
+        }
+        let mut pos = anchor.tis_offset;
+        let mut prev = anchor.text.clone();
+        let (mut fp, mut pp) = (anchor.info.freq_pointer, anchor.info.prox_pointer);
+        while pos < self.tis.len() {
+            let Ok((f, t, _)) = decode_entry(
+                &self.tis,
+                &mut pos,
+                &prev,
+                &mut fp,
+                &mut pp,
+                &self.field_names,
+            ) else {
+                break;
+            };
+            if f.as_str() > field {
+                break; // canonical order (field asc, text asc): nothing further belongs to `field`
+            }
+            if f == field {
+                if upper.is_some_and(|hi| t.as_str() > hi) {
+                    break; // past the range in-field
+                }
+                if in_range(&t) {
+                    out.push(t.clone());
+                }
+            }
+            prev = t;
+        }
+        out
+    }
+
     /// Sequentially decodes the WHOLE `.tis` from just past its 24-byte header.
     /// `.tis` is physically written in canonical `(field_name asc, text asc)`
     /// order (see `EagerTermCursor`'s doc comment and `zsl/writer/terms.rs`), so a
