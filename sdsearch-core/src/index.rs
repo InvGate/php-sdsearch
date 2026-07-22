@@ -44,6 +44,19 @@ pub trait IndexReader {
         v.truncate(limit);
         v
     }
+    /// Terms of `field` within the inclusive range `[lower, upper]` (either bound `None` =
+    /// unbounded on that side), ascending. Bounds are compared as byte strings against the
+    /// stored term form. The default filters `terms_with_prefix(field, "")`; the on-disk
+    /// term dictionary overrides it with a bounded seek+scan so a narrow range does not scan
+    /// the field's whole vocabulary.
+    fn terms_in_range(&self, field: &str, lower: Option<&str>, upper: Option<&str>) -> Vec<String> {
+        self.terms_with_prefix(field, "")
+            .into_iter()
+            .filter(|t| {
+                lower.is_none_or(|lo| t.as_str() >= lo) && upper.is_none_or(|hi| t.as_str() <= hi)
+            })
+            .collect()
+    }
     fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32>;
     /// names of indexed fields (unique, ascending order); used for all-fields queries.
     fn indexed_fields(&self) -> Vec<String>;
@@ -430,5 +443,37 @@ mod tests {
             idx.terms_with_prefix_limited("body", "a", 999),
             idx.terms_with_prefix("body", "a")
         );
+    }
+
+    #[test]
+    fn terms_in_range_filters_inclusive_bounds() {
+        let mut idx = MemoryIndex::new();
+        for v in ["100", "200", "300", "400"] {
+            let mut d = Document::new();
+            d.add("created_at_key", v, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        // inclusive both ends: [200,300] => 200,300
+        assert_eq!(
+            idx.terms_in_range("created_at_key", Some("200"), Some("300")),
+            vec!["200".to_string(), "300".to_string()]
+        );
+        // open-ended upper: [300,None] => 300,400
+        assert_eq!(
+            idx.terms_in_range("created_at_key", Some("300"), None),
+            vec!["300".to_string(), "400".to_string()]
+        );
+        // open-ended lower: [None,200] => 100,200
+        assert_eq!(
+            idx.terms_in_range("created_at_key", None, Some("200")),
+            vec!["100".to_string(), "200".to_string()]
+        );
+        // bounds need not be actual terms: [150,350] => 200,300
+        assert_eq!(
+            idx.terms_in_range("created_at_key", Some("150"), Some("350")),
+            vec!["200".to_string(), "300".to_string()]
+        );
+        // unknown field => empty
+        assert!(idx.terms_in_range("nope", None, None).is_empty());
     }
 }
