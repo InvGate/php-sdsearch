@@ -1,0 +1,15 @@
+This product bundles a synonym dictionary (sdsearch-core/src/synonyms.bin)
+derived from the following third-party lexical resources:
+
+- Princeton WordNet 3.0 (English). Licensed under the WordNet License:
+  https://wordnet.princeton.edu/license-and-commercial-use
+
+- Multilingual Central Repository (MCR), Spanish wordnet. Licensed under
+  Creative Commons Attribution 3.0 (CC BY 3.0):
+  https://creativecommons.org/licenses/by/3.0/
+
+Both are distributed via the Open Multilingual Wordnet (OMW) and linked through
+the Collaborative Interlingual Index (CILI). The bundled dictionary is a
+derivative work: lemmas grouped by shared interlingual synset, lowercased,
+accent-folded on the lookup key, deduplicated and capped, for query-time
+expansion. No search index data is affected.

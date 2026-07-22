@@ -44,6 +44,7 @@ namespace SdSearch {
          *   "min_score": 0.0,
          *   "limit": 20,
          *   "accent_insensitive": false,
+         *   "synonyms": false,
          *   "field_weights": { "title": 3.0, "description": 1.0 },
          *   "similarity": "bm25"
          * }
@@ -52,6 +53,9 @@ namespace SdSearch {
          * - `in[]` matches a field against any of the literal values (already-suffixed key fields).
          * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
          *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
+         * - `synonyms` (optional, default `false`): when `true`, each query token is
+         *   also matched against its bundled synonyms and cross-lingual translations
+         *   (Spanish↔English), scored below the literal token. Widens recall.
          * - `field_weights` (optional, default `{}`): per-field score multipliers; a field not
          *   listed weighs `1.0`. Empty = every field weighed equally (current behavior).
          * - `similarity` (optional, default `"bm25"`): scoring algorithm, `"bm25"` or `"tfidf"`;
@@ -136,6 +140,80 @@ namespace SdSearch {
          *                    internal engine error.
          */
         public function more_like_this(string $indexDir, string $paramsJson): string {}
+
+        /**
+         * Semantic search via two-pass pseudo-relevance feedback (PRF): runs `$paramsJson`
+         * as a normal {@see Engine::search()} query, harvests feedback terms from the
+         * top hits, then re-runs an augmented query for the final result.
+         *
+         * `$paramsJson` accepts the SAME object as {@see Engine::search()}, plus an optional
+         * `"prf"` object (all keys optional, defaults shown):
+         * ```json
+         * {
+         *   "text": "free text query",
+         *   "prf": {
+         *     "top_k": 5,
+         *     "num_terms": 10,
+         *     "feedback_weight": 0.3,
+         *     "fields": [],
+         *     "min_term_freq": 1,
+         *     "min_doc_freq": 1,
+         *     "max_doc_freq": null,
+         *     "posting_budget": null
+         *   }
+         * }
+         * ```
+         * - `prf.top_k`: number of top pass-1 hits treated as pseudo-relevant.
+         * - `prf.num_terms`: max feedback terms added to the augmented query.
+         * - `prf.feedback_weight`: score multiplier for the feedback-term subtree.
+         * - `prf.fields` (optional, default `[]`): source fields to harvest terms from;
+         *   empty = all indexed fields.
+         *
+         * Returns the same JSON hit array shape as {@see Engine::search()}. The result is a
+         * RERANK of the augmented query, not strictly a superset of {@see Engine::search()}:
+         * with a nonzero `min_score` or a limit that binds, `semantic_query` may omit hits
+         * that a plain `search()` call would return.
+         *
+         * @param string $indexDir   Path to the ZSL index directory.
+         * @param string $paramsJson JSON-encoded query parameters + optional `prf` object (see above).
+         * @return string JSON-encoded array of hits (see {@see Engine::search()}).
+         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
+         *                    internal engine error.
+         */
+        public function semantic_query(string $indexDir, string $paramsJson): string {}
+
+        /**
+         * Hybrid search: runs the query through both the lexical retriever ({@see Engine::search()})
+         * and the semantic retriever ({@see Engine::semantic_query()}, two-pass PRF), then fuses
+         * the two rankings with Reciprocal Rank Fusion (RRF) — rank-based, so the retrievers'
+         * non-comparable score scales never mix.
+         *
+         * `$paramsJson` accepts the SAME object as {@see Engine::search()}, plus an optional
+         * `"prf"` object (see {@see Engine::semantic_query()}) and an optional `"hybrid"` object
+         * (all keys optional, defaults shown):
+         * ```json
+         * {
+         *   "text": "free text query",
+         *   "prf": { "top_k": 5, "num_terms": 10, "feedback_weight": 0.3 },
+         *   "hybrid": { "k": 60, "depth": 100 }
+         * }
+         * ```
+         * - `hybrid.k`: RRF constant; damps the weight of top ranks (canonical default 60).
+         * - `hybrid.depth`: candidate pool fetched per retriever before fusion (0 = unlimited).
+         *
+         * `min_score` is applied inside each retriever on its own native score scale before
+         * fusion; `limit` truncates the fused result (`limit == 0` = unlimited). Each returned
+         * hit's `score` is the RRF fused score (small, ~0.01-0.03 per matching retriever) and is
+         * NOT comparable to a plain `search()` score. Because the lexical retriever enters fusion
+         * in full, hybrid search fixes the PRF wart: a strong plain hit is always represented.
+         *
+         * @param string $indexDir   Path to the ZSL index directory.
+         * @param string $paramsJson JSON query params + optional `prf` and `hybrid` objects.
+         * @return string JSON-encoded array of hits (see {@see Engine::search()}).
+         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
+         *                    internal engine error.
+         */
+        public function hybrid_query(string $indexDir, string $paramsJson): string {}
     }
 
     /**

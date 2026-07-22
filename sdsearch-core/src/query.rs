@@ -48,6 +48,12 @@ pub enum Query {
     Boolean {
         clauses: Vec<(Occur, Query)>,
     },
+    /// Score multiplier: evaluates `inner` and scales every score by `boost`.
+    /// Used to down-weight PRF feedback terms relative to the original query.
+    Boosted {
+        boost: f32,
+        inner: Box<Query>,
+    },
 }
 
 /// target fields of a leaf: the given one, or all indexed fields if None.
@@ -137,6 +143,13 @@ fn eval(
                 .collect()
         }
         Query::Boolean { clauses } => eval_boolean(index, clauses, weights, sim),
+        Query::Boosted { boost, inner } => {
+            let mut acc = eval(index, inner, weights, sim);
+            for s in acc.values_mut() {
+                *s *= *boost;
+            }
+            acc
+        }
     }
 }
 
@@ -293,6 +306,10 @@ pub struct QueryParams {
     /// when true, the per-token text clauses become accent-insensitive (Spanish):
     /// `avion` also matches `avión` and vice-versa. Off = current ZSL behavior.
     pub accent_insensitive: bool,
+    /// when true, each analyzed query token is additionally expanded with its
+    /// bundled synonyms/translations (cross-lingual ES↔EN), each added as a
+    /// down-weighted `Should` clause. Off = current behavior. See `synonyms.rs`.
+    pub synonyms: bool,
     /// optional per-field score multipliers (field -> weight); missing field = 1.0.
     /// Empty map = every field weighted equally (current behavior).
     pub field_weights: HashMap<String, f32>,
@@ -318,6 +335,10 @@ impl std::fmt::Display for QueryError {
 }
 impl std::error::Error for QueryError {}
 
+/// Score multiplier applied to every expanded (non-literal) synonym term. A synonym
+/// is weaker evidence than the literal token the user typed, so it ranks below it.
+pub const SYNONYM_BOOST: f32 = 0.6;
+
 /// text subtree (port of the host's fuzzy-text subquery builder): per-word fuzzy + prefix
 /// wildcard, plus one all-fields analyzer term per token. All Should.
 ///
@@ -327,7 +348,21 @@ impl std::error::Error for QueryError {}
 /// no indexed term carries; and (2) the whole-text fuzzy/wildcard for multi-word input, which
 /// could never match (no indexed term spans the whitespace). Removing them lets the fuzzy and
 /// wildcard leaves work on punctuation-bearing tokens, consistently with the analyzer.
+///
+/// When `synonyms` is on, each analyzer token additionally emits a down-weighted
+/// (`SYNONYM_BOOST`) Should clause per bundled synonym/translation (see `synonyms.rs`).
 fn text_subquery(p: &QueryParams) -> Query {
+    // .then(...) short-circuits: crate::synonyms::global() (and its first-call
+    // OnceLock::get_or_init decode of the bundled dictionary) only runs when synonyms
+    // is on. synonyms:false must cost nothing, including "nothing parsed" — see synonyms.rs.
+    let dict = p.synonyms.then(crate::synonyms::global);
+    text_subquery_with_dict(p, dict)
+}
+
+/// Testable core of `text_subquery`: takes the synonym dictionary explicitly (as an
+/// `Option` so callers/tests can pass `None` without forcing the global to resolve) so
+/// unit tests can inject a fixture instead of the bundled global.
+fn text_subquery_with_dict(p: &QueryParams, dict: Option<&crate::synonyms::SynonymDict>) -> Query {
     let lc = p.text.to_lowercase();
     let mut clauses: Vec<(Occur, Query)> = Vec::new();
 
@@ -358,18 +393,27 @@ fn text_subquery(p: &QueryParams) -> Query {
     // one all-fields term (default-OR) per token. With accent_insensitive on, the
     // per-token clause becomes an AccentTerm so `avion` also reaches `avión`.
     for tok in crate::analysis::analyze(&p.text) {
-        let leaf = if p.accent_insensitive {
-            Query::AccentTerm {
-                field: None,
-                text: tok,
-            }
-        } else {
-            Query::Term {
-                field: None,
-                text: tok,
+        let leaf = |text: String| {
+            if p.accent_insensitive {
+                Query::AccentTerm { field: None, text }
+            } else {
+                Query::Term { field: None, text }
             }
         };
-        clauses.push((Occur::Should, leaf));
+        clauses.push((Occur::Should, leaf(tok.clone())));
+        if p.synonyms {
+            if let Some(d) = dict {
+                for syn in d.expand(&tok) {
+                    clauses.push((
+                        Occur::Should,
+                        Query::Boosted {
+                            boost: SYNONYM_BOOST,
+                            inner: Box::new(leaf(syn.clone())),
+                        },
+                    ));
+                }
+            }
+        }
     }
     Query::Boolean { clauses }
 }
@@ -508,6 +552,32 @@ mod tests {
         match q {
             Query::AccentTerm { .. } => true,
             Query::Boolean { clauses } => clauses.iter().any(|(_, c)| query_has_accent_term(c)),
+            Query::Boosted { inner, .. } => query_has_accent_term(inner),
+            _ => false,
+        }
+    }
+
+    /// true only if some `Boosted` subtree's inner leaf is an `AccentTerm` — unlike
+    /// `query_has_accent_term`, this ignores literal (non-boosted) clauses, so it isolates
+    /// the synonym leaf's shape specifically instead of also matching the literal token's
+    /// own (unwrapped) AccentTerm clause when `accent_insensitive` is on.
+    fn boosted_leaf_is_accent_term(q: &Query) -> bool {
+        match q {
+            Query::Boosted { inner, .. } => matches!(**inner, Query::AccentTerm { .. }),
+            Query::Boolean { clauses } => {
+                clauses.iter().any(|(_, c)| boosted_leaf_is_accent_term(c))
+            }
+            _ => false,
+        }
+    }
+
+    /// true if some `Boosted` subtree's inner leaf is a plain `Term` (used to confirm a
+    /// Boosted synonym clause exists at all, so the accompanying `!boosted_leaf_is_accent_term`
+    /// check isn't vacuously true).
+    fn has_boosted_term_leaf(q: &Query) -> bool {
+        match q {
+            Query::Boosted { inner, .. } => matches!(**inner, Query::Term { .. }),
+            Query::Boolean { clauses } => clauses.iter().any(|(_, c)| has_boosted_term_leaf(c)),
             _ => false,
         }
     }
@@ -686,6 +756,7 @@ mod tests {
             fuzzy_prefix_len: 3,
             wildcard_min_prefix: 0,
             accent_insensitive: false,
+            synonyms: false,
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
         }
@@ -876,6 +947,34 @@ mod tests {
     }
 
     #[test]
+    fn boosted_multiplies_leaf_scores() {
+        // Boosted{boost, inner} must return inner's score map with every score * boost.
+        let idx = score_corpus();
+        let base = Query::Term {
+            field: Some("title".into()),
+            text: "vpn".into(),
+        };
+        let plain = eval(&idx, &base, &HashMap::new(), Similarity::Bm25);
+        let boosted = eval(
+            &idx,
+            &Query::Boosted {
+                boost: 3.0,
+                inner: Box::new(base),
+            },
+            &HashMap::new(),
+            Similarity::Bm25,
+        );
+        assert_eq!(plain.len(), boosted.len());
+        for (id, s) in &plain {
+            assert!(
+                (boosted[id] - s * 3.0).abs() < 1e-6,
+                "id={id} plain={s} boosted={}",
+                boosted[id]
+            );
+        }
+    }
+
+    #[test]
     fn search_min_score_filters_on_normalized_scale() {
         // raw scores are small (~0.1); on the normalized [0,1] scale a min_score calibrated
         // to ZSL behaves the same. Without normalization, min_score=0.5 would empty everything.
@@ -891,6 +990,93 @@ mod tests {
         assert!(
             search(&score_corpus(), &q, 1.0001, 100).is_empty(),
             "no normalized score should exceed 1.0"
+        );
+    }
+
+    fn count_boosted_terms(q: &Query, boost: f32) -> usize {
+        match q {
+            Query::Boosted { boost: b, .. } if (*b - boost).abs() < f32::EPSILON => 1,
+            Query::Boolean { clauses } => clauses
+                .iter()
+                .map(|(_, c)| count_boosted_terms(c, boost))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn synonyms_off_adds_no_boosted_clauses() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
+        let p = params("laptop"); // synonyms defaults to false in the helper
+        let q = text_subquery_with_dict(&p, Some(&dict));
+        assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 0);
+    }
+
+    /// Structural proxy for laziness: `text_subquery_with_dict` must work with `dict: None`
+    /// and produce the exact same (no-Boosted) clause structure as the `Some(&dict)` case
+    /// above, i.e. it never dereferences `dict` when `p.synonyms` is false. This is what
+    /// `text_subquery` actually passes in production (`p.synonyms.then(crate::synonyms::global)`
+    /// short-circuits to `None` without calling `global()`), so this proves the call site
+    /// can go through the off path without ever touching (and therefore never parsing) the
+    /// bundled dictionary.
+    #[test]
+    fn synonyms_off_never_touches_the_dict_even_as_none() {
+        let p = params("laptop"); // synonyms defaults to false in the helper
+        let q = text_subquery_with_dict(&p, None);
+        assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 0);
+    }
+
+    #[test]
+    fn synonyms_on_adds_one_boosted_should_per_expansion() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook", "portátil"])]);
+        let mut p = params("laptop");
+        p.synonyms = true;
+        let q = text_subquery_with_dict(&p, Some(&dict));
+        assert_eq!(count_boosted_terms(&q, SYNONYM_BOOST), 2);
+    }
+
+    #[test]
+    fn synonym_leaf_is_plain_term_when_accents_off() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
+        let mut p = params("laptop");
+        p.synonyms = true; // accent_insensitive stays false
+        let q = text_subquery_with_dict(&p, Some(&dict));
+        // a Boosted synonym clause exists at all (not vacuously true below)...
+        assert!(has_boosted_term_leaf(&q));
+        // ...and specifically its inner leaf is a plain Term, not an AccentTerm.
+        assert!(!boosted_leaf_is_accent_term(&q));
+    }
+
+    #[test]
+    fn synonym_leaf_is_accent_term_when_accents_on() {
+        let dict = crate::synonyms::from_pairs(&[("laptop", &["notebook"])]);
+        let mut p = params("laptop");
+        p.synonyms = true;
+        p.accent_insensitive = true;
+        let q = text_subquery_with_dict(&p, Some(&dict));
+        // the Boosted synonym clause's inner leaf specifically must be an AccentTerm
+        // (not just some AccentTerm anywhere in the tree, which the literal per-token
+        // clause already provides when accent_insensitive is on).
+        assert!(boosted_leaf_is_accent_term(&q));
+    }
+
+    #[test]
+    fn build_query_synonyms_reach_cross_lingual_doc() {
+        // index one doc that only mentions the English term (same pattern as `accent_index`)
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("title", "the office printer is broken", FieldKind::Text);
+        idx.add_document(d);
+
+        // query the Spanish term; without synonyms it must NOT match
+        let mut p = params("impresora");
+        assert!(ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)).is_empty());
+
+        // with synonyms on, "impresora" expands to "printer" and reaches the doc
+        p.synonyms = true;
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            vec![0]
         );
     }
 }

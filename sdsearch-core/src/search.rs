@@ -12,6 +12,7 @@ use crate::index::IndexReader;
 use crate::score::Similarity;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
 pub struct Hit {
     pub id: usize,
     pub score: f32,
