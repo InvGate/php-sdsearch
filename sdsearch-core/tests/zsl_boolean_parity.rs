@@ -52,6 +52,7 @@ fn base(text: &str) -> QueryParams {
         accent_insensitive: false,
         field_weights: std::collections::HashMap::new(),
         similarity: sdsearch_core::score::Similarity::Bm25,
+        range_filters: vec![],
     }
 }
 

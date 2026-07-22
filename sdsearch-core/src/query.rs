@@ -282,7 +282,7 @@ pub fn search_with_weights(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    search_with_weights_paged(index, query, weights, sim, min_score, 0, limit, None).hits
+    search_with_weights_paged(index, query, weights, sim, min_score, 0, limit, None, None).hits
 }
 
 /// Like `search_with_weights`, but returns a page `[offset, offset+limit)` plus the total
@@ -299,8 +299,9 @@ pub fn search_with_weights_paged(
     offset: usize,
     limit: usize,
     total_cap: Option<usize>,
+    restrict: Option<&HashSet<usize>>,
 ) -> SearchOutcome {
-    let scored = eval(index, query, weights, sim, None);
+    let scored = eval(index, query, weights, sim, restrict);
     let top = scored.values().copied().fold(0.0f32, f32::max);
     let normalized: Vec<(usize, f32)> = if top > 0.0 {
         scored.into_iter().map(|(id, s)| (id, s / top)).collect()
@@ -321,6 +322,40 @@ pub struct WhereGroup {
 pub struct InGroup {
     pub field: String,
     pub values: Vec<String>,
+}
+
+/// Inclusive range over a keyword field's term form: `lower <= <field> <= upper` (either bound
+/// `None` = unbounded). `field` is used VERBATIM (already `_key`-suffixed by the caller).
+pub struct RangeFilter {
+    pub field: String,
+    pub lower: Option<String>,
+    pub upper: Option<String>,
+}
+
+/// Doc allow-list for a set of range filters, ANDed together: for each filter, the union of the
+/// postings of its in-range terms; intersected across filters. `None` = no filters (no
+/// restriction). `Some(empty)` = a filter matched no doc (valid: the query yields nothing).
+pub fn range_allow_list(
+    index: &impl IndexReader,
+    filters: &[RangeFilter],
+) -> Option<HashSet<usize>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let mut acc: Option<HashSet<usize>> = None;
+    for f in filters {
+        let mut docs: HashSet<usize> = HashSet::new();
+        for term in index.terms_in_range(&f.field, f.lower.as_deref(), f.upper.as_deref()) {
+            for (doc_id, _tf) in index.postings_for(&f.field, &term) {
+                docs.insert(doc_id);
+            }
+        }
+        acc = Some(match acc {
+            Some(prev) => prev.intersection(&docs).copied().collect(),
+            None => docs,
+        });
+    }
+    acc
 }
 
 /// parameters of a host-application search (the supported surface).
@@ -344,6 +379,9 @@ pub struct QueryParams {
     pub field_weights: HashMap<String, f32>,
     /// scoring algorithm; defaults to Bm25.
     pub similarity: Similarity,
+    /// optional inclusive range filters over keyword fields (ANDed). Empty = no range
+    /// restriction. Applied as the initial `restrict` allow-list, not as a scored clause.
+    pub range_filters: Vec<RangeFilter>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -774,6 +812,7 @@ mod tests {
             accent_insensitive: false,
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
+            range_filters: vec![],
         }
     }
 
@@ -1045,14 +1084,24 @@ mod tests {
             0,
             10,
             None,
+            None,
         );
         assert_eq!(full.hits.len(), 2);
         assert_eq!(full.total, 2);
         assert!(!full.total_capped);
 
         // offset 1, limit 1 => the 2nd hit only; total still reflects all matches
-        let page =
-            search_with_weights_paged(&idx, &q, &HashMap::new(), Similarity::Bm25, 0.0, 1, 1, None);
+        let page = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            1,
+            1,
+            None,
+            None,
+        );
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].id, full.hits[1].id);
         assert_eq!(page.total, 2);
@@ -1067,9 +1116,69 @@ mod tests {
             0,
             10,
             Some(1),
+            None,
         );
         assert_eq!(capped.total, 1);
         assert!(capped.total_capped);
         assert_eq!(capped.hits.len(), 2, "cap bounds the total, not the page");
+    }
+
+    #[test]
+    fn range_allow_list_narrows_scored_docs() {
+        let mut idx = MemoryIndex::new();
+        for ca in ["100", "200", "300"] {
+            let mut d = Document::new();
+            d.add("body", "ticket", FieldKind::Text);
+            d.add("created_at_key", ca, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        // [150,250] over created_at_key => only doc1 ("200")
+        let filters = vec![RangeFilter {
+            field: "created_at_key".into(),
+            lower: Some("150".into()),
+            upper: Some("250".into()),
+        }];
+        let allow = range_allow_list(&idx, &filters).expect("filters present");
+        assert_eq!(allow, [1usize].into_iter().collect::<HashSet<usize>>());
+
+        // used as the restrict on a text query => only doc1, total reflects the narrowed set
+        let q = Query::Term {
+            field: Some("body".into()),
+            text: "ticket".into(),
+        };
+        let out = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            None,
+            Some(&allow),
+        );
+        assert_eq!(out.hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(out.total, 1);
+
+        // no filters => None (no restriction)
+        assert!(range_allow_list(&idx, &[]).is_none());
+
+        // two range filters AND together: created_at in [100,200] AND created_at in [200,300] => {doc1}
+        let both = vec![
+            RangeFilter {
+                field: "created_at_key".into(),
+                lower: Some("100".into()),
+                upper: Some("200".into()),
+            },
+            RangeFilter {
+                field: "created_at_key".into(),
+                lower: Some("200".into()),
+                upper: Some("300".into()),
+            },
+        ];
+        assert_eq!(
+            range_allow_list(&idx, &both).unwrap(),
+            [1usize].into_iter().collect::<HashSet<usize>>()
+        );
     }
 }

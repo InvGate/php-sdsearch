@@ -131,6 +131,7 @@ fn params(text: &str, in_groups: Vec<InGroup>) -> QueryParams {
         accent_insensitive: false,
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
+        range_filters: vec![],
     }
 }
 
