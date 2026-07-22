@@ -41,6 +41,7 @@ namespace SdSearch {
          *   "text": "free text query",
          *   "where": [ { "field": "status", "values": ["open"], "occur": "must" } ],
          *   "in":    [ { "field": "category_key", "values": ["10", "11"] } ],
+         *   "range": [ { "field": "created_at_key", "from": "1700000000", "to": "1800000000" } ],
          *   "min_score": 0.0,
          *   "limit": 20,
          *   "offset": 0,
@@ -53,6 +54,11 @@ namespace SdSearch {
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
          * - `in[]` matches a field against any of the literal values (already-suffixed key fields).
+         * - `range[]` filters docs whose `field` term is in the inclusive `[from, to]` range
+         *   (either bound optional). `field` is used VERBATIM (pass the `_key` name). Bounds are
+         *   strings compared lexicographically against the stored term; for numeric/date fields
+         *   use a fixed-width form (e.g. epoch seconds) so byte order equals numeric order.
+         *   Multiple `range[]` entries are ANDed. Docs missing the field are excluded.
          * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
          *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
          * - `field_weights` (optional, default `{}`): per-field score multipliers; a field not

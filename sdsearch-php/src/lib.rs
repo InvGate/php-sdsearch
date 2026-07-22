@@ -10,7 +10,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
-use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
+use sdsearch_core::query::{
+    InGroup, Occur, Query, QueryParams, RangeFilter as SearchRangeFilter, WhereGroup, build_query,
+    search,
+};
 use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index_paged};
@@ -30,6 +33,14 @@ struct InDto {
     values: Vec<String>,
 }
 #[derive(Deserialize)]
+struct RangeDto {
+    field: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+}
+#[derive(Deserialize)]
 struct ParamsDto {
     #[serde(default)]
     text: String,
@@ -37,6 +48,8 @@ struct ParamsDto {
     r#where: Vec<WhereDto>,
     #[serde(default)]
     r#in: Vec<InDto>,
+    #[serde(default)]
+    range: Vec<RangeDto>,
     #[serde(default)]
     min_score: f32,
     #[serde(default)]
@@ -228,6 +241,15 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
             .map(|i| InGroup {
                 field: i.field,
                 values: i.values,
+            })
+            .collect(),
+        range_filters: dto
+            .range
+            .into_iter()
+            .map(|r| SearchRangeFilter {
+                field: r.field,
+                lower: r.from,
+                upper: r.to,
             })
             .collect(),
         fuzzy_similarity: 0.5,
@@ -439,6 +461,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
             field: id_field.to_string(),
             values: vec![value.to_string()],
         }],
+        range_filters: Vec::new(),
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0, // inert: empty text => no wildcard leaf
