@@ -2,8 +2,10 @@
 //! application's Zend Lucene search adapter (min_score filtering, limit==0 = unlimited).
 
 use crate::mlt::{MltParams, more_like_this};
-use crate::query::{InGroup, QueryParams, build_query, search, search_with_weights};
-use crate::search::Hit;
+use crate::query::{
+    InGroup, QueryParams, build_query, search, search_with_weights, search_with_weights_paged,
+};
+use crate::search::{Hit, SearchOutcome};
 use crate::zsl::index::ZslIndex;
 use std::path::Path;
 
@@ -34,6 +36,32 @@ pub fn search_index(
         lim,
     );
     Ok(hits)
+}
+
+/// Paged variant of `search_index`: returns the page `[offset, offset+limit)` plus the
+/// (optionally capped) total match count. `limit == 0` = unlimited, as in `search_index`.
+/// `total_cap`: `None` = exact count; `Some(cap)` = saturated at `cap`.
+pub fn search_index_paged(
+    index_dir: &Path,
+    params: &QueryParams,
+    min_score: f32,
+    offset: usize,
+    limit: usize,
+    total_cap: Option<usize>,
+) -> Result<SearchOutcome, Box<dyn std::error::Error>> {
+    let index = ZslIndex::open(index_dir)?;
+    let query = build_query(params)?;
+    let lim = if limit == 0 { usize::MAX } else { limit };
+    Ok(search_with_weights_paged(
+        &index,
+        &query,
+        &params.field_weights,
+        params.similarity,
+        min_score,
+        offset,
+        lim,
+        total_cap,
+    ))
 }
 
 /// Resolves an id-field value to an internal doc id via an `InGroup` over
@@ -242,6 +270,30 @@ mod tests {
         // "how" matches the two "how to ..." docs even with limit=0.
         let hits = search_index(&multiseg(), &params("how"), 0.0, 0).unwrap();
         assert!(hits.len() >= 2, "limit=0 must return all matches");
+    }
+
+    #[test]
+    fn search_index_paged_reports_total_and_offset() {
+        // "how" matches the two "how to ..." docs in the multiseg fixture.
+        let full = search_index_paged(&multiseg(), &params("how"), 0.0, 0, 0, None).unwrap();
+        assert!(
+            full.total >= 2,
+            "total counts all matches, got {}",
+            full.total
+        );
+        assert!(!full.total_capped);
+        let full_ids = ids(&full.hits);
+
+        // offset 1 with a large limit drops exactly the first hit of the ranking.
+        let paged = search_index_paged(&multiseg(), &params("how"), 0.0, 1, 100, None).unwrap();
+        assert_eq!(paged.hits.len(), full.hits.len() - 1);
+        assert_eq!(paged.total, full.total, "total is independent of the page");
+
+        // a cap of 1 saturates the total and flags it, without changing the page size.
+        let capped = search_index_paged(&multiseg(), &params("how"), 0.0, 0, 100, Some(1)).unwrap();
+        assert_eq!(capped.total, 1);
+        assert!(capped.total_capped);
+        assert_eq!(ids(&capped.hits), full_ids, "cap bounds total, not hits");
     }
 
     use crate::mlt::MltParams;
