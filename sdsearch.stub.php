@@ -43,6 +43,8 @@ namespace SdSearch {
          *   "in":    [ { "field": "category_key", "values": ["10", "11"] } ],
          *   "min_score": 0.0,
          *   "limit": 20,
+         *   "offset": 0,
+         *   "track_total_hits": 1001,
          *   "accent_insensitive": false,
          *   "field_weights": { "title": 3.0, "description": 1.0 },
          *   "similarity": "bm25",
@@ -61,16 +63,22 @@ namespace SdSearch {
          * - `wildcard_min_prefix` (optional, default `2`): minimum literal-prefix length before
          *   the first `*`/`?` for the free-text wildcard leaf. Omitted = `2` (short single-word
          *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
+         * - `offset` (optional, default `0`): number of leading hits to skip (pagination).
+         * - `track_total_hits` (optional, default `1001`): integer caps the reported `total`
+         *   at that value; `true` = exact count; `false` = omit `total`. Default caps at 1001.
          *
-         * The return value is a JSON array of hits:
+         * The return value is a JSON object: the `hits` array plus pagination metadata:
          * ```json
-         * [ { "id": 42, "score": 1.7, "fields": { "title": "…", "status": "open" } } ]
+         * { "hits": [ { "id": 42, "score": 1.7, "fields": { "title": "…" } } ],
+         *   "total": 128, "total_capped": false }
          * ```
-         * `id` is the global internal document id; `fields` are the stored fields.
+         * `id` is the global internal document id; `fields` are the stored fields. `total` is
+         * the match count (capped per `track_total_hits`; absent when it is `false`);
+         * `total_capped` is `true` when the real count exceeded the cap.
          *
          * @param string $indexDir   Path to the ZSL index directory.
          * @param string $paramsJson JSON-encoded query parameters (see above).
-         * @return string JSON-encoded array of hits (see above).
+         * @return string JSON-encoded `{hits,total,total_capped}` object (see above).
          * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
          *                    internal engine error.
          */

@@ -13,7 +13,7 @@ use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::query::{InGroup, Occur, Query, QueryParams, WhereGroup, build_query, search};
 use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
-use sdsearch_core::zsl::runner::{more_like_this_index, search_index};
+use sdsearch_core::zsl::runner::{more_like_this_index, search_index_paged};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
 
 // ---- JSON contract with PHP ----
@@ -41,6 +41,12 @@ struct ParamsDto {
     min_score: f32,
     #[serde(default)]
     limit: u64,
+    #[serde(default)]
+    offset: u64,
+    /// optional: total-hit tracking. Integer `n` caps the reported total at `n`; `true` =
+    /// exact count; `false` = do not report a total. Absent ⇒ default cap of 1001.
+    #[serde(default)]
+    track_total_hits: Option<TrackTotalHitsDto>,
     /// optional: accent-insensitive text matching (Spanish). Omitted = false.
     #[serde(default)]
     accent_insensitive: bool,
@@ -61,6 +67,37 @@ struct HitDto {
     id: u64,
     score: f32,
     fields: HashMap<String, String>,
+}
+
+/// `track_total_hits` from JSON: a bool flag or an integer cap.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TrackTotalHitsDto {
+    Flag(bool),
+    Cap(u64),
+}
+
+/// The app's "1000+" UX cap, applied when the caller does not specify `track_total_hits`.
+const DEFAULT_TOTAL_CAP: usize = 1001;
+
+/// Maps `track_total_hits` to `(core total_cap, report_total)`:
+/// absent ⇒ cap at DEFAULT_TOTAL_CAP; `n` ⇒ cap `n`; `true` ⇒ exact (no cap);
+/// `false` ⇒ do not report (total omitted from the response).
+fn total_tracking(dto: Option<&TrackTotalHitsDto>) -> (Option<usize>, bool) {
+    match dto {
+        None => (Some(DEFAULT_TOTAL_CAP), true),
+        Some(TrackTotalHitsDto::Cap(n)) => (Some(*n as usize), true),
+        Some(TrackTotalHitsDto::Flag(true)) => (None, true),
+        Some(TrackTotalHitsDto::Flag(false)) => (None, false),
+    }
+}
+
+#[derive(Serialize)]
+struct SearchResponseDto {
+    hits: Vec<HitDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
+    total_capped: bool,
 }
 
 fn default_min_term_freq() -> u32 {
@@ -173,6 +210,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
             ));
         }
     };
+    let (total_cap, report_total) = total_tracking(dto.track_total_hits.as_ref());
     let params = QueryParams {
         text: dto.text,
         where_groups: dto
@@ -199,14 +237,17 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         field_weights: dto.field_weights,
         similarity,
     };
-    let hits = search_index(
+    let outcome = search_index_paged(
         Path::new(index_dir),
         &params,
         dto.min_score,
+        dto.offset as usize,
         dto.limit as usize,
+        total_cap,
     )
     .map_err(|e| format!("sdsearch: {e}"))?;
-    let out: Vec<HitDto> = hits
+    let hits: Vec<HitDto> = outcome
+        .hits
         .into_iter()
         .map(|h| HitDto {
             id: h.id as u64,
@@ -214,7 +255,16 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
             fields: h.fields,
         })
         .collect();
-    serde_json::to_string(&out).map_err(|e| format!("sdsearch: serialize hits: {e}"))
+    let resp = SearchResponseDto {
+        hits,
+        total: if report_total {
+            Some(outcome.total as u64)
+        } else {
+            None
+        },
+        total_capped: outcome.total_capped,
+    };
+    serde_json::to_string(&resp).map_err(|e| format!("sdsearch: serialize hits: {e}"))
 }
 
 /// fallible core of `Engine::more_like_this`: parses MLT params, runs the query, projects
