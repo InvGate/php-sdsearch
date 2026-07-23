@@ -3,8 +3,8 @@
 
 use crate::mlt::{MltParams, more_like_this};
 use crate::query::{
-    InGroup, QueryParams, build_query, range_allow_list, search, search_with_weights,
-    search_with_weights_paged,
+    InGroup, QueryParams, build_query, intersect_allow, match_all_allow_list, range_allow_list,
+    search, search_with_weights, search_with_weights_paged,
 };
 use crate::search::{Hit, SearchOutcome};
 use crate::zsl::index::ZslIndex;
@@ -53,7 +53,10 @@ pub fn search_index_paged(
     let index = ZslIndex::open(index_dir)?;
     let query = build_query(params)?;
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let restrict = range_allow_list(&index, &params.range_filters);
+    let restrict = intersect_allow(
+        range_allow_list(&index, &params.range_filters),
+        match_all_allow_list(&index, &params.match_all),
+    );
     Ok(search_with_weights_paged(
         &index,
         &query,
@@ -88,6 +91,7 @@ fn resolve_reference_doc(
         field_weights: std::collections::HashMap::new(),
         similarity: crate::score::Similarity::Bm25,
         range_filters: Vec::new(),
+        match_all: Vec::new(),
     };
     let query = build_query(&params)?;
     let hits = search(index, &query, 0.0, 1);
@@ -133,6 +137,7 @@ mod tests {
             field_weights: std::collections::HashMap::new(),
             similarity: crate::score::Similarity::Bm25,
             range_filters: vec![],
+            match_all: vec![],
         }
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {

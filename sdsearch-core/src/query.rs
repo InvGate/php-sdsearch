@@ -358,6 +358,78 @@ pub fn range_allow_list(
     acc
 }
 
+/// Field-scoped AND text filter: the analyzed words of `text` must ALL occur in `field`.
+/// `field` is used verbatim (a base text field). A pure filter — contributes no score.
+pub struct MatchAllFilter {
+    pub field: String,
+    pub text: String,
+}
+
+/// Intersection of two optional allow-lists where `None` means "unconstrained": `None` is the
+/// identity, two `Some` sets intersect.
+pub fn intersect_allow(
+    a: Option<HashSet<usize>>,
+    b: Option<HashSet<usize>>,
+) -> Option<HashSet<usize>> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => Some(x.intersection(&y).copied().collect()),
+    }
+}
+
+/// Doc allow-list for a set of matchAll filters, ANDed together. For each filter, the analyzed
+/// words must all occur in the field: intersect the words' postings, cheapest (rarest, by
+/// `doc_freq`) first, short-circuiting to empty as soon as the running set is empty or a word is
+/// absent. `None` = no filters (no constraint); a filter whose text has no tokens adds no
+/// constraint; `Some(empty)` = a filter matched nothing.
+pub fn match_all_allow_list(
+    index: &impl IndexReader,
+    filters: &[MatchAllFilter],
+) -> Option<HashSet<usize>> {
+    let mut acc: Option<HashSet<usize>> = None;
+    for f in filters {
+        // (doc_freq, token) so we intersect rarest-first (exact rarity, cheap dict lookup).
+        let mut toks: Vec<(usize, String)> = crate::analysis::analyze(&f.text)
+            .into_iter()
+            .map(|t| (index.doc_freq(&f.field, &t), t))
+            .collect();
+        if toks.is_empty() {
+            continue; // vacuous filter contributes no constraint
+        }
+        toks.sort_by_key(|(df, _)| *df);
+
+        let this: HashSet<usize> = if toks[0].0 == 0 {
+            HashSet::new() // rarest word absent ⇒ the AND is unsatisfiable
+        } else {
+            let mut set: Option<HashSet<usize>> = None;
+            for (_, t) in &toks {
+                let docs: HashSet<usize> = index
+                    .postings_for(&f.field, t)
+                    .into_iter()
+                    .map(|(d, _)| d)
+                    .collect();
+                set = Some(match set {
+                    None => docs,
+                    Some(prev) => prev.intersection(&docs).copied().collect(),
+                });
+                if set.as_ref().is_some_and(HashSet::is_empty) {
+                    break; // short-circuit: intersection can only shrink
+                }
+            }
+            set.unwrap_or_default()
+        };
+
+        acc = Some(match acc {
+            None => this,
+            Some(prev) => prev.intersection(&this).copied().collect(),
+        });
+        if acc.as_ref().is_some_and(HashSet::is_empty) {
+            break; // short-circuit across filters too
+        }
+    }
+    acc
+}
+
 /// parameters of a host-application search (the supported surface).
 ///
 /// Deliberately does NOT derive `Default`: several fields (`fuzzy_similarity`,
@@ -382,6 +454,9 @@ pub struct QueryParams {
     /// optional inclusive range filters over keyword fields (ANDed). Empty = no range
     /// restriction. Applied as the initial `restrict` allow-list, not as a scored clause.
     pub range_filters: Vec<RangeFilter>,
+    /// optional field-scoped AND text filters (title/description "contains all words").
+    /// Empty = none. Applied as part of the `restrict` allow-list, not as a scored clause.
+    pub match_all: Vec<MatchAllFilter>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -813,6 +888,7 @@ mod tests {
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
             range_filters: vec![],
+            match_all: vec![],
         }
     }
 
@@ -1180,5 +1256,111 @@ mod tests {
             range_allow_list(&idx, &both).unwrap(),
             [1usize].into_iter().collect::<HashSet<usize>>()
         );
+    }
+
+    #[test]
+    fn match_all_allow_list_and_semantics_and_shortcircuit() {
+        // doc0 title "vpn setup guide", doc1 "vpn guide", doc2 "setup only", doc3 "vpn"
+        let mut idx = MemoryIndex::new();
+        for t in ["vpn setup guide", "vpn guide", "setup only", "vpn"] {
+            let mut d = Document::new();
+            d.add("title", t, FieldKind::Text);
+            idx.add_document(d);
+        }
+        // "vpn guide" (AND) => docs containing BOTH words in title: doc0, doc1
+        let f = vec![MatchAllFilter {
+            field: "title".into(),
+            text: "vpn guide".into(),
+        }];
+        let mut got: Vec<usize> = match_all_allow_list(&idx, &f)
+            .unwrap()
+            .into_iter()
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1]);
+
+        // a word absent from the field => empty (short-circuit on doc_freq 0)
+        let f = vec![MatchAllFilter {
+            field: "title".into(),
+            text: "vpn absent".into(),
+        }];
+        assert!(match_all_allow_list(&idx, &f).unwrap().is_empty());
+
+        // two matchAll filters AND together (both on title): "vpn" AND "setup" => doc0 only
+        let f = vec![
+            MatchAllFilter {
+                field: "title".into(),
+                text: "vpn".into(),
+            },
+            MatchAllFilter {
+                field: "title".into(),
+                text: "setup".into(),
+            },
+        ];
+        assert_eq!(
+            match_all_allow_list(&idx, &f).unwrap(),
+            [0usize].into_iter().collect::<HashSet<usize>>()
+        );
+
+        // no filters => None (no constraint)
+        assert!(match_all_allow_list(&idx, &[]).is_none());
+
+        // text analyzing to no tokens => no constraint contributed => None
+        let f = vec![MatchAllFilter {
+            field: "title".into(),
+            text: "   ".into(),
+        }];
+        assert!(match_all_allow_list(&idx, &f).is_none());
+    }
+
+    #[test]
+    fn intersect_allow_treats_none_as_unconstrained() {
+        let a: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        let b: HashSet<usize> = [2, 3, 4].into_iter().collect();
+        // None is the identity (no constraint)
+        assert_eq!(intersect_allow(None, Some(a.clone())), Some(a.clone()));
+        assert_eq!(intersect_allow(Some(a.clone()), None), Some(a.clone()));
+        assert_eq!(intersect_allow(None, None), None);
+        // both present => intersection
+        assert_eq!(
+            intersect_allow(Some(a), Some(b)),
+            Some([2usize, 3].into_iter().collect())
+        );
+    }
+
+    #[test]
+    fn match_all_narrows_a_text_query_via_restrict() {
+        // full search: text "guide" matches doc0,doc1; matchAll title contains "setup" => doc0
+        let mut idx = MemoryIndex::new();
+        for t in ["vpn setup guide", "vpn guide", "setup only"] {
+            let mut d = Document::new();
+            d.add("title", t, FieldKind::Text);
+            idx.add_document(d);
+        }
+        let allow = match_all_allow_list(
+            &idx,
+            &[MatchAllFilter {
+                field: "title".into(),
+                text: "setup".into(),
+            }],
+        )
+        .unwrap();
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "guide".into(),
+        };
+        let out = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            None,
+            Some(&allow),
+        );
+        assert_eq!(out.hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(out.total, 1);
     }
 }

@@ -337,6 +337,7 @@ fn params_for(token: &str) -> QueryParams {
         field_weights: std::collections::HashMap::new(),
         similarity: sdsearch_core::score::Similarity::Bm25,
         range_filters: vec![],
+        match_all: vec![],
     }
 }
 
