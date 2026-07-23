@@ -42,6 +42,7 @@ namespace SdSearch {
          *   "where": [ { "field": "status", "values": ["open"], "occur": "must" } ],
          *   "in":    [ { "field": "category_key", "values": ["10", "11"] } ],
          *   "range": [ { "field": "created_at_key", "from": "1700000000", "to": "1800000000" } ],
+         *   "match_all": [ { "field": "title", "text": "impresora oficina" } ],
          *   "min_score": 0.0,
          *   "limit": 20,
          *   "offset": 0,
@@ -59,6 +60,10 @@ namespace SdSearch {
          *   strings compared lexicographically against the stored term; for numeric/date fields
          *   use a fixed-width form (e.g. epoch seconds) so byte order equals numeric order.
          *   Multiple `range[]` entries are ANDed. Docs missing the field are excluded.
+         * - `match_all[]` filters docs whose `field` (a base text field, used verbatim) contains
+         *   ALL the analyzed words of `text` (AND). A non-scoring filter, ANDed with `range[]` and
+         *   with other `match_all[]` entries. Matching is on the engine's analyzed tokens (no ES
+         *   `.multilang` stemming): "impresora" does not match "impresoras".
          * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
          *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
          * - `field_weights` (optional, default `{}`): per-field score multipliers; a field not

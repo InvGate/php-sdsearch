@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::query::{
-    InGroup, Occur, Query, QueryParams, RangeFilter as SearchRangeFilter, WhereGroup, build_query,
-    search,
+    InGroup, MatchAllFilter, Occur, Query, QueryParams, RangeFilter as SearchRangeFilter,
+    WhereGroup, build_query, search,
 };
 use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
@@ -41,6 +41,11 @@ struct RangeDto {
     to: Option<String>,
 }
 #[derive(Deserialize)]
+struct MatchAllDto {
+    field: String,
+    text: String,
+}
+#[derive(Deserialize)]
 struct ParamsDto {
     #[serde(default)]
     text: String,
@@ -50,6 +55,8 @@ struct ParamsDto {
     r#in: Vec<InDto>,
     #[serde(default)]
     range: Vec<RangeDto>,
+    #[serde(default)]
+    match_all: Vec<MatchAllDto>,
     #[serde(default)]
     min_score: f32,
     #[serde(default)]
@@ -250,6 +257,14 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
                 field: r.field,
                 lower: r.from,
                 upper: r.to,
+            })
+            .collect(),
+        match_all: dto
+            .match_all
+            .into_iter()
+            .map(|m| MatchAllFilter {
+                field: m.field,
+                text: m.text,
             })
             .collect(),
         fuzzy_similarity: 0.5,
@@ -462,6 +477,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
             values: vec![value.to_string()],
         }],
         range_filters: Vec::new(),
+        match_all: Vec::new(),
         fuzzy_similarity: 0.5,
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0, // inert: empty text => no wildcard leaf
