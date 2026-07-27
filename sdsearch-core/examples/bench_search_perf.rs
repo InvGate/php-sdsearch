@@ -302,6 +302,61 @@ fn bench_intersect_strategies(iters: usize) {
     }
 }
 
+/// #3 isolation: does sizing the `HashSet<usize>` up front (`HashSet::with_capacity(n)`) actually
+/// avoid rehash-cycle cost versus growing it unsized (`HashSet::new()`) through the same insert
+/// loop? Mirrors exactly what `range_allow_list` does — N distinct ids inserted one at a time —
+/// so this isolates just the allocation strategy, not the surrounding term/posting walk. Reports
+/// both wall-clock (p50 ms) and peak bytes via the counting allocator: the peak column is the
+/// more interesting one, since avoiding rehashing removes the transient where hashbrown holds
+/// both the old and new tables live at once. Ids are deterministic (`0..n`), no randomness, so
+/// results are stable across runs.
+fn bench_reserve_strategies(iters: usize) {
+    println!(
+        "\n---- reserve: HashSet::new() vs HashSet::with_capacity(n) (p50 ms + peak bytes) ----"
+    );
+    println!(
+        "{:<10} {:>12} {:>12} {:>14} {:>14}",
+        "n", "new p50", "with_cap p50", "new peak B", "with_cap peak B"
+    );
+    for &n in &[1_000usize, 50_000, 200_000] {
+        let new_p50 = percentiles_ms(iters, || {
+            let mut docs: HashSet<usize> = HashSet::new();
+            for id in 0..n {
+                docs.insert(id);
+            }
+            std::hint::black_box(&docs);
+        })
+        .0;
+        reset_peak();
+        let mut docs: HashSet<usize> = HashSet::new();
+        for id in 0..n {
+            docs.insert(id);
+        }
+        std::hint::black_box(&docs);
+        let new_peak = peak_since_reset();
+        drop(docs);
+
+        let cap_p50 = percentiles_ms(iters, || {
+            let mut docs: HashSet<usize> = HashSet::with_capacity(n);
+            for id in 0..n {
+                docs.insert(id);
+            }
+            std::hint::black_box(&docs);
+        })
+        .0;
+        reset_peak();
+        let mut docs: HashSet<usize> = HashSet::with_capacity(n);
+        for id in 0..n {
+            docs.insert(id);
+        }
+        std::hint::black_box(&docs);
+        let cap_peak = peak_since_reset();
+        drop(docs);
+
+        println!("{n:<10} {new_p50:>12.3} {cap_p50:>12.3} {new_peak:>14} {cap_peak:>14}");
+    }
+}
+
 fn main() {
     let n: usize = std::env::args()
         .nth(1)
@@ -424,6 +479,7 @@ fn main() {
 
     bench_finalize_strategies(iters);
     bench_intersect_strategies(iters);
+    bench_reserve_strategies(iters);
 
     std::fs::remove_dir_all(&dir).ok();
 }
