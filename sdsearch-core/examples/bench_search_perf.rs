@@ -248,6 +248,7 @@ fn bench_finalize_strategies(iters: usize) {
 /// mirrors `query.rs`'s private `intersect_in_place` helper (kept local here since that fn is
 /// not `pub`): retains on the smaller operand and probes the larger, so the cost is O(min(|a|,
 /// |b|)) probes with no third-set allocation and no rehashing of survivors.
+// keep in sync with query.rs::intersect_in_place
 fn intersect_in_place_local(a: HashSet<usize>, b: HashSet<usize>) -> HashSet<usize> {
     let (mut keep, probe) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     keep.retain(|d| probe.contains(d));
@@ -315,21 +316,29 @@ fn bench_intersect_strategies(iters: usize) {
     }
 }
 
-/// #3 isolation: does sizing the `HashSet<usize>` up front (`HashSet::with_capacity(n)`) actually
-/// avoid rehash-cycle cost versus growing it unsized (`HashSet::new()`) through the same insert
-/// loop? Mirrors exactly what `range_allow_list` does — N distinct ids inserted one at a time —
-/// so this isolates just the allocation strategy, not the surrounding term/posting walk. Reports
-/// both wall-clock (p50 ms) and peak bytes via the counting allocator: the peak column is the
-/// more interesting one, since avoiding rehashing removes the transient where hashbrown holds
-/// both the old and new tables live at once. Ids are deterministic (`0..n`), no randomness, so
-/// results are stable across runs.
+/// #3 isolation: this benchmark is the record of a NEGATIVE result, kept deliberately so nobody
+/// re-introduces the change it disproves. `range_allow_list` briefly sized its allow-list up
+/// front via `HashSet::with_capacity(n)`, with `n` from a summed-`doc_freq` pre-pass over the
+/// in-range terms, instead of growing an unsized `HashSet::new()` through the insert loop. That
+/// was reverted in commit `eefbb49`: measured 1.9x SLOWER end to end, on every range class, in an
+/// interleaved A/B. In *isolation* — exactly what this function measures below — `with_capacity`
+/// genuinely wins: roughly 2x on wall-clock and it eliminates the rehash transient (the peak-bytes
+/// column), since avoiding rehashing removes the window where hashbrown holds both the old and
+/// new tables live at once. But that isolated win doesn't transfer, because `range_allow_list`
+/// has no `n` lying around — it has to compute one, and the only source is a pre-pass that sums
+/// `doc_freq` per term. `doc_freq` and `postings_for` both begin with `dict.info(field, term)`, a
+/// seek+scan in the on-disk `.tis` file, so that pre-pass doubles term-dictionary lookups (~160k
+/// extra on a wide range) to save ~20 hash-table rehashes — and the doubled seek+scan cost swamps
+/// the allocation saving. Conclusion: do not re-apply the capacity hint to `range_allow_list`
+/// (or any similar call site) without a size source that costs no extra dictionary lookups; this
+/// benchmark's numbers are what "the isolated win exists but doesn't pay for itself" looks like.
 fn bench_reserve_strategies(iters: usize) {
     println!(
         "\n---- reserve: HashSet::new() vs HashSet::with_capacity(n) (p50 ms + peak bytes) ----"
     );
     println!(
-        "{:<10} {:>12} {:>12} {:>14} {:>14}",
-        "n", "new p50", "with_cap p50", "new peak B", "with_cap peak B"
+        "{:<10} {:>12} {:>12} {:>16} {:>21}",
+        "n", "new p50", "with_cap p50", "new transient B", "with_cap transient B"
     );
     for &n in &[1_000usize, 50_000, 200_000] {
         let new_p50 = percentiles_ms(iters, || {
@@ -366,7 +375,7 @@ fn bench_reserve_strategies(iters: usize) {
         let cap_peak = peak_since_reset();
         drop(docs);
 
-        println!("{n:<10} {new_p50:>12.3} {cap_p50:>12.3} {new_peak:>14} {cap_peak:>14}");
+        println!("{n:<10} {new_p50:>12.3} {cap_p50:>12.3} {new_peak:>16} {cap_peak:>21}");
     }
 }
 

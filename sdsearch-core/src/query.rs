@@ -1367,6 +1367,16 @@ mod tests {
     }
 
     #[test]
+    fn drop_if_universal_does_not_collapse_an_empty_index_to_unrestricted() {
+        // an empty index (num_docs 0) must NOT collapse a genuinely-unsatisfiable filter to
+        // "no restriction" — that's what the `!s.is_empty()` guard in `drop_if_universal` is for.
+        assert_eq!(
+            drop_if_universal(Some(HashSet::new()), 0),
+            Some(HashSet::new())
+        );
+    }
+
+    #[test]
     fn range_allow_list_keeps_restricting_when_a_doc_lacks_the_field() {
         // OpenSearch parity: a doc with no value in the range field never matches a range
         // filter. An unbounded range therefore is NOT equivalent to "no restriction" here.
