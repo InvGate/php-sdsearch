@@ -191,7 +191,7 @@ fn eval_boolean(
             let m = eval(index, must_qs[i], weights, sim, cand.as_ref());
             let keys: HashSet<usize> = m.keys().copied().collect();
             cand = Some(match cand {
-                Some(prev) => prev.intersection(&keys).copied().collect(),
+                Some(prev) => intersect_in_place(prev, keys),
                 None => keys,
             });
             must_maps[i] = Some(m);
@@ -351,7 +351,7 @@ pub fn range_allow_list(
             }
         }
         acc = Some(match acc {
-            Some(prev) => prev.intersection(&docs).copied().collect(),
+            Some(prev) => intersect_in_place(prev, docs),
             None => docs,
         });
     }
@@ -365,6 +365,17 @@ pub struct MatchAllFilter {
     pub text: String,
 }
 
+/// Intersection that reuses an operand's table instead of allocating a third set. Keeps the
+/// smaller set and probes the larger, so the cost is O(min(|a|, |b|)) probes with no inserts
+/// and no rehashing; the larger table is freed on return. Set intersection is commutative, so
+/// which operand survives cannot change the contents — and `HashSet` iteration order cannot
+/// reach the results, because `finalize_paged` ranks by the total order `score desc, id asc`.
+fn intersect_in_place(a: HashSet<usize>, b: HashSet<usize>) -> HashSet<usize> {
+    let (mut keep, probe) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    keep.retain(|d| probe.contains(d));
+    keep // `probe` drops here
+}
+
 /// Intersection of two optional allow-lists where `None` means "unconstrained": `None` is the
 /// identity, two `Some` sets intersect.
 pub fn intersect_allow(
@@ -373,7 +384,7 @@ pub fn intersect_allow(
 ) -> Option<HashSet<usize>> {
     match (a, b) {
         (None, x) | (x, None) => x,
-        (Some(x), Some(y)) => Some(x.intersection(&y).copied().collect()),
+        (Some(x), Some(y)) => Some(intersect_in_place(x, y)),
     }
 }
 
@@ -410,7 +421,7 @@ pub fn match_all_allow_list(
                     .collect();
                 set = Some(match set {
                     None => docs,
-                    Some(prev) => prev.intersection(&docs).copied().collect(),
+                    Some(prev) => intersect_in_place(prev, docs),
                 });
                 if set.as_ref().is_some_and(HashSet::is_empty) {
                     break; // short-circuit: intersection can only shrink
@@ -421,7 +432,7 @@ pub fn match_all_allow_list(
 
         acc = Some(match acc {
             None => this,
-            Some(prev) => prev.intersection(&this).copied().collect(),
+            Some(prev) => intersect_in_place(prev, this),
         });
         if acc.as_ref().is_some_and(HashSet::is_empty) {
             break; // short-circuit across filters too
@@ -1362,5 +1373,36 @@ mod tests {
         );
         assert_eq!(out.hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![0]);
         assert_eq!(out.total, 1);
+    }
+
+    #[test]
+    fn intersect_in_place_matches_set_intersection_either_way_round() {
+        let set_a: HashSet<usize> = (0..100).collect();
+        let set_b: HashSet<usize> = (50..500).collect();
+        let expected: HashSet<usize> = (50..100).collect();
+
+        // commutative: which operand is larger must not change the contents
+        assert_eq!(
+            intersect_in_place(set_a.clone(), set_b.clone()),
+            expected,
+            "small first"
+        );
+        assert_eq!(intersect_in_place(set_b, set_a), expected, "large first");
+
+        // disjoint => empty
+        let left: HashSet<usize> = (0..10).collect();
+        let right: HashSet<usize> = (10..20).collect();
+        assert!(intersect_in_place(left, right).is_empty(), "disjoint");
+
+        // empty operand => empty, in either position
+        let base: HashSet<usize> = (0..10).collect();
+        assert!(
+            intersect_in_place(HashSet::new(), base.clone()).is_empty(),
+            "empty first"
+        );
+        assert!(
+            intersect_in_place(base, HashSet::new()).is_empty(),
+            "empty second"
+        );
     }
 }
