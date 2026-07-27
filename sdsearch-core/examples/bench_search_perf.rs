@@ -45,12 +45,25 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+static CURRENT_AT_RESET: AtomicUsize = AtomicUsize::new(0);
+
 fn reset_peak() {
-    PEAK.store(CURRENT.load(Ordering::Relaxed), Ordering::Relaxed);
+    let cur = CURRENT.load(Ordering::Relaxed);
+    PEAK.store(cur, Ordering::Relaxed);
+    CURRENT_AT_RESET.store(cur, Ordering::Relaxed);
 }
+/// Transient bytes: allocated-then-freed since the last reset (the peak minus whatever is
+/// live right now). Right metric for rehash waste; wrong metric for "how much RAM does this
+/// query need", since it excludes everything still retained at measurement time.
 fn peak_since_reset() -> usize {
     PEAK.load(Ordering::Relaxed)
         .saturating_sub(CURRENT.load(Ordering::Relaxed))
+}
+/// True high-water growth: the peak minus whatever was ALREADY live at the last reset. This is
+/// retained + transient — the real answer to "how much RAM does this query need".
+fn hiwater_since_reset() -> usize {
+    PEAK.load(Ordering::Relaxed)
+        .saturating_sub(CURRENT_AT_RESET.load(Ordering::Relaxed))
 }
 
 const POOL: &[&str] = &[
@@ -387,6 +400,15 @@ fn main() {
     let hi_narrow = format!("{}", base_ts + (n as u64) / 2 + (n as u64) / 100);
     let lo_wide = format!("{base_ts}");
     let hi_wide = format!("{}", base_ts + (n as u64) * 4 / 5);
+    // two overlapping ~10%-wide windows: [40%,50%) and [45%,55%) — a 5% overlap. Each range's
+    // term walk only touches ~10% of the dictionary (cheap), but created_at_key is 1 doc/term,
+    // so each resulting set is ~10% of the corpus — large enough that intersecting the two
+    // (inside range_allow_list) and then intersecting against the matchAll set (via
+    // intersect_allow) is real hash-set work, not a no-op on a handful of ids.
+    let lo_ov1 = format!("{}", base_ts + (n as u64) * 40 / 100);
+    let hi_ov1 = format!("{}", base_ts + (n as u64) * 50 / 100);
+    let lo_ov2 = format!("{}", base_ts + (n as u64) * 45 / 100);
+    let hi_ov2 = format!("{}", base_ts + (n as u64) * 55 / 100);
 
     // query classes: (label, params)
     let cases: Vec<(&str, QueryParams)> = vec![
@@ -431,12 +453,34 @@ fn main() {
                 "widetoken",
             ),
         ),
+        (
+            "intersection-heavy",
+            with_match_all(
+                with_match_all(
+                    with_range(
+                        with_range(
+                            params("vpn login", vec![]),
+                            "created_at_key",
+                            Some(&lo_ov1),
+                            Some(&hi_ov1),
+                        ),
+                        "created_at_key",
+                        Some(&lo_ov2),
+                        Some(&hi_ov2),
+                    ),
+                    "body",
+                    "vpn slow",
+                ),
+                "body",
+                "update timeout",
+            ),
+        ),
     ];
 
     println!("\n==== bench_search_perf: {n} docs, iters={iters} ====\n");
     println!(
-        "{:<28} {:>10} {:>10} {:>14} {:>8}",
-        "query", "p50 ms", "p95 ms", "peak KiB", "hits"
+        "{:<28} {:>10} {:>10} {:>14} {:>14} {:>8}",
+        "query", "p50 ms", "p95 ms", "hiwater KiB", "transient KiB", "hits"
     );
     for (label, p) in &cases {
         let q = build_query(p).unwrap();
@@ -459,7 +503,8 @@ fn main() {
             None,
             restrict.as_ref(),
         );
-        let peak = peak_since_reset();
+        let hiwater = hiwater_since_reset();
+        let transient = peak_since_reset();
         let hits = outcome.hits;
         // warm p50/p95 latency of the full per-request path (open + query), like production
         let (p50, p95) = percentiles_ms(iters, || {
@@ -467,8 +512,9 @@ fn main() {
             std::hint::black_box(&h);
         });
         println!(
-            "{label:<28} {p50:>10.3} {p95:>10.3} {:>14} {:>8}",
-            peak / 1024,
+            "{label:<28} {p50:>10.3} {p95:>10.3} {:>14} {:>14} {:>8}",
+            hiwater / 1024,
+            transient / 1024,
             hits.len()
         );
         // parity dump: (id, score) for baseline-vs-change diffing
