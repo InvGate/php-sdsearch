@@ -13,10 +13,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use sdsearch_core::query::{InGroup, QueryParams, build_query, search};
+use sdsearch_core::query::{
+    InGroup, MatchAllFilter, QueryParams, RangeFilter, build_query, intersect_allow,
+    match_all_allow_list, range_allow_list, search_with_weights_paged,
+};
 use sdsearch_core::score::Similarity;
 use sdsearch_core::zsl::index::ZslIndex;
-use sdsearch_core::zsl::runner::search_index;
+use sdsearch_core::zsl::runner::search_index_paged;
 use sdsearch_core::zsl::writer::{FieldKind, IndexWriter, WriterDoc, WriterField, WriterOpts};
 
 // ---- counting allocator: current + peak bytes ----
@@ -90,6 +93,13 @@ fn gen_one(i: usize) -> WriterDoc {
                 stored: true,
             },
             WriterField {
+                name: "created_at_key".into(),
+                // fixed-width 10 digits for i up to ~2.9e9, so byte order == numeric order
+                value: format!("{}", 1_700_000_000u64 + i as u64),
+                kind: FieldKind::Keyword,
+                stored: true,
+            },
+            WriterField {
                 name: "id".into(),
                 value: format!("REC-{i}"),
                 kind: FieldKind::Keyword,
@@ -134,6 +144,23 @@ fn params(text: &str, in_groups: Vec<InGroup>) -> QueryParams {
         range_filters: vec![],
         match_all: vec![],
     }
+}
+
+fn with_range(mut p: QueryParams, field: &str, lo: Option<&str>, hi: Option<&str>) -> QueryParams {
+    p.range_filters.push(RangeFilter {
+        field: field.to_string(),
+        lower: lo.map(str::to_string),
+        upper: hi.map(str::to_string),
+    });
+    p
+}
+
+fn with_match_all(mut p: QueryParams, field: &str, text: &str) -> QueryParams {
+    p.match_all.push(MatchAllFilter {
+        field: field.to_string(),
+        text: text.to_string(),
+    });
+    p
 }
 
 /// warm (p50, p95) in ms over `iters` timed runs after 3 warm-up runs.
@@ -229,10 +256,18 @@ fn main() {
         w.optimize().unwrap();
     }
 
+    // range bounds derived from gen_one's created_at_key = 1_700_000_000 + i
+    let base_ts = 1_700_000_000u64;
+    let lo_narrow = format!("{}", base_ts + (n as u64) / 2);
+    let hi_narrow = format!("{}", base_ts + (n as u64) / 2 + (n as u64) / 100);
+    let lo_wide = format!("{base_ts}");
+    let hi_wide = format!("{}", base_ts + (n as u64) * 4 / 5);
+
     // query classes: (label, params)
     let cases: Vec<(&str, QueryParams)> = vec![
         ("short-wildcard 'vp'", params("vp", vec![])),
         ("multi-word 'vpn login'", params("vpn login", vec![])),
+        // CONTROL for this plan: same text, no filters. Must not regress.
         ("common 'widetoken' (big M)", params("widetoken", vec![])),
         (
             "filtered 'widetoken' + cat_key=3",
@@ -245,6 +280,32 @@ fn main() {
             ),
         ),
         ("none 'absenttoken'", params("absenttoken", vec![])),
+        (
+            "range narrow ~1%",
+            with_range(
+                params("widetoken", vec![]),
+                "created_at_key",
+                Some(&lo_narrow),
+                Some(&hi_narrow),
+            ),
+        ),
+        (
+            "range wide ~80%",
+            with_range(
+                params("widetoken", vec![]),
+                "created_at_key",
+                Some(&lo_wide),
+                Some(&hi_wide),
+            ),
+        ),
+        (
+            "range full + matchAll",
+            with_match_all(
+                with_range(params("widetoken", vec![]), "created_at_key", None, None),
+                "body",
+                "widetoken",
+            ),
+        ),
     ];
 
     println!("\n==== bench_search_perf: {n} docs, iters={iters} ====\n");
@@ -256,12 +317,28 @@ fn main() {
         let q = build_query(p).unwrap();
         let idx = ZslIndex::open(&dir).unwrap();
         // measure peak allocation for one query over an already-open index
+        // peak must cover allow-list construction, not just scoring — `search()` bypasses restrict
         reset_peak();
-        let hits = search(&idx, &q, 0.0, 20);
+        let restrict = intersect_allow(
+            range_allow_list(&idx, &p.range_filters),
+            match_all_allow_list(&idx, &p.match_all),
+        );
+        let outcome = search_with_weights_paged(
+            &idx,
+            &q,
+            &p.field_weights,
+            p.similarity,
+            0.0,
+            0,
+            20,
+            None,
+            restrict.as_ref(),
+        );
         let peak = peak_since_reset();
+        let hits = outcome.hits;
         // warm p50/p95 latency of the full per-request path (open + query), like production
         let (p50, p95) = percentiles_ms(iters, || {
-            let h = search_index(&dir, p, 0.0, 20).unwrap();
+            let h = search_index_paged(&dir, p, 0.0, 0, 20, None).unwrap();
             std::hint::black_box(&h);
         });
         println!(
