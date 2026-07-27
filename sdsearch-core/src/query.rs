@@ -359,14 +359,9 @@ pub fn range_allow_list(
     }
     let mut acc: Option<HashSet<usize>> = None;
     for f in filters {
-        let terms = index.terms_in_range(&f.field, f.lower.as_deref(), f.upper.as_deref());
-        // `doc_freq` reads TermInfo straight from the term dictionary — no .frq access — so this
-        // pre-pass is cheap next to the posting reads below, and it sizes the set exactly instead
-        // of growing it by ~20 rehash cycles. It counts deleted docs, hence the clamp to live.
-        let df_sum: usize = terms.iter().map(|t| index.doc_freq(&f.field, t)).sum();
-        let mut docs: HashSet<usize> = HashSet::with_capacity(df_sum.min(index.num_docs()));
-        for term in &terms {
-            for (doc_id, _tf) in index.postings_for(&f.field, term) {
+        let mut docs: HashSet<usize> = HashSet::new();
+        for term in index.terms_in_range(&f.field, f.lower.as_deref(), f.upper.as_deref()) {
+            for (doc_id, _tf) in index.postings_for(&f.field, &term) {
                 docs.insert(doc_id);
             }
         }
