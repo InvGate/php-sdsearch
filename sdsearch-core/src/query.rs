@@ -332,6 +332,21 @@ pub struct RangeFilter {
     pub upper: Option<String>,
 }
 
+/// Collapses an allow-list that contains every live doc to `None` ("no restriction"), which is
+/// what it means. Skips the per-posting `contains` in the scorer and every downstream
+/// intersection.
+///
+/// `live` must be `num_docs()` (live docs), NOT `total_docs()` — the latter is maxDoc including
+/// deletes (it feeds the idf denominator), while `postings_for` drops deleted docs, so an
+/// allow-list only ever holds live ids. The `is_empty` guard keeps an empty index (`0 == 0`)
+/// from turning a legitimate `Some(empty)` into `None`.
+fn drop_if_universal(acc: Option<HashSet<usize>>, live: usize) -> Option<HashSet<usize>> {
+    match acc {
+        Some(s) if !s.is_empty() && s.len() == live => None,
+        other => other,
+    }
+}
+
 /// Doc allow-list for a set of range filters, ANDed together: for each filter, the union of the
 /// postings of its in-range terms; intersected across filters. `None` = no filters (no
 /// restriction). `Some(empty)` = a filter matched no doc (valid: the query yields nothing).
@@ -360,7 +375,7 @@ pub fn range_allow_list(
             None => docs,
         });
     }
-    acc
+    drop_if_universal(acc, index.num_docs())
 }
 
 /// Field-scoped AND text filter: the analyzed words of `text` must ALL occur in `field`.
@@ -443,7 +458,7 @@ pub fn match_all_allow_list(
             break; // short-circuit across filters too
         }
     }
-    acc
+    drop_if_universal(acc, index.num_docs())
 }
 
 /// parameters of a host-application search (the supported surface).
@@ -1327,6 +1342,79 @@ mod tests {
             text: "   ".into(),
         }];
         assert!(match_all_allow_list(&idx, &f).is_none());
+    }
+
+    #[test]
+    fn range_allow_list_drops_a_filter_that_excludes_nothing() {
+        let mut idx = MemoryIndex::new();
+        for ca in ["100", "200", "300"] {
+            let mut d = Document::new();
+            d.add("body", "ticket", FieldKind::Text);
+            d.add("created_at_key", ca, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        // covers every value present => no doc is excluded => equivalent to no restriction
+        let filters = vec![RangeFilter {
+            field: "created_at_key".into(),
+            lower: Some("050".into()),
+            upper: Some("400".into()),
+        }];
+        assert!(range_allow_list(&idx, &filters).is_none());
+
+        // a bound that excludes one doc must still restrict
+        let filters = vec![RangeFilter {
+            field: "created_at_key".into(),
+            lower: Some("050".into()),
+            upper: Some("250".into()),
+        }];
+        let got = range_allow_list(&idx, &filters).expect("still restricts");
+        assert_eq!(got, [0usize, 1].into_iter().collect::<HashSet<usize>>());
+    }
+
+    #[test]
+    fn range_allow_list_keeps_restricting_when_a_doc_lacks_the_field() {
+        // OpenSearch parity: a doc with no value in the range field never matches a range
+        // filter. An unbounded range therefore is NOT equivalent to "no restriction" here.
+        let mut idx = MemoryIndex::new();
+        let mut d0 = Document::new();
+        d0.add("body", "ticket", FieldKind::Text);
+        d0.add("created_at_key", "100", FieldKind::Keyword);
+        idx.add_document(d0);
+        let mut d1 = Document::new(); // deliberately has no created_at_key
+        d1.add("body", "ticket", FieldKind::Text);
+        idx.add_document(d1);
+
+        let filters = vec![RangeFilter {
+            field: "created_at_key".into(),
+            lower: None,
+            upper: None,
+        }];
+        let got = range_allow_list(&idx, &filters).expect("must not collapse to None");
+        assert_eq!(got, [0usize].into_iter().collect::<HashSet<usize>>());
+    }
+
+    #[test]
+    fn match_all_allow_list_drops_a_filter_that_excludes_nothing() {
+        let mut idx = MemoryIndex::new();
+        for t in ["vpn setup", "vpn guide", "vpn"] {
+            let mut d = Document::new();
+            d.add("title", t, FieldKind::Text);
+            idx.add_document(d);
+        }
+        // "vpn" is in every doc's title => the filter excludes nothing
+        let f = vec![MatchAllFilter {
+            field: "title".into(),
+            text: "vpn".into(),
+        }];
+        assert!(match_all_allow_list(&idx, &f).is_none());
+
+        // "setup" is not => still restricts
+        let f = vec![MatchAllFilter {
+            field: "title".into(),
+            text: "setup".into(),
+        }];
+        let got = match_all_allow_list(&idx, &f).expect("still restricts");
+        assert_eq!(got, [0usize].into_iter().collect::<HashSet<usize>>());
     }
 
     #[test]

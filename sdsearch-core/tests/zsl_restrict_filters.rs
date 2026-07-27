@@ -5,9 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sdsearch_core::query::{MatchAllFilter, QueryParams, RangeFilter};
+use sdsearch_core::index::IndexReader;
+use sdsearch_core::query::{MatchAllFilter, QueryParams, RangeFilter, range_allow_list};
 use sdsearch_core::score::Similarity;
+use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::search_index_paged;
+use sdsearch_core::zsl::writer::{IndexWriter, WriterOpts};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -105,6 +108,34 @@ fn range_and_match_all_intersect_over_a_real_zsl_index() {
 
     assert_eq!(got, expected, "range AND matchAll must intersect");
     assert_eq!(out.total, expected.len(), "total counts the restricted set");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn short_circuit_compares_against_live_docs_not_maxdoc() {
+    let dir = temp_kb_full();
+
+    // delete one of the fixture's 20 docs: num_docs becomes 19, maxDoc stays 20
+    let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+    w.delete_document(5);
+    w.commit().unwrap();
+
+    let idx = ZslIndex::open(&dir).unwrap();
+    assert_eq!(idx.num_docs(), 19, "one doc deleted");
+    assert_eq!(idx.total_docs(), 20, "maxDoc still counts the delete");
+
+    // created_at_key is universal over the fixture, so an unbounded range covers every LIVE doc.
+    // Comparing against total_docs() would give 19 != 20 and silently fail to fire.
+    let filters = vec![RangeFilter {
+        field: "created_at_key".into(),
+        lower: None,
+        upper: None,
+    }];
+    assert!(
+        range_allow_list(&idx, &filters).is_none(),
+        "must short-circuit on live docs"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
