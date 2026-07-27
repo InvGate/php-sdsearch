@@ -8,7 +8,7 @@
 //!   N default 200000, iters default 30 (enough samples for a meaningful p95).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -232,6 +232,76 @@ fn bench_finalize_strategies(iters: usize) {
     }
 }
 
+/// mirrors `query.rs`'s private `intersect_in_place` helper (kept local here since that fn is
+/// not `pub`): retains on the smaller operand and probes the larger, so the cost is O(min(|a|,
+/// |b|)) probes with no third-set allocation and no rehashing of survivors.
+fn intersect_in_place_local(a: HashSet<usize>, b: HashSet<usize>) -> HashSet<usize> {
+    let (mut keep, probe) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    keep.retain(|d| probe.contains(d));
+    keep
+}
+
+/// #2 isolation: the macro bench (query classes above) couldn't resolve whether
+/// `intersect_in_place` actually beats the naive `prev.intersection(&other).copied().collect()`
+/// it replaced — both range/matchAll query classes with a single filter never call it at all,
+/// and run-to-run noise on unrelated rows (±20-30%) dwarfed the deltas on the rows that do. This
+/// synthetic head-to-head isolates just the two intersection strategies over `HashSet<usize>`
+/// pairs shaped like what the engine actually intersects: same-size pairs, and the asymmetric
+/// (small, large) / (large, small) pairs the helper is specifically designed for. Order matters:
+/// every real call site intersects as `prev.intersection(&x)`, i.e. always iterates the FIRST
+/// operand — cheap when `prev` is the smaller set, expensive when it is the larger one.
+/// `intersect_in_place` picks the smaller operand regardless of position, so it should differ
+/// from naive only on the asymmetric rows. Both strategies consume their inputs, so a fresh
+/// clone of both sets is built every iteration; the `clone` column is that per-iter floor
+/// (identical cost for both strategies), so the real algorithm cost is (strategy − clone).
+/// Overlap is deterministic (`b` starts at `a.len() / 2`) — no randomness — so result sizes are
+/// stable across runs.
+fn bench_intersect_strategies(iters: usize) {
+    println!(
+        "\n---- intersect: prev.intersection(..).collect() vs intersect_in_place (p50 ms, incl. clone floor) ----"
+    );
+    println!(
+        "{:<18} {:>10} {:>12} {:>20}",
+        "|a| / |b|", "clone", "naive", "intersect_in_place"
+    );
+    for &(na, nb) in &[
+        (1_000usize, 1_000usize),
+        (100_000, 100_000),
+        (1_000, 100_000),
+        (100_000, 1_000),
+    ] {
+        // deterministic overlap: b starts at a.len()/2, so results are stable across runs.
+        let a: HashSet<usize> = (0..na).collect();
+        let b: HashSet<usize> = (na / 2..na / 2 + nb).collect();
+
+        let clone_p50 = percentiles_ms(iters, || {
+            let pa = a.clone();
+            let pb = b.clone();
+            std::hint::black_box(&pa);
+            std::hint::black_box(&pb);
+        })
+        .0;
+        let naive_p50 = percentiles_ms(iters, || {
+            let pa = a.clone();
+            let pb = b.clone();
+            let out: HashSet<usize> = pa.intersection(&pb).copied().collect();
+            std::hint::black_box(&out);
+        })
+        .0;
+        let new_p50 = percentiles_ms(iters, || {
+            let pa = a.clone();
+            let pb = b.clone();
+            let out = intersect_in_place_local(pa, pb);
+            std::hint::black_box(&out);
+        })
+        .0;
+        println!(
+            "{:<18} {clone_p50:>10.3} {naive_p50:>12.3} {new_p50:>20.3}",
+            format!("{na} / {nb}")
+        );
+    }
+}
+
 fn main() {
     let n: usize = std::env::args()
         .nth(1)
@@ -353,6 +423,7 @@ fn main() {
     }
 
     bench_finalize_strategies(iters);
+    bench_intersect_strategies(iters);
 
     std::fs::remove_dir_all(&dir).ok();
 }
