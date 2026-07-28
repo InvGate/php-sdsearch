@@ -50,7 +50,9 @@ namespace SdSearch {
          *   "accent_insensitive": false,
          *   "field_weights": { "title": 3.0, "description": 1.0 },
          *   "similarity": "bm25",
-         *   "wildcard_min_prefix": 2
+         *   "wildcard_min_prefix": 2,
+         *   "sort": "created_at_key",
+         *   "sort_dir": "desc"
          * }
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
@@ -74,6 +76,15 @@ namespace SdSearch {
          * - `wildcard_min_prefix` (optional, default `2`): minimum literal-prefix length before
          *   the first `*`/`?` for the free-text wildcard leaf. Omitted = `2` (short single-word
          *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
+         * - `sort` (optional): keyword field to order by, used VERBATIM (pass the `_key` name).
+         *   Omitted or `"_score"` = relevance order. `sort_dir` is `"asc"` or `"desc"`
+         *   (default `"desc"`). Ordering is resolved at READ time per value: a value that parses
+         *   as a 64-bit integer sorts NUMERICALLY, anything else sorts by byte order. So
+         *   variable-width numeric ids order correctly (`"3" < "20" < "100"`) with **no
+         *   zero-padding in the feed and no reindex**, and ISO-8601 timestamps order
+         *   chronologically via the byte-order fallback. Docs with no value for the field sort
+         *   LAST in both directions. Ties break by score desc, then document id asc. A doc with
+         *   several values for the field is placed once, under its first value in write order.
          * - `offset` (optional, default `0`): number of leading hits to skip (pagination).
          * - `track_total_hits` (optional, default `1001`): integer caps the reported `total`
          *   at that value; `true` = exact count; `false` = omit `total`. Default caps at 1001.

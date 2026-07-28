@@ -15,6 +15,7 @@ use sdsearch_core::query::{
     WhereGroup, build_query, search,
 };
 use sdsearch_core::score::Similarity;
+use sdsearch_core::search::SortSpec;
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::{more_like_this_index, search_index_paged};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
@@ -81,6 +82,13 @@ struct ParamsDto {
     /// scan the whole vocabulary). Pass 0/1 for typeahead surfaces.
     #[serde(default = "default_wildcard_min_prefix")]
     wildcard_min_prefix: usize,
+    /// optional: keyword field to order by, used VERBATIM (pass the `_key` name). Omitted or
+    /// `"_score"` = relevance order.
+    #[serde(default)]
+    sort: Option<String>,
+    /// optional: `"asc"` or `"desc"`. Omitted = `"desc"` (OpenSearch-adapter parity).
+    #[serde(default)]
+    sort_dir: Option<String>,
 }
 #[derive(Serialize)]
 struct HitDto {
@@ -109,6 +117,21 @@ fn total_tracking(dto: Option<&TrackTotalHitsDto>) -> (Option<usize>, bool) {
         Some(TrackTotalHitsDto::Cap(n)) => (Some(*n as usize), true),
         Some(TrackTotalHitsDto::Flag(true)) => (None, true),
         Some(TrackTotalHitsDto::Flag(false)) => (None, false),
+    }
+}
+
+/// Maps the `sort`/`sort_dir` params to an optional core `SortSpec`. An absent `sort`, or the
+/// literal `"_score"`, means relevance order — which the core expresses as the ABSENCE of a
+/// `SortSpec`, so both collapse to `None` here and the relevance path is reached by exactly the
+/// same call as before. Direction defaults to descending, matching the OpenSearch adapter.
+fn sort_spec_from(field: Option<String>, dir: Option<&str>) -> Option<SortSpec> {
+    match field {
+        None => None,
+        Some(f) if f == "_score" => None,
+        Some(f) => Some(SortSpec {
+            field: f,
+            ascending: dir == Some("asc"),
+        }),
     }
 }
 
@@ -273,6 +296,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         accent_insensitive: dto.accent_insensitive,
         field_weights: dto.field_weights,
         similarity,
+        sort: sort_spec_from(dto.sort, dto.sort_dir.as_deref()),
     };
     let outcome = search_index_paged(
         Path::new(index_dir),
@@ -484,6 +508,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         accent_insensitive: false,
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
+        sort: None, // resolving one id: order is irrelevant, the caller takes the first hit
     };
     let query = build_query(&params).map_err(|e| format!("sdsearch: build_query: {e}"))?;
     let hits = search(index, &query, 0.0, 1);
