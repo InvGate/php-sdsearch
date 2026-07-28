@@ -990,6 +990,56 @@ mod tests {
     }
 
     #[test]
+    fn finalize_sorted_with_a_zero_size_page_still_counts() {
+        // offset+limit == 0 makes the heap pointless, but `total` must still be right: the
+        // runner reaches this whenever a caller wants only the count. The loop has to keep
+        // counting matches while skipping the value lookup entirely.
+        let (idx, scored) = sortable();
+        let out = finalize_sorted(&idx, scored.clone(), 0.0, &spec("d_key", true), 0, 0, None);
+        assert!(out.hits.is_empty());
+        assert_eq!(out.total, 6, "an empty page still reports the match count");
+        assert!(!out.total_capped);
+
+        // and min_score / the cap still apply on that path
+        let out = finalize_sorted(&idx, scored, 0.6, &spec("d_key", true), 0, 0, Some(2));
+        assert!(out.hits.is_empty());
+        assert_eq!(out.total, 2);
+        assert!(out.total_capped);
+    }
+
+    #[test]
+    fn sort_entry_equality_agrees_with_the_ordering() {
+        // `Ord` on `SortEntry` requires `Eq`, so `PartialEq` exists whether or not the heap ever
+        // calls it. It must not disagree with `cmp`, or the type would violate the total-order
+        // contract `BinaryHeap` and `sort_unstable` are entitled to rely on.
+        let e = |key: SortKey, id: usize, score: f32| SortEntry {
+            key,
+            id,
+            score,
+            ascending: true,
+        };
+        let a = e(SortKey::Num(10), 1, 0.5);
+        let same = e(SortKey::Num(10), 1, 0.5);
+        let other_id = e(SortKey::Num(10), 2, 0.5);
+        let other_key = e(SortKey::Num(20), 1, 0.5);
+
+        assert!(a == same, "identical entries compare equal");
+        assert!(
+            a != other_id,
+            "the id tiebreak makes entries distinguishable"
+        );
+        assert!(a != other_key);
+        // the property that matters: eq is exactly cmp == Equal
+        for (x, y) in [(&a, &same), (&a, &other_id), (&a, &other_key)] {
+            assert_eq!(
+                x == y,
+                x.cmp(y) == std::cmp::Ordering::Equal,
+                "PartialEq must agree with Ord"
+            );
+        }
+    }
+
+    #[test]
     fn finalize_sorted_text_falls_back_to_byte_order() {
         let mut idx = MemoryIndex::new();
         for v in ["open", "closed", "pending"] {
@@ -1055,15 +1105,20 @@ mod tests {
         assert_eq!(got, vec![0, 1]);
     }
 
-    /// Counts the reader calls `finalize_sorted` makes, so the cost shape is pinned by a test
-    /// rather than by a comment. An ordered term walk over the sort field measured 4.2 s at
-    /// 500k docs and a per-term `doc_freq` pre-pass cost a 1.9x regression in the range work —
-    /// both are re-introducible by a well-meaning refactor, and both are caught here.
+    /// Pins the SHAPE of `finalize_sorted`'s reader access, so a refactor cannot quietly change
+    /// the cost model. Two regressions this guards against are not hypothetical: an ordered term
+    /// walk over the sort field measured 4.2 s at 500k docs, and a per-term `doc_freq` pre-pass
+    /// cost a 1.9x regression in the range work.
+    ///
+    /// Every method sort must NEVER reach is `unreachable!` rather than counted. That is a
+    /// stronger assertion than comparing a counter to zero — it covers the whole surface instead
+    /// of the handful of methods someone remembered to count, and it names the violated invariant
+    /// at the point of failure. It also means these arms are legitimately never executed: their
+    /// absence from a coverage report is the property being asserted, not a gap in testing.
     struct CountingIndex {
         inner: MemoryIndex,
         stored_value_calls: std::cell::RefCell<Vec<usize>>,
         stored_fields_calls: std::cell::Cell<usize>,
-        dictionary_calls: std::cell::Cell<usize>,
     }
 
     impl CountingIndex {
@@ -1072,53 +1127,53 @@ mod tests {
                 inner,
                 stored_value_calls: std::cell::RefCell::new(Vec::new()),
                 stored_fields_calls: std::cell::Cell::new(0),
-                dictionary_calls: std::cell::Cell::new(0),
             }
         }
     }
 
     impl IndexReader for CountingIndex {
-        fn num_docs(&self) -> usize {
-            self.inner.num_docs()
-        }
-        fn doc_freq(&self, field: &str, term: &str) -> usize {
-            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
-            self.inner.doc_freq(field, term)
-        }
-        fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
-            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
-            self.inner.postings_for(field, term)
-        }
-        fn field_len(&self, doc_id: usize, field: &str) -> u32 {
-            self.inner.field_len(doc_id, field)
+        // --- the only two the sort path may use ---
+        fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
+            self.stored_value_calls.borrow_mut().push(doc_id);
+            self.inner.stored_value(doc_id, field)
         }
         fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
             self.stored_fields_calls
                 .set(self.stored_fields_calls.get() + 1);
             self.inner.stored_fields(doc_id)
         }
-        fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
-            self.stored_value_calls.borrow_mut().push(doc_id);
-            self.inner.stored_value(doc_id, field)
+
+        // --- term dictionary: reaching any of these is the regression ---
+        fn doc_freq(&self, _field: &str, _term: &str) -> usize {
+            unreachable!("field sort must not call doc_freq (dict.info() is a .tis seek+scan)")
         }
-        fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
-            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
-            self.inner.terms_with_prefix(field, prefix)
+        fn postings_for(&self, _field: &str, _term: &str) -> Vec<(usize, u32)> {
+            unreachable!("field sort must not read postings of the sort field")
+        }
+        fn terms_with_prefix(&self, _field: &str, _prefix: &str) -> Vec<String> {
+            unreachable!("field sort must not enumerate the sort field's vocabulary")
         }
         fn terms_in_range(
             &self,
-            field: &str,
-            lower: Option<&str>,
-            upper: Option<&str>,
+            _field: &str,
+            _lower: Option<&str>,
+            _upper: Option<&str>,
         ) -> Vec<String> {
-            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
-            self.inner.terms_in_range(field, lower, upper)
+            unreachable!("field sort must not walk the term dictionary (4.2 s at 500k docs)")
         }
-        fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
-            self.inner.positions_for(field, term, doc_id)
+        fn positions_for(&self, _field: &str, _term: &str, _doc_id: usize) -> Vec<u32> {
+            unreachable!("field sort must not read positions")
+        }
+
+        // --- collection metadata: not needed either, and cheap to keep honest ---
+        fn num_docs(&self) -> usize {
+            unreachable!("field sort must not need collection statistics")
+        }
+        fn field_len(&self, _doc_id: usize, _field: &str) -> u32 {
+            unreachable!("field sort must not need field lengths")
         }
         fn indexed_fields(&self) -> Vec<String> {
-            self.inner.indexed_fields()
+            unreachable!("field sort must not enumerate indexed fields")
         }
     }
 
@@ -1137,13 +1192,9 @@ mod tests {
         // the expensive whole-doc hydration happens ONLY for the returned page
         assert_eq!(idx.stored_fields_calls.get(), 2, "hydrate the page, not N");
 
-        // and the term dictionary is never consulted for the sort — no ordered walk, no
-        // doc_freq pre-pass. This is the invariant the measured evidence demands.
-        assert_eq!(
-            idx.dictionary_calls.get(),
-            0,
-            "sort must not touch the dictionary"
-        );
+        // That this test reached its end at all is the dictionary assertion: every term-dictionary
+        // method of `CountingIndex` is `unreachable!`, so an ordered walk or a doc_freq pre-pass
+        // would have panicked above rather than merely bumped a counter.
     }
 
     #[test]

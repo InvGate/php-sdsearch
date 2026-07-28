@@ -205,6 +205,52 @@ mod tests {
     }
 
     #[test]
+    fn read_stored_field_handles_binary_entries() {
+        // A binary entry (flag 0x02) is length-prefixed in BYTES, not code points, so it is the
+        // one case `read_stored_field` skips arithmetically instead of scanning. The host
+        // application never indexes binaries — `read_stored_raw` calls its own binary branch a
+        // defensive guard — but the skip still has to be right, because getting it wrong
+        // desynchronizes the walk and silently returns a neighbouring field's bytes.
+        use crate::zsl::bytes::{write_modified_utf8, write_vint};
+
+        let mut fdt = Vec::new();
+        write_vint(&mut fdt, 3);
+        // entry 0: binary, must be SKIPPED correctly to reach the ones after it
+        write_vint(&mut fdt, 0);
+        fdt.push(0x02);
+        write_vint(&mut fdt, 4);
+        fdt.extend_from_slice(b"\x00\x01\x02\x03");
+        // entry 1: a normal string living immediately after the binary one
+        write_vint(&mut fdt, 1);
+        fdt.push(0x00);
+        write_modified_utf8(&mut fdt, "after-binary");
+        // entry 2: another binary, this one is the target
+        write_vint(&mut fdt, 2);
+        fdt.push(0x02);
+        write_vint(&mut fdt, 3);
+        fdt.extend_from_slice(b"abc");
+        let fdx = 0u64.to_be_bytes();
+
+        // skipping the leading binary lands exactly on the string after it
+        assert_eq!(
+            read_stored_field(&fdx, &fdt, 0, 1).unwrap().as_deref(),
+            Some("after-binary")
+        );
+        // and a binary entry can itself be the requested field
+        assert_eq!(
+            read_stored_field(&fdx, &fdt, 0, 2).unwrap().as_deref(),
+            Some("abc")
+        );
+        // agreeing with the full read, which decodes binaries the same lossy way
+        let all = read_stored_raw(&fdx, &fdt, 0).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            read_stored_field(&fdx, &fdt, 0, 0).unwrap(),
+            Some(all[0].value.clone())
+        );
+    }
+
+    #[test]
     fn read_stored_field_is_none_out_of_range() {
         let cf = cfs();
         let names = cf.names();
