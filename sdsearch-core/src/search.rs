@@ -10,6 +10,7 @@
 use crate::distance::levenshtein_bytes;
 use crate::index::IndexReader;
 use crate::score::Similarity;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -26,6 +27,101 @@ pub struct SearchOutcome {
     pub total: usize,
     pub total_capped: bool,
 }
+
+/// Field sort selector. `field` is used VERBATIM (the caller passes the `_key`-suffixed name,
+/// consistent with range/matchAll). Relevance order is the ABSENCE of a `SortSpec`, not a
+/// special value here.
+pub struct SortSpec {
+    pub field: String,
+    pub ascending: bool,
+}
+
+/// A doc's sort value, resolved at READ time from its stored field — never by re-encoding what
+/// the index holds, so this works on indexes the legacy PHP engine wrote, with no reindex.
+///
+/// The variant is decided PER VALUE, not per field. That matters: deciding per field would mean
+/// inspecting the field's whole vocabulary first, which is measured at 4.2 s on a 500k-doc index
+/// (see the sort plan) — the exact cost this design exists to avoid. Per value it is a `parse`.
+///
+/// The derived `Ord` gives `Num < Text < Missing` and orders each variant by its payload, which
+/// is the ascending output order. Two consequences worth stating:
+/// - numeric fields order NUMERICALLY over raw, un-padded values (`"3" < "20" < "100"`), so the
+///   feed never has to zero-pad;
+/// - text fields fall back to byte order, which for ISO-8601 timestamps IS chronological order.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SortKey {
+    Num(i64),
+    Text(String),
+    Missing,
+}
+
+impl SortKey {
+    /// Classifies one stored value. `None` (no such field on this doc) becomes `Missing`.
+    fn from_stored(value: Option<String>) -> SortKey {
+        match value {
+            None => SortKey::Missing,
+            Some(v) => match v.parse::<i64>() {
+                Ok(n) => SortKey::Num(n),
+                Err(_) => SortKey::Text(v),
+            },
+        }
+    }
+}
+
+/// One candidate in the bounded top-K heap.
+///
+/// `Ord` is defined so that GREATER means "later in the final output". `BinaryHeap` is a max-heap,
+/// so its root is then the WORST entry currently kept — exactly what a bounded top-K needs to
+/// evict. `ascending` rides along per entry (it lands in padding the struct already had, so it
+/// costs nothing) because every entry in one heap shares the same direction.
+struct SortEntry {
+    key: SortKey,
+    id: usize,
+    score: f32,
+    ascending: bool,
+}
+
+impl Ord for SortEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Missing sorts LAST in both directions, so the missing flag is compared ascending
+        // ALWAYS — outside the direction flip. Flipping it with the rest would float
+        // value-less docs to the top of a descending page.
+        let a_missing = matches!(self.key, SortKey::Missing);
+        let b_missing = matches!(other.key, SortKey::Missing);
+        a_missing
+            .cmp(&b_missing)
+            .then_with(|| {
+                let by_key = self.key.cmp(&other.key);
+                if self.ascending {
+                    by_key
+                } else {
+                    by_key.reverse()
+                }
+            })
+            // same tiebreak as the relevance path: score desc, then id asc (deterministic).
+            .then_with(|| {
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for SortEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SortEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for SortEntry {}
 
 /// raw scores (doc_id, score) of a term in a field. No sort/filter/hydration.
 /// The idf is computed ONCE (constant over the posting list), not per doc.
@@ -297,6 +393,84 @@ pub(crate) fn finalize_paged(
             id,
             score,
             fields: index.stored_fields(id),
+        })
+        .collect();
+    SearchOutcome {
+        hits,
+        total,
+        total_capped,
+    }
+}
+
+/// Field-sorted counterpart of `finalize_paged`: same filtering, paging and total semantics, but
+/// ordered by a field's value instead of by score.
+///
+/// Walks the MATCHED docs (never the sort field's term dictionary) and resolves each one's value
+/// with `stored_value`, feeding a heap bounded to `offset + limit`. So:
+/// - the sort path performs ZERO term-dictionary lookups — no `terms_in_range`, no `doc_freq`,
+///   no per-term pre-pass. That is deliberate: an ordered term walk over a near-unique field
+///   measured 4.2 s at 500k docs, and it is paid up front regardless of how few docs match;
+/// - retained memory is `K' = offset + limit` entries, not one per match;
+/// - `min_score` is applied BEFORE the value lookup, so filtered-out docs never touch the `.fdt`.
+///
+/// `limit == usize::MAX` (the runner's "unlimited") makes the bound vacuous and the heap retains
+/// every match — inherent to an unbounded request, and the same O(matches) the relevance path
+/// already pays there.
+pub(crate) fn finalize_sorted(
+    index: &impl IndexReader,
+    scored: impl IntoIterator<Item = (usize, f32)>,
+    min_score: f32,
+    sort: &SortSpec,
+    offset: usize,
+    limit: usize,
+    total_cap: Option<usize>,
+) -> SearchOutcome {
+    // `saturating_add` guards `limit == usize::MAX`. Note this is offset PLUS limit, not times:
+    // paging to offset 10000 keeps 10020 entries, not 200000.
+    let want = offset.saturating_add(limit);
+    let mut heap: BinaryHeap<SortEntry> = BinaryHeap::new();
+    let mut count = 0usize;
+
+    for (id, score) in scored {
+        if score < min_score {
+            continue;
+        }
+        // every surviving match counts toward `total`, even when it cannot reach the page
+        count += 1;
+        if want == 0 {
+            continue;
+        }
+        let entry = SortEntry {
+            key: SortKey::from_stored(index.stored_value(id, &sort.field)),
+            id,
+            score,
+            ascending: sort.ascending,
+        };
+        if heap.len() < want {
+            heap.push(entry);
+        } else if heap.peek().is_some_and(|worst| entry < *worst) {
+            // better than the worst entry kept: evict it. Otherwise drop `entry` on the floor —
+            // this is the branch the overwhelming majority of matches take.
+            heap.pop();
+            heap.push(entry);
+        }
+    }
+
+    let total = total_cap.map_or(count, |cap| count.min(cap));
+    let total_capped = total_cap.is_some_and(|cap| count > cap);
+
+    // a heap only orders its root, so the retained K' entries still need a sort — O(K' log K'),
+    // dominated by the O(matches) walk above.
+    let mut ordered = heap.into_vec();
+    ordered.sort_unstable();
+    let hits = ordered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|e| Hit {
+            id: e.id,
+            score: e.score,
+            fields: index.stored_fields(e.id),
         })
         .collect();
     SearchOutcome {
@@ -690,5 +864,302 @@ mod tests {
             let want: Vec<usize> = reference.iter().take(limit).map(|(id, _)| *id).collect();
             assert_eq!(got, want, "limit={limit}");
         }
+    }
+
+    // ---- field sort ----
+
+    /// 6 docs whose `d_key` values are VARIABLE-WIDTH numbers, so numeric order
+    /// ("3" < "20" < "100") disagrees with byte order ("100" < "20" < "3"). Doc 3 has no
+    /// `d_key` at all. Scores are chosen so two docs share each value, exercising the tiebreak.
+    fn sortable() -> (MemoryIndex, Vec<(usize, f32)>) {
+        let mut idx = MemoryIndex::new();
+        let rows = [
+            (Some("20"), 0.5f32),
+            (Some("3"), 0.9),
+            (Some("20"), 0.7),
+            (None, 0.4),
+            (Some("3"), 0.2),
+            (Some("100"), 0.6),
+        ];
+        for (v, _) in rows {
+            let mut d = Document::new();
+            d.add("body", "x", FieldKind::Text);
+            if let Some(v) = v {
+                d.add("d_key", v, FieldKind::Keyword);
+            }
+            idx.add_document(d);
+        }
+        let scored = rows.iter().enumerate().map(|(i, (_, s))| (i, *s)).collect();
+        (idx, scored)
+    }
+
+    fn ids(out: &SearchOutcome) -> Vec<usize> {
+        out.hits.iter().map(|h| h.id).collect()
+    }
+
+    fn spec(field: &str, ascending: bool) -> SortSpec {
+        SortSpec {
+            field: field.into(),
+            ascending,
+        }
+    }
+
+    #[test]
+    fn finalize_sorted_orders_numerically_over_unpadded_values() {
+        let (idx, scored) = sortable();
+        // ascending: 3 (docs 1,4 -> score desc), 20 (docs 2,0), 100 (doc 5), then missing (doc 3).
+        // Byte order would lead with "100" (doc 5) — asserting doc 1 first is what proves the
+        // read-time numeric ordering, i.e. that the feed does NOT need to zero-pad.
+        let out = finalize_sorted(&idx, scored.clone(), 0.0, &spec("d_key", true), 0, 10, None);
+        assert_eq!(ids(&out), vec![1, 4, 2, 0, 5, 3]);
+        assert_eq!(out.total, 6);
+        assert!(!out.total_capped);
+
+        // descending flips the VALUES but not the missing tail: 100, 20, 3, then doc 3 last.
+        let out = finalize_sorted(&idx, scored, 0.0, &spec("d_key", false), 0, 10, None);
+        assert_eq!(ids(&out), vec![5, 2, 0, 1, 4, 3]);
+    }
+
+    #[test]
+    fn finalize_sorted_pages_totals_and_caps() {
+        let (idx, scored) = sortable();
+        let asc = spec("d_key", true);
+        // full ascending order is [1, 4, 2, 0, 5, 3]
+        let out = finalize_sorted(&idx, scored.clone(), 0.0, &asc, 1, 2, None);
+        assert_eq!(ids(&out), vec![4, 2], "offset+limit page");
+        assert_eq!(out.total, 6, "total is independent of the page");
+
+        // the bounded heap must not disturb the offset boundary: every page of every size has to
+        // agree with the full ordering, since the heap keeps exactly offset+limit entries.
+        let full = ids(&finalize_sorted(
+            &idx,
+            scored.clone(),
+            0.0,
+            &asc,
+            0,
+            usize::MAX,
+            None,
+        ));
+        for offset in 0..full.len() {
+            for limit in 1..=full.len() {
+                let page = ids(&finalize_sorted(
+                    &idx,
+                    scored.clone(),
+                    0.0,
+                    &asc,
+                    offset,
+                    limit,
+                    None,
+                ));
+                let want: Vec<usize> = full.iter().skip(offset).take(limit).copied().collect();
+                assert_eq!(page, want, "offset={offset} limit={limit}");
+            }
+        }
+
+        // cap saturates `total` and flags it; the page itself is unaffected
+        let out = finalize_sorted(&idx, scored.clone(), 0.0, &asc, 0, 2, Some(3));
+        assert_eq!(out.total, 3);
+        assert!(out.total_capped);
+        assert_eq!(ids(&out), vec![1, 4]);
+
+        // min_score filters BEFORE ordering and shrinks the total (keeps 1=0.9, 2=0.7, 5=0.6)
+        let out = finalize_sorted(&idx, scored, 0.6, &asc, 0, 10, None);
+        assert_eq!(ids(&out), vec![1, 2, 5]);
+        assert_eq!(out.total, 3);
+    }
+
+    #[test]
+    fn finalize_sorted_missing_values_sort_last_in_both_directions() {
+        // every doc lacks the sort field => all Missing => the tiebreak alone decides,
+        // and nothing panics on a field the index has never seen.
+        let (idx, scored) = sortable();
+        for ascending in [true, false] {
+            let out = finalize_sorted(
+                &idx,
+                scored.clone(),
+                0.0,
+                &spec("absent_key", ascending),
+                0,
+                10,
+                None,
+            );
+            // score desc, id asc: 1(.9), 2(.7), 5(.6), 0(.5), 3(.4), 4(.2)
+            assert_eq!(ids(&out), vec![1, 2, 5, 0, 3, 4], "ascending={ascending}");
+            assert_eq!(out.total, 6);
+        }
+    }
+
+    #[test]
+    fn finalize_sorted_text_falls_back_to_byte_order() {
+        let mut idx = MemoryIndex::new();
+        for v in ["open", "closed", "pending"] {
+            let mut d = Document::new();
+            d.add("s_key", v, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        let scored: Vec<(usize, f32)> = (0..3).map(|i| (i, 1.0)).collect();
+        let out = finalize_sorted(&idx, scored, 0.0, &spec("s_key", true), 0, 10, None);
+        // alphabetical: "closed"(1), "open"(0), "pending"(2)
+        assert_eq!(ids(&out), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn finalize_sorted_iso_timestamps_order_chronologically() {
+        // A datetime string does not parse as i64, so it takes the Text branch — where byte
+        // order IS chronological order for ISO-8601. This is why a text fallback is correct
+        // rather than merely safe.
+        let mut idx = MemoryIndex::new();
+        for v in [
+            "2026-07-27 10:00:00",
+            "2025-01-02 23:59:59",
+            "2026-07-27 09:59:59",
+        ] {
+            let mut d = Document::new();
+            d.add("t_key", v, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        let scored: Vec<(usize, f32)> = (0..3).map(|i| (i, 1.0)).collect();
+        let out = finalize_sorted(&idx, scored, 0.0, &spec("t_key", true), 0, 10, None);
+        assert_eq!(ids(&out), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn finalize_sorted_places_a_multi_valued_doc_once() {
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("m_key", "50", FieldKind::Keyword);
+        d.add("m_key", "10", FieldKind::Keyword);
+        idx.add_document(d);
+        let mut d = Document::new();
+        d.add("m_key", "30", FieldKind::Keyword);
+        idx.add_document(d);
+
+        let out = finalize_sorted(
+            &idx,
+            vec![(0, 1.0), (1, 1.0)],
+            0.0,
+            &spec("m_key", true),
+            0,
+            10,
+            None,
+        );
+        // The point asserted here is placement: a doc with several values occupies ONE slot,
+        // it does not appear once per value. WHICH of its values decides the slot is a reader
+        // property, not a `finalize_sorted` one — `MemoryIndex` stores fields in a `HashMap`
+        // and so cannot even hold two, while the on-disk reader walks the `.fdt` in write order.
+        // That contract is pinned in `zsl::stored::read_stored_field_returns_the_first_of_a_repeated_field`.
+        assert_eq!(out.hits.len(), 2, "doc 0 must occupy exactly one slot");
+        assert_eq!(out.total, 2);
+        let mut got = ids(&out);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1]);
+    }
+
+    /// Counts the reader calls `finalize_sorted` makes, so the cost shape is pinned by a test
+    /// rather than by a comment. An ordered term walk over the sort field measured 4.2 s at
+    /// 500k docs and a per-term `doc_freq` pre-pass cost a 1.9x regression in the range work —
+    /// both are re-introducible by a well-meaning refactor, and both are caught here.
+    struct CountingIndex {
+        inner: MemoryIndex,
+        stored_value_calls: std::cell::RefCell<Vec<usize>>,
+        stored_fields_calls: std::cell::Cell<usize>,
+        dictionary_calls: std::cell::Cell<usize>,
+    }
+
+    impl CountingIndex {
+        fn new(inner: MemoryIndex) -> CountingIndex {
+            CountingIndex {
+                inner,
+                stored_value_calls: std::cell::RefCell::new(Vec::new()),
+                stored_fields_calls: std::cell::Cell::new(0),
+                dictionary_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl IndexReader for CountingIndex {
+        fn num_docs(&self) -> usize {
+            self.inner.num_docs()
+        }
+        fn doc_freq(&self, field: &str, term: &str) -> usize {
+            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
+            self.inner.doc_freq(field, term)
+        }
+        fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)> {
+            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
+            self.inner.postings_for(field, term)
+        }
+        fn field_len(&self, doc_id: usize, field: &str) -> u32 {
+            self.inner.field_len(doc_id, field)
+        }
+        fn stored_fields(&self, doc_id: usize) -> HashMap<String, String> {
+            self.stored_fields_calls
+                .set(self.stored_fields_calls.get() + 1);
+            self.inner.stored_fields(doc_id)
+        }
+        fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
+            self.stored_value_calls.borrow_mut().push(doc_id);
+            self.inner.stored_value(doc_id, field)
+        }
+        fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
+            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
+            self.inner.terms_with_prefix(field, prefix)
+        }
+        fn terms_in_range(
+            &self,
+            field: &str,
+            lower: Option<&str>,
+            upper: Option<&str>,
+        ) -> Vec<String> {
+            self.dictionary_calls.set(self.dictionary_calls.get() + 1);
+            self.inner.terms_in_range(field, lower, upper)
+        }
+        fn positions_for(&self, field: &str, term: &str, doc_id: usize) -> Vec<u32> {
+            self.inner.positions_for(field, term, doc_id)
+        }
+        fn indexed_fields(&self) -> Vec<String> {
+            self.inner.indexed_fields()
+        }
+    }
+
+    #[test]
+    fn finalize_sorted_touches_each_matched_doc_once_and_the_dictionary_never() {
+        let (inner, scored) = sortable();
+        let idx = CountingIndex::new(inner);
+        let out = finalize_sorted(&idx, scored, 0.0, &spec("d_key", true), 0, 2, None);
+        assert_eq!(ids(&out), vec![1, 4]);
+
+        // one value lookup per matched doc — never O(matches x K), never a second pass
+        let mut looked_up = idx.stored_value_calls.borrow().clone();
+        looked_up.sort_unstable();
+        assert_eq!(looked_up, vec![0, 1, 2, 3, 4, 5]);
+
+        // the expensive whole-doc hydration happens ONLY for the returned page
+        assert_eq!(idx.stored_fields_calls.get(), 2, "hydrate the page, not N");
+
+        // and the term dictionary is never consulted for the sort — no ordered walk, no
+        // doc_freq pre-pass. This is the invariant the measured evidence demands.
+        assert_eq!(
+            idx.dictionary_calls.get(),
+            0,
+            "sort must not touch the dictionary"
+        );
+    }
+
+    #[test]
+    fn finalize_sorted_skips_the_value_lookup_for_docs_below_min_score() {
+        let (inner, scored) = sortable();
+        let idx = CountingIndex::new(inner);
+        // keeps only docs 1 (0.9), 2 (0.7) and 5 (0.6)
+        let out = finalize_sorted(&idx, scored, 0.6, &spec("d_key", true), 0, 10, None);
+        assert_eq!(ids(&out), vec![1, 2, 5]);
+
+        let mut looked_up = idx.stored_value_calls.borrow().clone();
+        looked_up.sort_unstable();
+        assert_eq!(
+            looked_up,
+            vec![1, 2, 5],
+            "docs filtered by min_score must never reach the .fdt"
+        );
     }
 }
