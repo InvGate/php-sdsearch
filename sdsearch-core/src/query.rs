@@ -4,8 +4,8 @@
 use crate::index::IndexReader;
 use crate::score::Similarity;
 use crate::search::{
-    Hit, SearchOutcome, accent_variant_terms, finalize_paged, fuzzy_terms, phrase_scores,
-    term_scores, union_scores, wildcard_terms,
+    Hit, SearchOutcome, SortSpec, accent_variant_terms, finalize_paged, finalize_sorted,
+    fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -282,7 +282,10 @@ pub fn search_with_weights(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    search_with_weights_paged(index, query, weights, sim, min_score, 0, limit, None, None).hits
+    search_with_weights_paged(
+        index, query, weights, sim, min_score, 0, limit, None, None, None,
+    )
+    .hits
 }
 
 /// Like `search_with_weights`, but returns a page `[offset, offset+limit)` plus the total
@@ -300,6 +303,7 @@ pub fn search_with_weights_paged(
     limit: usize,
     total_cap: Option<usize>,
     restrict: Option<&HashSet<usize>>,
+    sort: Option<&SortSpec>,
 ) -> SearchOutcome {
     let scored = eval(index, query, weights, sim, restrict);
     let top = scored.values().copied().fold(0.0f32, f32::max);
@@ -308,7 +312,12 @@ pub fn search_with_weights_paged(
     } else {
         scored.into_iter().collect()
     };
-    finalize_paged(index, normalized, min_score, offset, limit, total_cap)
+    // Field sort is a different finalizer, not a variation of the relevance one: `finalize_paged`
+    // is reached by exactly the same call as before when `sort` is `None`.
+    match sort {
+        Some(spec) => finalize_sorted(index, normalized, min_score, spec, offset, limit, total_cap),
+        None => finalize_paged(index, normalized, min_score, offset, limit, total_cap),
+    }
 }
 
 /// WHERE group: values over a `_key` field, with the group sign (occur).
@@ -483,6 +492,8 @@ pub struct QueryParams {
     /// optional field-scoped AND text filters (title/description "contains all words").
     /// Empty = none. Applied as part of the `restrict` allow-list, not as a scored clause.
     pub match_all: Vec<MatchAllFilter>,
+    /// optional field sort. `None` = relevance (score) order, the default and unchanged path.
+    pub sort: Option<SortSpec>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -915,6 +926,7 @@ mod tests {
             similarity: Similarity::Bm25,
             range_filters: vec![],
             match_all: vec![],
+            sort: None,
         }
     }
 
@@ -1170,6 +1182,77 @@ mod tests {
     }
 
     #[test]
+    fn search_with_weights_paged_field_sort() {
+        // three docs sharing the text term, with variable-width numeric created_at values so
+        // numeric order ("100" < "200" < "300") is what gets asserted, not byte order.
+        let mut idx = MemoryIndex::new();
+        for ca in ["300", "100", "200"] {
+            let mut d = Document::new();
+            d.add("title", "ticket", FieldKind::Text);
+            d.add("created_at_key", ca, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        let q = Query::Term {
+            field: Some("title".into()),
+            text: "ticket".into(),
+        };
+        let ids = |o: &SearchOutcome| o.hits.iter().map(|h| h.id).collect::<Vec<_>>();
+
+        let asc = SortSpec {
+            field: "created_at_key".into(),
+            ascending: true,
+        };
+        let out = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            None,
+            None,
+            Some(&asc),
+        );
+        assert_eq!(ids(&out), vec![1, 2, 0], "ascending by created_at");
+        assert_eq!(out.total, 3);
+
+        let desc = SortSpec {
+            field: "created_at_key".into(),
+            ascending: false,
+        };
+        let out = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            None,
+            None,
+            Some(&desc),
+        );
+        assert_eq!(ids(&out), vec![0, 2, 1], "descending flips it");
+
+        // `sort: None` must reach `finalize_paged` and produce the relevance order, unchanged.
+        // All three docs score identically here, so the relevance tiebreak is id asc.
+        let out = search_with_weights_paged(
+            &idx,
+            &q,
+            &HashMap::new(),
+            Similarity::Bm25,
+            0.0,
+            0,
+            10,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ids(&out), vec![0, 1, 2], "no sort => relevance path");
+    }
+
+    #[test]
     fn search_with_weights_paged_reports_total_and_pages() {
         let idx = corpus(); // doc0 "vpn guide", doc1 "vpn setup", doc2 "mysql notes"
         let q = Query::Term {
@@ -1185,6 +1268,7 @@ mod tests {
             0.0,
             0,
             10,
+            None,
             None,
             None,
         );
@@ -1203,6 +1287,7 @@ mod tests {
             1,
             None,
             None,
+            None,
         );
         assert_eq!(page.hits.len(), 1);
         assert_eq!(page.hits[0].id, full.hits[1].id);
@@ -1218,6 +1303,7 @@ mod tests {
             0,
             10,
             Some(1),
+            None,
             None,
         );
         assert_eq!(capped.total, 1);
@@ -1258,6 +1344,7 @@ mod tests {
             10,
             None,
             Some(&allow),
+            None,
         );
         assert_eq!(out.hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1]);
         assert_eq!(out.total, 1);
@@ -1468,6 +1555,7 @@ mod tests {
             10,
             None,
             Some(&allow),
+            None,
         );
         assert_eq!(out.hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![0]);
         assert_eq!(out.total, 1);

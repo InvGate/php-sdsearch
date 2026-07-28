@@ -18,6 +18,7 @@ fn params(text: &str) -> QueryParams {
         similarity: sdsearch_core::score::Similarity::Bm25,
         range_filters: vec![],
         match_all: vec![],
+        sort: None,
     }
 }
 

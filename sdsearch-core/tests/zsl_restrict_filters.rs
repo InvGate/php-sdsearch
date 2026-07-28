@@ -48,6 +48,7 @@ fn params(
         similarity: Similarity::Bm25,
         range_filters,
         match_all,
+        sort: None,
     }
 }
 

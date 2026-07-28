@@ -67,6 +67,7 @@ pub fn search_index_paged(
         lim,
         total_cap,
         restrict.as_ref(),
+        params.sort.as_ref(),
     ))
 }
 
@@ -92,6 +93,7 @@ fn resolve_reference_doc(
         similarity: crate::score::Similarity::Bm25,
         range_filters: Vec::new(),
         match_all: Vec::new(),
+        sort: None,
     };
     let query = build_query(&params)?;
     let hits = search(index, &query, 0.0, 1);
@@ -138,6 +140,7 @@ mod tests {
             similarity: crate::score::Similarity::Bm25,
             range_filters: vec![],
             match_all: vec![],
+            sort: None,
         }
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {
