@@ -18,6 +18,7 @@ use sdsearch_core::query::{
     match_all_allow_list, range_allow_list, search_with_weights_paged,
 };
 use sdsearch_core::score::Similarity;
+use sdsearch_core::search::SortSpec;
 use sdsearch_core::zsl::index::ZslIndex;
 use sdsearch_core::zsl::runner::search_index_paged;
 use sdsearch_core::zsl::writer::{FieldKind, IndexWriter, WriterDoc, WriterField, WriterOpts};
@@ -156,6 +157,7 @@ fn params(text: &str, in_groups: Vec<InGroup>) -> QueryParams {
         similarity: Similarity::Bm25,
         range_filters: vec![],
         match_all: vec![],
+        sort: None,
     }
 }
 
@@ -253,6 +255,108 @@ fn intersect_in_place_local(a: HashSet<usize>, b: HashSet<usize>) -> HashSet<usi
     let (mut keep, probe) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     keep.retain(|d| probe.contains(d));
     keep
+}
+
+/// #4 isolation: what does FIELD SORT cost, and — the question this exists to answer — how much
+/// does it RETAIN?
+///
+/// The query is `widetoken`, which every generated doc contains, so the matched set is the whole
+/// corpus: the worst case for a design that walks matches instead of the term dictionary. Sorting
+/// is measured over an ALREADY-OPEN index so the `.tis` load (~60 ms at 500k, and 98% of a cold
+/// per-request search) does not swamp the signal.
+///
+/// The criteria are picked to hit each `SortKey` branch and each cardinality regime, because they
+/// have different retention: a numeric key is a flat 8-byte payload, while a text key allocates a
+/// `String` per RETAINED entry. `id` is `"REC-{i}"`, which does not parse as an integer, so it is
+/// the allocating branch at maximum cardinality.
+///
+/// What to read out of the table:
+/// - `sort ms - none ms`, divided by the match count, is the per-matched-doc cost of resolving a
+///   stored value. That number decides whether wide filter-only browse ever needs another path.
+/// - `hiwater` on the BOUNDED pagings must stay flat as N grows across runs. If it tracks N, the
+///   heap is not bounding and the design is broken, not just slow.
+/// - `unlimited` is the degenerate case: the bound is vacuous, and the caller asked for every doc
+///   anyway, so N whole-document hydrations dominate. Compare it against its own `none` control —
+///   the interesting quantity is what sort ADDS to an already-unbounded request.
+fn bench_sort_criteria(dir: &std::path::Path, n: usize, iters: usize) {
+    let idx = ZslIndex::open(dir).unwrap();
+    let p = params("widetoken", vec![]); // present in EVERY doc => matched set == whole corpus
+    let q = build_query(&p).unwrap();
+
+    let criteria: [(&str, Option<&str>); 5] = [
+        ("(none: relevance)", None),
+        ("created_at_key Num ~uniq", Some("created_at_key")),
+        ("cat_key Num 50 distinct", Some("cat_key")),
+        ("id Text unique (allocs)", Some("id")),
+        ("absent_key Missing", Some("absent_key")),
+    ];
+    // (label, offset, limit). `unlimited` is the runner's `limit == 0` translated to usize::MAX.
+    let pagings: [(&str, usize, usize); 4] = [
+        ("top20", 0, 20),
+        ("top100", 0, 100),
+        ("deep 10k+20", 10_000, 20),
+        ("unlimited", 0, usize::MAX),
+    ];
+
+    println!("\n---- sort criteria over {n} matched docs (index already open) ----");
+    println!(
+        "{:<26} {:<13} {:>10} {:>13} {:>15} {:>9}",
+        "sort by", "paging", "p50 ms", "hiwater KiB", "transient KiB", "hits"
+    );
+    for (clabel, field) in criteria {
+        for (plabel, offset, limit) in pagings {
+            let spec = field.map(|f| SortSpec {
+                field: f.to_string(),
+                ascending: false,
+            });
+            // one run for memory: hiwater is what survives the call, transient what it churned
+            reset_peak();
+            let outcome = search_with_weights_paged(
+                &idx,
+                &q,
+                &p.field_weights,
+                p.similarity,
+                0.0,
+                offset,
+                limit,
+                None,
+                None,
+                spec.as_ref(),
+            );
+            let hiwater = hiwater_since_reset();
+            let transient = peak_since_reset();
+            let hits = outcome.hits.len();
+            drop(outcome);
+
+            // `unlimited` hydrates every matched doc, so a full iteration budget would dominate
+            // the whole benchmark for a row whose cost is already understood.
+            let it = if limit == usize::MAX {
+                iters.min(3)
+            } else {
+                iters
+            };
+            let (p50, _) = percentiles_ms(it, || {
+                let o = search_with_weights_paged(
+                    &idx,
+                    &q,
+                    &p.field_weights,
+                    p.similarity,
+                    0.0,
+                    offset,
+                    limit,
+                    None,
+                    None,
+                    spec.as_ref(),
+                );
+                std::hint::black_box(&o);
+            });
+            println!(
+                "{clabel:<26} {plabel:<13} {p50:>10.3} {:>13} {:>15} {hits:>9}",
+                hiwater / 1024,
+                transient / 1024
+            );
+        }
+    }
 }
 
 /// #2 isolation: the macro bench (query classes above) couldn't resolve whether
@@ -511,6 +615,7 @@ fn main() {
             20,
             None,
             restrict.as_ref(),
+            p.sort.as_ref(),
         );
         let hiwater = hiwater_since_reset();
         let transient = peak_since_reset();
@@ -532,6 +637,7 @@ fn main() {
         eprintln!("PARITY {label}: {dump:?}");
     }
 
+    bench_sort_criteria(&dir, n, iters);
     bench_finalize_strategies(iters);
     bench_intersect_strategies(iters);
     bench_reserve_strategies(iters);
