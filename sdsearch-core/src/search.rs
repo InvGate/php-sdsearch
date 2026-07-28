@@ -36,6 +36,40 @@ pub struct SortSpec {
     pub ascending: bool,
 }
 
+/// A `sort_dir` token the caller spelled in a way this engine does not accept.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InvalidSortDir(pub String);
+
+impl std::fmt::Display for InvalidSortDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown sort_dir {:?} (expected \"asc\" or \"desc\")",
+            self.0
+        )
+    }
+}
+impl std::error::Error for InvalidSortDir {}
+
+impl SortSpec {
+    /// Builds a spec from the caller-facing direction token. Omitted = descending, matching the
+    /// adapter default.
+    ///
+    /// Anything other than `"asc"`/`"desc"` is REJECTED rather than silently read as descending:
+    /// `"ASC"`, `"ascending"` or a plain typo would otherwise reverse the caller's intended order
+    /// with no signal anywhere — a wrong answer that looks like a working query. Parsing lives
+    /// here, not at the FFI boundary, so the accepted set is covered by core's test suite
+    /// (`sdsearch-php` is a `cdylib` and runs no tests of its own).
+    pub fn new(field: String, dir: Option<&str>) -> Result<Self, InvalidSortDir> {
+        let ascending = match dir {
+            None | Some("desc") => false,
+            Some("asc") => true,
+            Some(other) => return Err(InvalidSortDir(other.to_string())),
+        };
+        Ok(Self { field, ascending })
+    }
+}
+
 /// A doc's sort value, resolved at READ time from its stored field — never by re-encoding what
 /// the index holds, so this works on indexes the legacy PHP engine wrote, with no reindex.
 ///
@@ -115,6 +149,13 @@ impl PartialOrd for SortEntry {
     }
 }
 
+/// Required by `Eq`, which `Ord` requires, which `BinaryHeap` requires — nothing ever calls it,
+/// so it will always show as uncovered. Do NOT "fix" that with a test asserting it agrees with
+/// `cmp`: it is *defined* as `cmp`, so such a test is tautological and buys nothing.
+///
+/// It is hand-written rather than derived because a derived `PartialEq` would compare fields
+/// structurally and disagree with `cmp` — which treats a NaN score as `Equal` — breaking the
+/// total-order contract `BinaryHeap` and `sort_unstable` rely on.
 impl PartialEq for SortEntry {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
@@ -905,6 +946,45 @@ mod tests {
     }
 
     #[test]
+    fn sort_spec_new_accepts_only_asc_and_desc() {
+        // omitted => descending, the adapter default
+        assert_eq!(
+            SortSpec::new("d_key".into(), None).map(|s| s.ascending),
+            Ok(false)
+        );
+        assert_eq!(
+            SortSpec::new("d_key".into(), Some("desc")).map(|s| s.ascending),
+            Ok(false)
+        );
+        assert_eq!(
+            SortSpec::new("d_key".into(), Some("asc")).map(|s| s.ascending),
+            Ok(true)
+        );
+
+        // the field is carried through untouched (used verbatim, no `_key` inference)
+        assert_eq!(
+            SortSpec::new("created_at_key".into(), Some("asc")).map(|s| s.field),
+            Ok("created_at_key".to_string())
+        );
+
+        // Everything else is an ERROR, not a silent fall back to descending. These three are the
+        // realistic typos: wrong case, the long spelling, and an OpenSearch-ism. Each one would
+        // otherwise hand back the exact reverse of what the caller asked for.
+        for bad in ["ASC", "ascending", "descending", "", "up"] {
+            assert_eq!(
+                SortSpec::new("d_key".into(), Some(bad)).map(|s| s.ascending),
+                Err(InvalidSortDir(bad.to_string())),
+                "sort_dir {bad:?} must be rejected"
+            );
+        }
+
+        assert_eq!(
+            InvalidSortDir("ASC".into()).to_string(),
+            r#"unknown sort_dir "ASC" (expected "asc" or "desc")"#
+        );
+    }
+
+    #[test]
     fn finalize_sorted_orders_numerically_over_unpadded_values() {
         let (idx, scored) = sortable();
         // ascending: 3 (docs 1,4 -> score desc), 20 (docs 2,0), 100 (doc 5), then missing (doc 3).
@@ -991,52 +1071,36 @@ mod tests {
 
     #[test]
     fn finalize_sorted_with_a_zero_size_page_still_counts() {
-        // offset+limit == 0 makes the heap pointless, but `total` must still be right: the
-        // runner reaches this whenever a caller wants only the count. The loop has to keep
-        // counting matches while skipping the value lookup entirely.
-        let (idx, scored) = sortable();
-        let out = finalize_sorted(&idx, scored.clone(), 0.0, &spec("d_key", true), 0, 0, None);
+        // offset+limit == 0 makes the heap pointless, but `total` must still be right, and the
+        // loop must keep counting while skipping the value lookup entirely.
+        //
+        // Not reachable through the PHP surface: `search_index_paged` maps `limit: 0` to
+        // `usize::MAX` ("unlimited") before this is called. It IS reachable by a Rust consumer
+        // calling the public `search_with_weights_paged` directly, which is why it is a
+        // supported case rather than dead code.
+        let (inner, scored) = sortable();
+        let idx = CountingIndex::new(inner);
+        let out = finalize_sorted(&idx, scored, 0.0, &spec("d_key", true), 0, 0, None);
         assert!(out.hits.is_empty());
         assert_eq!(out.total, 6, "an empty page still reports the match count");
         assert!(!out.total_capped);
+        // The short-circuit is the point: with no page to fill there is nothing to compare, so
+        // not one doc should be read from the `.fdt`. Asserting only `total` here would pass
+        // even with the short-circuit deleted — the result is the same, just N reads slower.
+        assert!(
+            idx.stored_value_calls.borrow().is_empty(),
+            "a zero-size page must not read any stored value"
+        );
+        assert_eq!(idx.stored_fields_calls.get(), 0, "and hydrate nothing");
 
-        // and min_score / the cap still apply on that path
-        let out = finalize_sorted(&idx, scored, 0.6, &spec("d_key", true), 0, 0, Some(2));
+        // min_score and the cap still apply on that path
+        let (inner, scored2) = sortable();
+        let idx = CountingIndex::new(inner);
+        let out = finalize_sorted(&idx, scored2, 0.6, &spec("d_key", true), 0, 0, Some(2));
         assert!(out.hits.is_empty());
         assert_eq!(out.total, 2);
         assert!(out.total_capped);
-    }
-
-    #[test]
-    fn sort_entry_equality_agrees_with_the_ordering() {
-        // `Ord` on `SortEntry` requires `Eq`, so `PartialEq` exists whether or not the heap ever
-        // calls it. It must not disagree with `cmp`, or the type would violate the total-order
-        // contract `BinaryHeap` and `sort_unstable` are entitled to rely on.
-        let e = |key: SortKey, id: usize, score: f32| SortEntry {
-            key,
-            id,
-            score,
-            ascending: true,
-        };
-        let a = e(SortKey::Num(10), 1, 0.5);
-        let same = e(SortKey::Num(10), 1, 0.5);
-        let other_id = e(SortKey::Num(10), 2, 0.5);
-        let other_key = e(SortKey::Num(20), 1, 0.5);
-
-        assert!(a == same, "identical entries compare equal");
-        assert!(
-            a != other_id,
-            "the id tiebreak makes entries distinguishable"
-        );
-        assert!(a != other_key);
-        // the property that matters: eq is exactly cmp == Equal
-        for (x, y) in [(&a, &same), (&a, &other_id), (&a, &other_key)] {
-            assert_eq!(
-                x == y,
-                x.cmp(y) == std::cmp::Ordering::Equal,
-                "PartialEq must agree with Ord"
-            );
-        }
+        assert!(idx.stored_value_calls.borrow().is_empty());
     }
 
     #[test]
