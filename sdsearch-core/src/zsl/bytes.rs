@@ -120,11 +120,38 @@ pub fn read_modified_utf8(data: &[u8], pos: &mut usize) -> io::Result<String> {
     Ok(s)
 }
 
+/// Steps over a modified-UTF-8 string without decoding it, advancing `pos` exactly as
+/// [`read_modified_utf8`] would. Same VInt(charCount) prefix, same 1/2/3/4-byte sequence
+/// widths, same truncation errors — it just does not build the `String`.
+///
+/// This exists for readers that want ONE field out of a record that holds many
+/// (`read_stored_field`): allocating a `String` per skipped field is the dominant cost there.
+pub fn skip_modified_utf8(data: &[u8], pos: &mut usize) -> io::Result<()> {
+    let char_count = read_vint(data, pos)? as usize;
+    for _ in 0..char_count {
+        let b0 = read_byte(data, pos)?;
+        // continuation-byte count per lead byte, mirroring `read_modified_utf8`'s branches.
+        let continuation = if b0 & 0x80 == 0 {
+            0
+        } else if b0 & 0xE0 == 0xC0 {
+            1
+        } else if b0 & 0xF0 == 0xE0 {
+            2
+        } else {
+            3
+        };
+        for _ in 0..continuation {
+            read_byte(data, pos)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         checked_capacity, read_byte, read_i32_be, read_modified_utf8, read_u32_be, read_u64_be,
-        write_i32_be, write_i64_be, write_modified_utf8, write_u32_be,
+        skip_modified_utf8, write_i32_be, write_i64_be, write_modified_utf8, write_u32_be,
     };
 
     #[test]
@@ -187,6 +214,62 @@ mod tests {
             );
             assert_eq!(pos, buf.len(), "consumed all bytes of {s:?}");
         }
+    }
+
+    #[test]
+    fn skip_modified_utf8_advances_exactly_like_read() {
+        // The whole contract of `skip` is that it leaves `pos` where `read` would. Same corpus
+        // as the round-trip test above, so every sequence width is covered — 1-byte ASCII,
+        // 2-byte (ü), 3-byte (€), 4-byte supplementary (emoji, U+20000), and NUL as C0 80.
+        // A skip that mis-sized ANY of these would desynchronize the `.fdt` walk and make
+        // `read_stored_field` return a neighbouring field's bytes.
+        for s in [
+            "",
+            "hi",
+            "über",
+            "a€b",
+            "na\u{0}me",
+            "TICKET-12345",
+            "user@example.com",
+            "a\u{1F600}b",
+            "\u{20000}",
+            "mix \u{1F4A9} end",
+            "über\u{1F680}",
+        ] {
+            let mut buf = Vec::new();
+            write_modified_utf8(&mut buf, s);
+            let mut read_pos = 0;
+            read_modified_utf8(&buf, &mut read_pos).unwrap();
+            let mut skip_pos = 0;
+            skip_modified_utf8(&buf, &mut skip_pos).unwrap();
+            assert_eq!(skip_pos, read_pos, "skip != read position for {s:?}");
+            assert_eq!(skip_pos, buf.len(), "skip consumed all bytes of {s:?}");
+        }
+    }
+
+    #[test]
+    fn skip_modified_utf8_stops_at_the_next_field() {
+        // Two strings back to back: skipping the first must land exactly on the second, which
+        // then reads cleanly. This is the `.fdt` walk in miniature.
+        let mut buf = Vec::new();
+        write_modified_utf8(&mut buf, "über\u{1F680}");
+        write_modified_utf8(&mut buf, "second");
+        let mut pos = 0;
+        skip_modified_utf8(&buf, &mut pos).unwrap();
+        assert_eq!(read_modified_utf8(&buf, &mut pos).unwrap(), "second");
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn skip_modified_utf8_errors_when_body_truncated() {
+        // mirrors `read_modified_utf8_errors_when_body_truncated`: VInt(3) promises 3 code
+        // points, only 1 byte follows.
+        let mut pos = 0;
+        assert!(skip_modified_utf8(&[0x03, b'a'], &mut pos).is_err());
+        // a lead byte promising continuations that are not there must also fail, not silently
+        // run `pos` past the end.
+        let mut pos = 0;
+        assert!(skip_modified_utf8(&[0x01, 0xF0, 0x9F], &mut pos).is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Stored fields reader (.fdt indexed by .fdx).
 use crate::zsl::bytes::{
-    checked_capacity, read_byte, read_modified_utf8, read_u64_be, read_vint, truncated,
+    checked_capacity, read_byte, read_modified_utf8, read_u64_be, read_vint, skip_modified_utf8,
+    truncated,
 };
 use crate::zsl::fields::FieldInfo;
 use std::collections::HashMap;
@@ -59,6 +60,54 @@ pub fn read_stored_raw(fdx: &[u8], fdt: &[u8], doc_id: usize) -> std::io::Result
     Ok(out)
 }
 
+/// Reads the value of ONE stored field of `doc_id`, identified by its segment-LOCAL
+/// `field_num`, without materializing the doc's other fields.
+///
+/// Same `.fdt`/`.fdx` walk as [`read_stored_raw`], but an entry whose `field_num` does not match
+/// is STEPPED OVER instead of decoded: the `String` allocated per skipped field is exactly the
+/// cost this avoids. A doc in the host application carries ~11-17 stored fields, so resolving one
+/// of them via [`read_stored_fields`] allocates that many strings plus a `HashMap` to throw all
+/// but one away — this does one allocation.
+///
+/// Returns the FIRST entry matching `field_num` in write order (so a multi-valued field resolves
+/// to its first value), or `None` when the doc has no such field or is out of range of the `.fdx`.
+pub fn read_stored_field(
+    fdx: &[u8],
+    fdt: &[u8],
+    doc_id: usize,
+    field_num: usize,
+) -> std::io::Result<Option<String>> {
+    let idx_pos = doc_id * 8;
+    if idx_pos + 8 > fdx.len() {
+        return Ok(None); // doc out of range of this .fdx: no stored fields, not an error
+    }
+    let mut p = idx_pos;
+    let fdt_off = read_u64_be(fdx, &mut p)? as usize;
+    let mut pos = fdt_off;
+    let stored_count = read_vint(fdt, &mut pos)? as usize;
+    for _ in 0..stored_count {
+        let num = read_vint(fdt, &mut pos)? as usize;
+        let flags = read_byte(fdt, &mut pos)?;
+        let is_binary = flags & 0x02 != 0;
+        let wanted = num == field_num;
+        if is_binary {
+            // length-prefixed raw bytes: skippable by byte count, unlike modified UTF-8.
+            let len = read_vint(fdt, &mut pos)? as usize;
+            let end = pos.checked_add(len).ok_or_else(|| truncated(pos))?;
+            let bytes = fdt.get(pos..end).ok_or_else(|| truncated(pos))?;
+            pos = end;
+            if wanted {
+                return Ok(Some(String::from_utf8_lossy(bytes).into_owned()));
+            }
+        } else if wanted {
+            return Ok(Some(read_modified_utf8(fdt, &mut pos)?));
+        } else {
+            skip_modified_utf8(fdt, &mut pos)?;
+        }
+    }
+    Ok(None)
+}
+
 /// reads a doc's stored fields resolving field_num -> name via `fields`.
 /// Delegates `.fdt`/`.fdx` parsing to [`read_stored_raw`]; entries whose `field_num`
 /// is out of range of `fields` are dropped.
@@ -95,6 +144,83 @@ mod tests {
             .find(|p| p.extension().is_some_and(|x| x == "cfs"))
             .unwrap();
         CompoundFile::open(&path).unwrap()
+    }
+
+    #[test]
+    fn read_stored_field_matches_the_full_read_for_every_field() {
+        // `read_stored_field` skips entries instead of decoding them, so a mis-sized skip would
+        // desynchronize the walk and yield a neighbouring field's bytes. Asserting equality
+        // against `read_stored_fields` for EVERY field of EVERY doc pins that down against the
+        // path the ZSL oracle already validates.
+        let cf = cfs();
+        let names = cf.names();
+        let find = |ext: &str| names.iter().find(|n| n.ends_with(ext)).unwrap().clone();
+        let fields = read_field_infos(cf.sub(&find(".fnm")).unwrap()).unwrap();
+        let fdx = cf.sub(&find(".fdx")).unwrap();
+        let fdt = cf.sub(&find(".fdt")).unwrap();
+
+        let doc_count = fdx.len() / 8;
+        assert!(doc_count > 0, "fixture must have stored docs");
+        for doc_id in 0..doc_count {
+            let all = read_stored_fields(fdx, fdt, &fields, doc_id).unwrap();
+            for (num, fi) in fields.iter().enumerate() {
+                let one = read_stored_field(fdx, fdt, doc_id, num).unwrap();
+                assert_eq!(
+                    one.as_deref(),
+                    all.get(&fi.name).map(String::as_str),
+                    "doc {doc_id} field {} (num {num})",
+                    fi.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_stored_field_returns_the_first_of_a_repeated_field() {
+        // A doc may carry the same field twice (`Document::add` called twice for one name).
+        // The `.fdt` keeps both, in write order, so the reader must resolve to the FIRST and
+        // stop — which is what makes field sort place such a doc under a defined value instead
+        // of whichever entry happened to be scanned last. Hand-built bytes because neither
+        // fixture has a repeated field, and `HashMap`-backed readers cannot express one.
+        use crate::zsl::bytes::{write_modified_utf8, write_vint};
+
+        let mut fdt = Vec::new();
+        write_vint(&mut fdt, 3); // three stored entries
+        for (num, value) in [(7usize, "first"), (2, "other"), (7, "second")] {
+            write_vint(&mut fdt, num as u64);
+            fdt.push(0x00); // not tokenized, not binary
+            write_modified_utf8(&mut fdt, value);
+        }
+        let fdx = 0u64.to_be_bytes(); // one doc, starting at offset 0 of the .fdt
+
+        assert_eq!(
+            read_stored_field(&fdx, &fdt, 0, 7).unwrap().as_deref(),
+            Some("first")
+        );
+        // and the entry AFTER a skipped one still resolves, proving the skip landed correctly
+        assert_eq!(
+            read_stored_field(&fdx, &fdt, 0, 2).unwrap().as_deref(),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn read_stored_field_is_none_out_of_range() {
+        let cf = cfs();
+        let names = cf.names();
+        let find = |ext: &str| names.iter().find(|n| n.ends_with(ext)).unwrap().clone();
+        let fdx = cf.sub(&find(".fdx")).unwrap();
+        let fdt = cf.sub(&find(".fdt")).unwrap();
+        let fields = read_field_infos(cf.sub(&find(".fnm")).unwrap()).unwrap();
+
+        // a field number past the schema: the doc exists, the field does not
+        assert_eq!(
+            read_stored_field(fdx, fdt, 0, fields.len() + 99).unwrap(),
+            None
+        );
+        // a doc past the end of the .fdx: not an error, just nothing (same contract as
+        // `read_stored_raw`, which the FFI relies on to degrade instead of panicking)
+        assert_eq!(read_stored_field(fdx, fdt, fdx.len(), 0).unwrap(), None);
     }
 
     #[test]
