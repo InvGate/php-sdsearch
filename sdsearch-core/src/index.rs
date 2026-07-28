@@ -34,6 +34,20 @@ pub trait IndexReader {
         1.0
     }
     fn stored_fields(&self, doc_id: usize) -> HashMap<String, String>;
+    /// Stored value of ONE field of `doc_id`, without materializing the doc's other fields.
+    /// The default goes through `stored_fields` (correct, but allocates a `String` per stored
+    /// field of the doc plus a `HashMap`, to keep one); the on-disk readers override it to step
+    /// over the entries they do not want. Field sort calls this once per matched doc, so the
+    /// difference is ~11-17 allocations per doc against 1.
+    ///
+    /// A multi-valued field resolves to its first value in write order — on the on-disk readers,
+    /// which walk the `.fdt` sequentially. `MemoryIndex` keeps stored fields in a `HashMap` and
+    /// therefore collapses repeats to one value as documents are added; that is a pre-existing
+    /// builder limitation, not something this method can paper over.
+    /// `None` = the doc has no value for `field`.
+    fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
+        self.stored_fields(doc_id).remove(field)
+    }
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String>;
     /// Like `terms_with_prefix`, but returns at most `limit` terms (lexicographic-first).
     /// The default collects then truncates; the on-disk ZSL readers override it to stop the

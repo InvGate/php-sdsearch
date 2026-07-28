@@ -5,7 +5,7 @@ use crate::zsl::deletes::DeletedDocs;
 use crate::zsl::fields::{FieldInfo, read_field_infos};
 use crate::zsl::norms::{approx_field_len, read_norms};
 use crate::zsl::postings::{for_each_posting, read_all_positions, read_freqs, read_positions};
-use crate::zsl::stored::{StoredRaw, read_stored_fields, read_stored_raw};
+use crate::zsl::stored::{StoredRaw, read_stored_field, read_stored_fields, read_stored_raw};
 use crate::zsl::terms::{TermCursor, TermDict, TermInfo};
 use std::collections::HashMap;
 use std::path::Path;
@@ -283,6 +283,20 @@ impl IndexReader for ZslSegment {
         .unwrap_or_default()
     }
 
+    fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
+        // `.fdt` entries carry a field NUMBER that indexes into this segment's own `.fnm`, so the
+        // name must be resolved here and not by a caller holding a multi-segment view.
+        let field_num = self.fields.iter().position(|fi| fi.name == field)?;
+        // degrade like `stored_fields`: a corrupt .fdt/.fdx yields no value, not a panic across FFI
+        read_stored_field(
+            self.cfs.sub(&self.fdx_name).unwrap(),
+            self.cfs.sub(&self.fdt_name).unwrap(),
+            doc_id,
+            field_num,
+        )
+        .unwrap_or_default()
+    }
+
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
         let mut out = self.dict.terms_with_prefix(field, prefix);
         out.sort();
@@ -387,6 +401,29 @@ mod tests {
             s.stored_fields(0).get("id_key").map(String::as_str),
             Some("165")
         );
+    }
+
+    #[test]
+    fn stored_value_equals_stored_fields_for_every_doc_and_field() {
+        // the segment override resolves the field NAME to a `.fnm` position before walking the
+        // `.fdt`; this pins that resolution against the full read for the whole fixture.
+        let s = seg();
+        let names: Vec<String> = s.field_infos().iter().map(|fi| fi.name.clone()).collect();
+        assert!(!names.is_empty(), "fixture must have fields");
+        for d in 0..s.num_docs() {
+            let all = s.stored_fields(d);
+            for name in &names {
+                assert_eq!(
+                    s.stored_value(d, name).as_deref(),
+                    all.get(name).map(String::as_str),
+                    "doc {d} field {name}"
+                );
+            }
+        }
+        // sanity: the fixture really does carry the value we expect, so an all-`None` run
+        // cannot pass the loop above vacuously.
+        assert_eq!(s.stored_value(0, "id_key").as_deref(), Some("165"));
+        assert_eq!(s.stored_value(0, "no_such_field_key"), None);
     }
 
     #[test]

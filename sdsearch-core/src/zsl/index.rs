@@ -105,6 +105,13 @@ impl IndexReader for ZslIndex {
         }
     }
 
+    fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
+        // resolve inside the segment: `.fdt` field numbers are segment-local, so the name has to
+        // travel down with the doc id rather than being turned into a number up here.
+        let (e, local) = self.locate(doc_id)?;
+        e.seg.stored_value(local, field)
+    }
+
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for e in &self.entries {
@@ -235,5 +242,54 @@ mod tests {
             (f64::from(avg) - manual).abs() < 1e-3,
             "avg={avg} manual={manual} field={field}"
         );
+    }
+
+    #[test]
+    fn stored_value_equals_stored_fields_across_segments() {
+        // Field sort reads one value per matched doc through `stored_value`, so it must agree
+        // with `stored_fields` — the path the ZSL oracle validates — for every doc and field.
+        // Multi-segment is the case that matters: `.fdt` field numbers are segment-LOCAL, so a
+        // resolution done above `locate()` would silently read the wrong field once segment 2's
+        // `.fnm` ordered its fields differently from segment 1's.
+        let dir = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zsl_index_multiseg"
+        ));
+        let idx = ZslIndex::open(&dir).unwrap();
+        assert!(
+            idx.entries.len() > 1,
+            "fixture must be multi-segment, got {}",
+            idx.entries.len()
+        );
+
+        // every stored field name the fixture actually has, gathered across all segments
+        let mut names: Vec<String> = Vec::new();
+        for d in 0..idx.total_docs() {
+            for k in idx.stored_fields(d).into_keys() {
+                if !names.contains(&k) {
+                    names.push(k);
+                }
+            }
+        }
+        assert!(!names.is_empty(), "fixture must have stored fields");
+
+        let mut checked = 0usize;
+        for d in 0..idx.total_docs() {
+            let all = idx.stored_fields(d);
+            for name in &names {
+                assert_eq!(
+                    idx.stored_value(d, name).as_deref(),
+                    all.get(name).map(String::as_str),
+                    "doc {d} field {name}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the comparison loop must actually run");
+
+        // a field nobody has: `None`, not a panic and not someone else's value
+        assert_eq!(idx.stored_value(0, "no_such_field_key"), None);
+        // a doc past the end of every segment
+        assert_eq!(idx.stored_value(idx.total_docs() + 10, &names[0]), None);
     }
 }
