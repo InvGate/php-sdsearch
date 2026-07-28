@@ -78,7 +78,9 @@ namespace SdSearch {
          *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
          * - `sort` (optional): keyword field to order by, used VERBATIM (pass the `_key` name).
          *   Omitted or `"_score"` = relevance order. `sort_dir` is `"asc"` or `"desc"`
-         *   (default `"desc"`). Ordering is resolved at READ time per value: a value that parses
+         *   (default `"desc"`); any other value THROWS rather than falling back, so a typo
+         *   cannot silently reverse the order. It is only read when `sort` is set.
+         *   Ordering is resolved at READ time per value: a value that parses
          *   as a 64-bit integer sorts NUMERICALLY, anything else sorts by byte order. So
          *   variable-width numeric ids order correctly (`"3" < "20" < "100"`) with **no
          *   zero-padding in the feed and no reindex**, and ISO-8601 timestamps order
@@ -101,8 +103,8 @@ namespace SdSearch {
          * @param string $indexDir   Path to the ZSL index directory.
          * @param string $paramsJson JSON-encoded query parameters (see above).
          * @return string JSON-encoded `{hits,total,total_capped}` object (see above).
-         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
-         *                    internal engine error.
+         * @throws \Exception on malformed params JSON, an unknown `similarity` or `sort_dir`,
+         *                    a missing/unreadable index, or an internal engine error.
          */
         public function search(string $indexDir, string $paramsJson): string {}
 

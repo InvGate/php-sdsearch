@@ -22,7 +22,7 @@ extension=sdsearch.so     ; Linux
 ```
 
 ```php
-echo sdsearch_version(); // "0.1.0" — also a smoke test that the extension loaded
+echo sdsearch_version(); // "0.3.0" — also a smoke test that the extension loaded
 ```
 
 ## Method reference
@@ -32,7 +32,7 @@ echo sdsearch_version(); // "0.1.0" — also a smoke test that the extension loa
 | Method | Purpose | Throws |
 |---|---|---|
 | `__construct()` | Create an engine. | — |
-| `search(string $indexDir, string $paramsJson): string` | Run a query, return hits as JSON. | bad params JSON, missing index, engine error |
+| `search(string $indexDir, string $paramsJson): string` | Run a query, return `{hits, total, total_capped}` as JSON. | bad params JSON, unknown `similarity`/`sort_dir`, missing index, engine error |
 | `more_like_this(string $indexDir, string $paramsJson): string` | Find documents similar to a reference document, return hits as JSON. | bad params JSON, missing index, engine error |
 
 ### `SdSearch\Writer`
@@ -137,18 +137,34 @@ $params = [
     'in'        => [
         ['field' => 'category_key', 'values' => ['10', '11']],
     ],
+    'range'     => [
+        ['field' => 'created_at_key', 'from' => '1700000000', 'to' => '1800000000'],
+    ],
+    'match_all' => [
+        ['field' => 'title', 'text' => 'impresora oficina'],
+    ],
     'min_score' => 0.0,
     'limit'     => 20,
+    'offset'    => 0,
+    'sort'      => 'created_at_key',
+    'sort_dir'  => 'desc',
 ];
 
 $json = $engine->search($indexDir, json_encode($params));
-$hits = json_decode($json, true);
+$res  = json_decode($json, true);
 
-foreach ($hits as $hit) {
+foreach ($res['hits'] as $hit) {
     // $hit = ['id' => int, 'score' => float, 'fields' => ['name' => 'value', ...]]
     printf("#%d  score=%.3f  %s\n", $hit['id'], $hit['score'], $hit['fields']['title'] ?? '');
 }
+printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 ```
+
+> **Breaking change in 0.3.0.** `search()` used to return a bare JSON array of hits. It now
+> returns an object, `{hits, total, total_capped}` — the hits moved under `hits`. Code doing
+> `foreach (json_decode($json, true) as $hit)` iterates the three envelope keys instead of
+> failing, so it must be updated rather than left to error. `more_like_this()` is unchanged
+> and still returns a bare array.
 
 ### Query parameters
 
@@ -157,14 +173,54 @@ foreach ($hits as $hit) {
 | `text` | string | Free-text query over tokenized fields. |
 | `where` | array | Each `{field, values[], occur}`; `occur` ∈ `must` \| `mustnot` \| `should` (default `should`). |
 | `in` | array | Each `{field, values[]}`; matches the (literal, key-suffixed) field against any value. |
+| `range` | array | Optional (default `[]`). Each `{field, from?, to?}`; keeps docs whose `field` term is in the inclusive `[from, to]` range (either bound optional). `field` verbatim. Multiple entries are ANDed. Docs missing the field are excluded. **Bounds are compared as bytes, not numerically** — see the note below. |
+| `match_all` | array | Optional (default `[]`). Each `{field, text}`; keeps docs whose `field` contains ALL the analyzed words of `text` (AND). A non-scoring filter, ANDed with `range` and with the other `match_all` entries. Matching is on the engine's analyzed tokens: `"impresora"` does not match `"impresoras"`. |
 | `min_score` | float | Drop hits below this score. |
 | `limit` | int | Maximum hits to return (`0` = unlimited). |
+| `offset` | int | Optional (default `0`). Leading hits to skip, for pagination. |
+| `track_total_hits` | int\|bool | Optional (default `1001`). Integer `n` caps the reported `total` at `n`; `true` = exact count; `false` = omit `total` from the response. |
+| `sort` | string | Optional. Keyword field to order by, used VERBATIM (pass the `_key` name). Omitted or `"_score"` = relevance order. See the ordering rules below. |
+| `sort_dir` | string | Optional (default `"desc"`). `"asc"` or `"desc"`; any other value → error. Only read when `sort` is set. |
 | `accent_insensitive` | bool | Optional (default `false`). When `true`, text matching is Spanish accent-insensitive (`avion` also matches `avión` and vice-versa). |
 | `field_weights` | object | Optional (default `{}`). Per-field score multipliers (`{"title": 3.0}`); a field not listed weighs `1.0`. |
 | `similarity` | string | Optional scoring algorithm: `"bm25"` (default) or `"tfidf"`. Unknown value → error. As of 0.2.0 BM25 is the default ranking; pass `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25. |
+| `wildcard_min_prefix` | int | Optional (default `2`). Minimum literal-prefix length before the first `*`/`?` in the free-text wildcard leaf, so a short single-word query does not scan the whole vocabulary. Pass `0`/`1` for typeahead surfaces. Changed in 0.3.0: previously always `0`. |
 
-Each hit is `{ "id": int, "score": float, "fields": { name: value, ... } }`, where `id` is
-the global internal document id and `fields` are the document's stored fields.
+### Response shape
+
+```json
+{ "hits": [ { "id": 42, "score": 1.7, "fields": { "title": "…" } } ],
+  "total": 128, "total_capped": false }
+```
+
+`id` is the global internal document id and `fields` are the document's stored fields.
+`total` is the match count, capped per `track_total_hits` and absent entirely when that is
+`false`; `total_capped` is `true` when the real count exceeded the cap (render it as
+`"1000+"`).
+
+### Sort ordering
+
+Ordering is resolved at READ time, **per value, not per field**: a value that parses as a
+64-bit integer sorts numerically, anything else sorts by byte order. Consequences:
+
+- variable-width numeric ids order correctly (`"3" < "20" < "100"`) with **no zero-padding in
+  the feed and no reindex** — this works on indexes the legacy PHP engine wrote;
+- ISO-8601 timestamps come out chronological through the byte-order fallback;
+- docs with no value for the field sort LAST in both directions;
+- ties break by score desc, then by document id asc;
+- a doc with several values for the field is placed once, under its first value in write order.
+
+Cost is roughly `0.3 µs` per matched doc and flat in index size: the sort walks the matched
+docs and reads each one's stored value, performing zero term-dictionary lookups. Memory is
+bounded by `offset + limit` — a sum, not a product — so paging to offset 10000 retains 10020
+entries, not 200000. Requesting `limit = 0` (unlimited) makes that bound vacuous and retains
+one entry per match.
+
+> **`range` bounds are byte comparisons, `sort` is numeric-aware.** The two do *not* agree on
+> the same field. Sorting `id_key` with un-padded values orders correctly, but a `range` filter
+> over that same field does not (`"9" > "100"` as bytes). For range-filtered numeric or date
+> fields, feed a fixed-width form (epoch seconds, zero-padded ids). Neither side reports an
+> error when this is wrong, so it is worth checking at feed time.
 
 ## More Like This (read path)
 

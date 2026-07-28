@@ -123,15 +123,19 @@ fn total_tracking(dto: Option<&TrackTotalHitsDto>) -> (Option<usize>, bool) {
 /// Maps the `sort`/`sort_dir` params to an optional core `SortSpec`. An absent `sort`, or the
 /// literal `"_score"`, means relevance order — which the core expresses as the ABSENCE of a
 /// `SortSpec`, so both collapse to `None` here and the relevance path is reached by exactly the
-/// same call as before. Direction defaults to descending, matching the OpenSearch adapter.
-fn sort_spec_from(field: Option<String>, dir: Option<&str>) -> Option<SortSpec> {
+/// same call as before.
+///
+/// `sort_dir` is validated by `SortSpec::new` (in core, where it is under test) and an unknown
+/// token throws, like `similarity` does. Note the validation is skipped entirely when there is
+/// no `sort`: `sort_dir` alone orders nothing, so rejecting it would fail queries that are
+/// merely passing a stale default through.
+fn sort_spec_from(field: Option<String>, dir: Option<&str>) -> Result<Option<SortSpec>, String> {
     match field {
-        None => None,
-        Some(f) if f == "_score" => None,
-        Some(f) => Some(SortSpec {
-            field: f,
-            ascending: dir == Some("asc"),
-        }),
+        None => Ok(None),
+        Some(f) if f == "_score" => Ok(None),
+        Some(f) => SortSpec::new(f, dir)
+            .map(Some)
+            .map_err(|e| format!("sdsearch: {e}")),
     }
 }
 
@@ -254,6 +258,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         }
     };
     let (total_cap, report_total) = total_tracking(dto.track_total_hits.as_ref());
+    let sort = sort_spec_from(dto.sort, dto.sort_dir.as_deref())?;
     let params = QueryParams {
         text: dto.text,
         where_groups: dto
@@ -296,7 +301,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         accent_insensitive: dto.accent_insensitive,
         field_weights: dto.field_weights,
         similarity,
-        sort: sort_spec_from(dto.sort, dto.sort_dir.as_deref()),
+        sort,
     };
     let outcome = search_index_paged(
         Path::new(index_dir),
