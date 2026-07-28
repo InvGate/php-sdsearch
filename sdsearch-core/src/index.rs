@@ -5,6 +5,7 @@ use crate::doc::{Document, FieldKind};
 use crate::serialize::write_vint;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// postings of a term in a field: doc_id -> token positions (ascending); freq = positions.len()
@@ -75,6 +76,21 @@ pub trait IndexReader {
     /// names of indexed fields (unique, ascending order); used for all-fields queries.
     fn indexed_fields(&self) -> Vec<String>;
 
+    /// `true` if `field` exists in this index at all — INDEXED OR STORED-ONLY. A sort field is
+    /// typically stored-only, so `indexed_fields` is the wrong question to ask about one.
+    ///
+    /// Meant to be called once per query, never per document: the on-disk readers answer it from
+    /// the `.fnm` field infos already held in memory (a scan over a handful of names), so it costs
+    /// no I/O. The default is the conservative one for readers that track nothing else.
+    ///
+    /// Note this cannot tell "the field was never written" from "the field exists but no document
+    /// carries a value for it" — ZSL records stored-ness per document in the `.fdt`, not as a flag
+    /// in the `.fnm`. It catches a misspelled field name, which is the mistake that actually
+    /// happens; it does not certify that sorting by the field will find any values.
+    fn has_field(&self, field: &str) -> bool {
+        self.indexed_fields().iter().any(|f| f == field)
+    }
+
     /// ALL positions of a term, doc -> positions, in a single pass.
     /// The default (correct but O(docs·decode)) serves readers where `positions_for`
     /// is cheap; the on-disk segment reader overrides it with a single-pass decode (phrase at scale).
@@ -131,6 +147,9 @@ pub struct MemoryIndex {
     field_lengths: HashMap<usize, HashMap<String, u32>>,
     /// doc_id -> (field -> stored value) for stored fields
     stored: HashMap<usize, HashMap<String, String>>,
+    /// every field name ever added, of ANY kind — the in-memory stand-in for `.fnm`, so
+    /// `has_field` answers for stored-only fields too and in O(1).
+    field_names: HashSet<String>,
 }
 
 impl MemoryIndex {
@@ -148,6 +167,7 @@ impl MemoryIndex {
         let mut stored_fields = HashMap::new();
 
         for field in doc.fields() {
+            self.field_names.insert(field.name.clone());
             match field.kind {
                 FieldKind::Text => {
                     let tokens = analyze(&field.value);
@@ -351,6 +371,12 @@ impl IndexReader for MemoryIndex {
         }
         set.into_iter().collect()
     }
+
+    /// Overrides the default because that one asks `indexed_fields`, which by construction
+    /// cannot see a `FieldKind::Stored` field: those never reach `postings`.
+    fn has_field(&self, field: &str) -> bool {
+        self.field_names.contains(field)
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +418,28 @@ mod tests {
         // full value as one term; not split into "in"/"progress"
         assert_eq!(idx.doc_freq("status_key", "In Progress"), 1);
         assert_eq!(idx.doc_freq("status_key", "in"), 0);
+    }
+
+    #[test]
+    fn has_field_covers_every_field_kind_including_stored_only() {
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("title", "hello world", FieldKind::Text);
+        d.add("status_key", "open", FieldKind::Keyword);
+        d.add("rev_attr", "12", FieldKind::Stored);
+        idx.add_document(d);
+
+        assert!(idx.has_field("title"));
+        assert!(idx.has_field("status_key"));
+        // the case the trait default gets WRONG: a Stored field never reaches `postings`, so
+        // `indexed_fields` cannot see it, and the default is written in terms of that.
+        assert!(idx.has_field("rev_attr"));
+        assert!(!idx.indexed_fields().contains(&"rev_attr".to_string()));
+
+        assert!(!idx.has_field("nope"));
+        assert!(!idx.has_field(""));
+        // an empty index knows no fields
+        assert!(!MemoryIndex::new().has_field("title"));
     }
 
     #[test]

@@ -351,6 +351,13 @@ impl IndexReader for ZslSegment {
         }
     }
 
+    /// Answered from the `.fnm` infos already resident since `open`, and WITHOUT the
+    /// `is_indexed` filter `indexed_fields` applies: a stored-only field (the usual shape of a
+    /// sort field) is in `.fnm` with the flag clear, and must still count as present.
+    fn has_field(&self, field: &str) -> bool {
+        self.fields.iter().any(|f| f.name == field)
+    }
+
     fn indexed_fields(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .fields
@@ -381,6 +388,30 @@ mod tests {
     #[test]
     fn num_docs_matches_oracle() {
         assert_eq!(seg().num_docs(), 4);
+    }
+
+    #[test]
+    fn has_field_sees_stored_only_fields_that_indexed_fields_cannot() {
+        let s = seg();
+
+        // an indexed field: both views agree
+        assert!(s.has_field("title"));
+        assert!(s.indexed_fields().contains(&"title".to_string()));
+
+        // a STORED-ONLY field (`.fnm` flag clear). This is the whole reason `has_field` exists
+        // rather than reusing `indexed_fields`: it is the usual shape of a sort field, and
+        // `indexed_fields` reports it absent.
+        assert!(s.has_field("description_attr"));
+        assert!(!s.indexed_fields().contains(&"description_attr".to_string()));
+
+        // a name that is in neither
+        assert!(!s.has_field("nope_key"));
+        assert!(!s.has_field(""));
+
+        // exact match, not a prefix or a substring — `field.starts_with` would pass all three
+        assert!(!s.has_field("titl"));
+        assert!(!s.has_field("title_"));
+        assert!(!s.has_field("itle"));
     }
 
     #[test]

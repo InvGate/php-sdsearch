@@ -1,12 +1,13 @@
 //! runner: orchestrates ZslIndex + build_query + executor, reproducing the host
 //! application's Zend Lucene search adapter (min_score filtering, limit==0 = unlimited).
 
+use crate::index::IndexReader;
 use crate::mlt::{MltParams, more_like_this};
 use crate::query::{
     InGroup, QueryParams, build_query, intersect_allow, match_all_allow_list, range_allow_list,
     search, search_with_weights, search_with_weights_paged,
 };
-use crate::search::{Hit, SearchOutcome};
+use crate::search::{Hit, SearchOutcome, SortSpec};
 use crate::zsl::index::ZslIndex;
 use std::path::Path;
 
@@ -52,6 +53,7 @@ pub fn search_index_paged(
 ) -> Result<SearchOutcome, Box<dyn std::error::Error>> {
     let index = ZslIndex::open(index_dir)?;
     let query = build_query(params)?;
+    reject_unknown_sort_field(&index, params.sort.as_ref())?;
     let lim = if limit == 0 { usize::MAX } else { limit };
     let restrict = intersect_allow(
         range_allow_list(&index, &params.range_filters),
@@ -69,6 +71,32 @@ pub fn search_index_paged(
         restrict.as_ref(),
         params.sort.as_ref(),
     ))
+}
+
+/// Fails a sort by a field this index does not have.
+///
+/// Without it a misspelled field name is not an error anywhere: every doc resolves to `Missing`,
+/// they all tie, and the results come back in the tiebreak order (score desc, id asc) — which
+/// reads as "sorting is broken" rather than "that field does not exist". `has_field` is a scan
+/// over the `.fnm` names already in memory, run once per query, so the check is free relative to
+/// the query it guards.
+///
+/// An index with no documents is exempt: it has no segments and therefore no field names, so
+/// validating would turn every sorted query over an empty index into an error instead of the
+/// empty result it should be.
+fn reject_unknown_sort_field(
+    index: &ZslIndex,
+    sort: Option<&SortSpec>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(spec) = sort else { return Ok(()) };
+    if index.num_docs() == 0 || index.has_field(&spec.field) {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown sort field {:?} (the index has no such field; the name is used verbatim, so pass the `_key` name)",
+        spec.field
+    )
+    .into())
 }
 
 /// Resolves an id-field value to an internal doc id via an `InGroup` over

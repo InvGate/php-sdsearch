@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use sdsearch_core::index::IndexReader;
 use sdsearch_core::query::{
     InGroup, MatchAllFilter, QueryParams, RangeFilter, build_query, intersect_allow,
     match_all_allow_list, range_allow_list, search_with_weights_paged,
@@ -436,6 +437,46 @@ fn bench_intersect_strategies(iters: usize) {
 /// the allocation saving. Conclusion: do not re-apply the capacity hint to `range_allow_list`
 /// (or any similar call site) without a size source that costs no extra dictionary lookups; this
 /// benchmark's numbers are what "the isolated win exists but doesn't pay for itself" looks like.
+/// Isolates the per-query cost of the unknown-sort-field guard (`ZslIndex::has_field`).
+///
+/// It cannot be resolved from the macro query classes: it runs ONCE per query, against a p50
+/// measured in milliseconds, so the effect is several orders of magnitude below this machine's
+/// run-to-run drift. Timing it directly is the only way to state a number instead of "lost in
+/// noise" — the same reason `bench_intersect_strategies` and `bench_finalize_strategies` exist.
+///
+/// Reported per 1000 calls because a single call is below the clock's useful resolution.
+///
+/// The miss is NOT the worst case, which is counter-intuitive enough to write down: it scans
+/// every name, but `String == &str` compares lengths first, and a long absent name mismatches
+/// on length against nearly every entry. The slow case is a HIT late in the `.fnm` whose length
+/// collides with earlier names, so each of those needs a byte compare before failing.
+fn bench_sort_guard(dir: &std::path::Path, iters: usize) {
+    println!("\n---- sort-field guard: ZslIndex::has_field, ns per call ----");
+    let idx = ZslIndex::open(dir).unwrap();
+    let n_fields = idx.indexed_fields().len();
+    println!("{:<34} {:>14} {:>16}", "case", "ns/call", "vs a 30ms query");
+    // `created_at_key` is early in the .fnm order and `rev_attr` is stored-only and late, so the
+    // two hits bracket where in the scan a name can be found.
+    for (label, field) in [
+        ("hit, early in .fnm", "title"),
+        ("hit, stored-only, late in .fnm", "rev_attr"),
+        ("MISS (scans every name)", "no_such_field_at_all"),
+    ] {
+        let per_1k = percentiles_ms(iters, || {
+            for _ in 0..1000 {
+                std::hint::black_box(idx.has_field(std::hint::black_box(field)));
+            }
+        })
+        .0;
+        let ns = per_1k * 1_000_000.0 / 1000.0;
+        println!(
+            "{label:<34} {ns:>14.1} {:>15.5}%",
+            ns / 30_000_000.0 * 100.0
+        );
+    }
+    println!("({n_fields} indexed field names in this index's .fnm)");
+}
+
 fn bench_reserve_strategies(iters: usize) {
     println!(
         "\n---- reserve: HashSet::new() vs HashSet::with_capacity(n) (p50 ms + peak bytes) ----"
@@ -638,6 +679,7 @@ fn main() {
     }
 
     bench_sort_criteria(&dir, n, iters);
+    bench_sort_guard(&dir, iters);
     bench_finalize_strategies(iters);
     bench_intersect_strategies(iters);
     bench_reserve_strategies(iters);

@@ -163,6 +163,13 @@ impl IndexReader for ZslIndex {
         }
         set.into_iter().collect()
     }
+
+    /// Present in ANY segment counts as present. Segments are written independently, so a field
+    /// introduced partway through the index's life exists in the later ones only — treating that
+    /// as absent would reject a sort the index can perfectly well serve.
+    fn has_field(&self, field: &str) -> bool {
+        self.entries.iter().any(|e| e.seg.has_field(field))
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +199,53 @@ mod tests {
         // stored routing: the same doc returns the same id_key
         let d0 = idx.postings_for("title", "vpn")[0].0;
         assert_eq!(idx.stored_fields(d0), seg.stored_fields(d0));
+    }
+
+    #[test]
+    fn has_field_is_the_union_over_segments() {
+        // Bootstrap from the KB fixture, then commit a second segment carrying a field name the
+        // fixture does not have. `has_field` must be the UNION: a field introduced partway
+        // through the index's life lives in the newer segment only, and rejecting a sort on it
+        // would reject a sort the index can serve.
+        use crate::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
+        let dir = std::env::temp_dir().join(format!("sdsearch_hasfield_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(kb()).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+
+        let before = ZslIndex::open(&dir).unwrap();
+        assert!(!before.has_field("late_arrival_key"));
+        assert!(before.has_field("title"));
+        drop(before);
+
+        {
+            let mut w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
+            w.add_document(WriterDoc {
+                fields: vec![WriterField::keyword("late_arrival_key", "7")],
+            })
+            .unwrap();
+            w.commit().unwrap();
+        }
+
+        let after = ZslIndex::open(&dir).unwrap();
+        assert!(
+            after.entries.len() > 1,
+            "the test needs more than one segment to mean anything"
+        );
+        // present in the new segment only
+        assert!(after.has_field("late_arrival_key"));
+        // still present from the original segment
+        assert!(after.has_field("title"));
+        // a stored-only field of the original segment survives the union too
+        assert!(after.has_field("rev_attr"));
+        assert!(!after.has_field("still_not_here_key"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
