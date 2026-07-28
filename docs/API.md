@@ -179,7 +179,7 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 | `limit` | int | Maximum hits to return (`0` = unlimited). |
 | `offset` | int | Optional (default `0`). Leading hits to skip, for pagination. |
 | `track_total_hits` | int\|bool | Optional (default `1001`). Integer `n` caps the reported `total` at `n`; `true` = exact count; `false` = omit `total` from the response. |
-| `sort` | string | Optional. Keyword field to order by, used VERBATIM (pass the `_key` name). Omitted or `"_score"` = relevance order. See the ordering rules below. |
+| `sort` | string | Optional. Keyword field to order by, used VERBATIM (pass the `_key` name). Omitted or `"_score"` = relevance order. A field the index does not have → error. See the ordering rules below. |
 | `sort_dir` | string | Optional (default `"desc"`). `"asc"` or `"desc"`; any other value → error. Only read when `sort` is set. |
 | `accent_insensitive` | bool | Optional (default `false`). When `true`, text matching is Spanish accent-insensitive (`avion` also matches `avión` and vice-versa). |
 | `field_weights` | object | Optional (default `{}`). Per-field score multipliers (`{"title": 3.0}`); a field not listed weighs `1.0`. |
@@ -209,6 +209,12 @@ Ordering is resolved at READ time, **per value, not per field**: a value that pa
 - docs with no value for the field sort LAST in both directions;
 - ties break by score desc, then by document id asc;
 - a doc with several values for the field is placed once, under its first value in write order.
+
+Sorting by a field the index does not have is an **error**, not an unsorted result. Without that
+check a misspelled name makes every document tie on a missing value, and the hits come back in
+the tiebreak order — indistinguishable from working sorting. Stored-only fields count as
+present, since that is what a sort field usually is. An index with no documents is exempt, so a
+sorted query over an empty index still returns an empty result rather than failing.
 
 Cost is roughly `0.3 µs` per matched doc and flat in index size: the sort walks the matched
 docs and reads each one's stored value, performing zero term-dictionary lookups. Memory is

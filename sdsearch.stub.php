@@ -77,6 +77,9 @@ namespace SdSearch {
          *   the first `*`/`?` for the free-text wildcard leaf. Omitted = `2` (short single-word
          *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
          * - `sort` (optional): keyword field to order by, used VERBATIM (pass the `_key` name).
+         *   A field the index does not have THROWS — otherwise every doc ties on a missing value
+         *   and the tiebreak order comes back looking like working sorting. Stored-only fields
+         *   count as present; an index with no documents is exempt.
          *   Omitted or `"_score"` = relevance order. `sort_dir` is `"asc"` or `"desc"`
          *   (default `"desc"`); any other value THROWS rather than falling back, so a typo
          *   cannot silently reverse the order. It is only read when `sort` is set.
