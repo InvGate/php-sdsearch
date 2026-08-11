@@ -185,6 +185,7 @@ mod tests {
             field_weights: HashMap::new(),
             similarity: Similarity::Bm25,
             sort: None,
+            boolean_tree: None,
         }
     }
 

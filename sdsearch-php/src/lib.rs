@@ -402,6 +402,7 @@ fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
         field_weights: dto.field_weights,
         similarity,
         sort,
+        boolean_tree: None,
     })
 }
 
@@ -717,6 +718,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
         sort: None, // resolving one id: order is irrelevant, the caller takes the first hit
+        boolean_tree: None, // MLT resolves a reference doc by id, never by a boolean tree
     };
     let query = build_query(&params).map_err(|e| format!("sdsearch: build_query: {e}"))?;
     let hits = search(index, &query, 0.0, 1);

@@ -51,6 +51,7 @@ fn params(sort: Option<SortSpec>) -> QueryParams {
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
         sort,
+        boolean_tree: None,
     }
 }
 

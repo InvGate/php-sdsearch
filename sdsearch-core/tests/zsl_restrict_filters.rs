@@ -50,6 +50,7 @@ fn params(
         range_filters,
         match_all,
         sort: None,
+        boolean_tree: None,
     }
 }
 

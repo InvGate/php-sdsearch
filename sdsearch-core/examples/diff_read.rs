@@ -37,6 +37,7 @@ fn params(text: &str) -> QueryParams {
         range_filters: vec![],
         match_all: vec![],
         sort: None,
+        boolean_tree: None,
     }
 }
 

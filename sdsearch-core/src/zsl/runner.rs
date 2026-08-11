@@ -189,6 +189,7 @@ fn resolve_reference_doc(
         range_filters: Vec::new(),
         match_all: Vec::new(),
         sort: None,
+        boolean_tree: None,
     };
     let query = build_query(&params)?;
     let hits = search(index, &query, 0.0, 1);
@@ -238,6 +239,7 @@ mod tests {
             range_filters: vec![],
             match_all: vec![],
             sort: None,
+            boolean_tree: None,
         }
     }
     fn ids(hits: &[Hit]) -> Vec<usize> {

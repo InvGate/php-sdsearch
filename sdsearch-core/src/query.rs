@@ -524,6 +524,11 @@ pub struct QueryParams {
     pub match_all: Vec<MatchAllFilter>,
     /// optional field sort. `None` = relevance (score) order, the default and unchanged path.
     pub sort: Option<SortSpec>,
+    /// optional boolean expression tree over phrase leaves. When set it REPLACES the
+    /// free-text sub-query — `text` stops participating in matching — mirroring the host
+    /// adapter's `booleanTree > exactMatch > full-text` precedence. `where` / `in` /
+    /// `range` / `match_all` / `sort` still apply on top, unchanged.
+    pub boolean_tree: Option<BoolNode>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -736,13 +741,17 @@ fn key_field_in(field: &str) -> String {
 /// builds the boolean Query equivalent to Zend Lucene's boolean query builder for the supported surface.
 pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
     let has_text = !p.text.trim().is_empty();
-    if !has_text && p.where_groups.is_empty() && p.in_groups.is_empty() {
+    if !has_text && p.boolean_tree.is_none() && p.where_groups.is_empty() && p.in_groups.is_empty()
+    {
         return Err(QueryError::Empty);
     }
 
     let mut top: Vec<(Occur, Query)> = Vec::new();
 
-    if has_text {
+    // a boolean tree REPLACES the free-text subquery (host precedence: tree > exact > text).
+    if let Some(tree) = &p.boolean_tree {
+        top.push((Occur::Must, map_bool_node(tree, p.accent_insensitive, 0)?));
+    } else if has_text {
         top.push((Occur::Must, text_subquery(p)));
     }
 
@@ -1108,6 +1117,7 @@ mod tests {
             range_filters: vec![],
             match_all: vec![],
             sort: None,
+            boolean_tree: None,
         }
     }
 
@@ -1997,5 +2007,67 @@ mod tests {
                 "la negación pura devuelve vacío, sin panic: {node:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_tree_replaces_the_free_text_subquery() {
+        let mut p = params("texto que se ignora");
+        p.boolean_tree = Some(BoolNode::And(vec![term("quick"), term("brown")]));
+        let q = build_query(&p).unwrap();
+        let dump = format!("{q:?}");
+        assert!(dump.contains("Phrase"), "el árbol tiene que estar: {dump}");
+        assert!(
+            !dump.contains("Fuzzy"),
+            "con árbol, el sub-query de texto libre NO se arma: {dump}"
+        );
+    }
+
+    #[test]
+    fn a_tree_with_empty_text_is_not_an_empty_query() {
+        let mut p = params("");
+        p.boolean_tree = Some(BoolNode::Or(vec![term("quick")]));
+        assert!(
+            build_query(&p).is_ok(),
+            "un árbol cuenta como algo que buscar aunque text esté vacío"
+        );
+    }
+
+    #[test]
+    fn a_tree_still_ands_with_where_and_in() {
+        let mut p = params("");
+        p.boolean_tree = Some(BoolNode::Or(vec![term("quick")]));
+        p.where_groups = vec![WhereGroup {
+            field: "status".into(),
+            values: vec!["open".into()],
+            occur: Occur::Must,
+        }];
+        let Query::Boolean { clauses } = build_query(&p).unwrap() else {
+            panic!("build_query devuelve un Boolean");
+        };
+        assert_eq!(clauses.len(), 2, "árbol + where, ambos Must: {clauses:?}");
+        assert!(clauses.iter().all(|(o, _)| *o == Occur::Must));
+    }
+
+    #[test]
+    fn the_tree_inherits_accent_insensitive_from_the_params() {
+        let mut p = params("");
+        p.accent_insensitive = true;
+        p.boolean_tree = Some(BoolNode::Or(vec![term("impresion")]));
+        let dump = format!("{:?}", build_query(&p).unwrap());
+        assert!(
+            !dump.contains("accent_insensitive: false"),
+            "el flag de la query tiene que bajar a las hojas: {dump}"
+        );
+    }
+
+    #[test]
+    fn a_too_deep_tree_surfaces_as_an_error_not_a_crash() {
+        let mut node = term("hoja");
+        for _ in 0..40 {
+            node = BoolNode::And(vec![node]);
+        }
+        let mut p = params("");
+        p.boolean_tree = Some(node);
+        assert_eq!(build_query(&p), Err(QueryError::TreeTooDeep));
     }
 }
