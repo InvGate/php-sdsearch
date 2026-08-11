@@ -185,6 +185,7 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 | `field_weights` | object | Optional (default `{}`). Per-field score multipliers (`{"title": 3.0}`); a field not listed weighs `1.0`. |
 | `similarity` | string | Optional scoring algorithm: `"bm25"` (default) or `"tfidf"`. Unknown value → error. As of 0.2.0 BM25 is the default ranking; pass `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25. |
 | `wildcard_min_prefix` | int | Optional (default `2`). Minimum literal-prefix length before the first `*`/`?` in the free-text wildcard leaf, so a short single-word query does not scan the whole vocabulary. Pass `0`/`1` for typeahead surfaces. Changed in 0.3.0: previously always `0`. |
+| `synonyms` | bool | Optional (default `false`). When `true`, each query token is also matched against its bundled synonyms and cross-lingual (ES↔EN) translations, each added as a down-weighted `should` clause. See "Bundled data / attribution" below. |
 
 ### Response shape
 
@@ -287,6 +288,24 @@ $hits = json_decode($json, true);   // same shape as search(); [] if the referen
 | `field_weights` | object | Per-field score multipliers, as in `search`. |
 | `size` | int | Maximum hits to return (`0` = unlimited). |
 | `min_score` | float | Drop hits below this score (scores are normalized so the top hit is `1.0`). |
+
+## Bundled data / attribution
+
+The `synonyms` search param (see "Query parameters" above) expands each query token
+against a bundled cross-lingual dictionary derived from the Open Multilingual Wordnet
+(OMW): Princeton WordNet 3.0 (English) plus the Multilingual Central Repository (MCR)
+Spanish wordnet, linked through the Collaborative Interlingual Index. See
+[`NOTICE`](../NOTICE) at the repo root for full licensing/attribution — notably the MCR
+data is CC BY 3.0.
+
+The compiled blob lives at `sdsearch-core/src/synonyms.bin` and is embedded at build
+time; nothing reads it unless a query sets `"synonyms": true`. To regenerate it from
+scratch:
+
+1. Extract a cross-lingual pairs TSV with the `wn`-based Python extractor (one line per
+   key: `key<TAB>val1<TAB>val2...`), using `omw-en:1.4` + `omw-es:1.4`.
+2. Run `cargo run -p sdsearch-core --example gen_synonyms -- omw_pairs.tsv` — this
+   overwrites `sdsearch-core/src/synonyms.bin` in place.
 
 ## Wrapping it safely
 

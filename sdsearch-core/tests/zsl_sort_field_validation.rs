@@ -47,6 +47,7 @@ fn params(sort: Option<SortSpec>) -> QueryParams {
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 2,
         accent_insensitive: false,
+        synonyms: false,
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
         sort,

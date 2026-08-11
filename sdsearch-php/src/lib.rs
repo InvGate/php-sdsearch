@@ -9,15 +9,19 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::time::Duration;
 
+use sdsearch_core::hybrid::HybridParams;
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
+use sdsearch_core::prf::PrfParams;
 use sdsearch_core::query::{
     InGroup, MatchAllFilter, Occur, Query, QueryParams, RangeFilter as SearchRangeFilter,
     WhereGroup, build_query, search,
 };
 use sdsearch_core::score::Similarity;
-use sdsearch_core::search::SortSpec;
+use sdsearch_core::search::{Hit, SortSpec};
 use sdsearch_core::zsl::index::ZslIndex;
-use sdsearch_core::zsl::runner::{more_like_this_index, search_index_paged};
+use sdsearch_core::zsl::runner::{
+    more_like_this_index, search_hybrid_index, search_index_paged, search_prf_index,
+};
 use sdsearch_core::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
 
 // ---- JSON contract with PHP ----
@@ -71,6 +75,10 @@ struct ParamsDto {
     /// optional: accent-insensitive text matching (Spanish). Omitted = false.
     #[serde(default)]
     accent_insensitive: bool,
+    /// optional: expand each query token with bundled synonyms/translations
+    /// (cross-lingual ES↔EN). Omitted = false.
+    #[serde(default)]
+    synonyms: bool,
     /// optional: per-field score multipliers (field -> weight). Omitted = {} (equal).
     #[serde(default)]
     field_weights: HashMap<String, f32>,
@@ -145,6 +153,99 @@ struct SearchResponseDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<u64>,
     total_capped: bool,
+}
+
+fn default_prf_top_k() -> u64 {
+    5
+}
+fn default_prf_num_terms() -> u64 {
+    10
+}
+fn default_prf_feedback_weight() -> f32 {
+    0.3
+}
+fn default_prf_min_term_freq() -> u32 {
+    1
+}
+fn default_prf_min_doc_freq() -> u64 {
+    1
+}
+
+#[derive(Deserialize)]
+struct PrfDto {
+    #[serde(default = "default_prf_top_k")]
+    top_k: u64,
+    #[serde(default = "default_prf_num_terms")]
+    num_terms: u64,
+    #[serde(default = "default_prf_feedback_weight")]
+    feedback_weight: f32,
+    #[serde(default)]
+    fields: Vec<String>,
+    #[serde(default = "default_prf_min_term_freq")]
+    min_term_freq: u32,
+    #[serde(default = "default_prf_min_doc_freq")]
+    min_doc_freq: u64,
+    #[serde(default)]
+    max_doc_freq: Option<u64>,
+    #[serde(default)]
+    posting_budget: Option<u64>,
+}
+
+impl Default for PrfDto {
+    fn default() -> Self {
+        Self {
+            top_k: default_prf_top_k(),
+            num_terms: default_prf_num_terms(),
+            feedback_weight: default_prf_feedback_weight(),
+            fields: Vec::new(),
+            min_term_freq: default_prf_min_term_freq(),
+            min_doc_freq: default_prf_min_doc_freq(),
+            max_doc_freq: None,
+            posting_budget: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SemanticParamsDto {
+    #[serde(flatten)]
+    base: ParamsDto,
+    #[serde(default)]
+    prf: PrfDto,
+}
+
+fn default_hybrid_k() -> u64 {
+    60
+}
+fn default_hybrid_depth() -> u64 {
+    100
+}
+
+#[derive(Deserialize)]
+struct HybridDto {
+    #[serde(default = "default_hybrid_k")]
+    k: u64,
+    #[serde(default = "default_hybrid_depth")]
+    depth: u64,
+}
+
+impl Default for HybridDto {
+    fn default() -> Self {
+        Self {
+            k: default_hybrid_k(),
+            depth: default_hybrid_depth(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct HybridParamsDto {
+    #[serde(flatten)]
+    base: ParamsDto,
+    #[serde(default)]
+    prf: PrfDto,
+    #[serde(default)]
+    hybrid: HybridDto,
 }
 
 fn default_min_term_freq() -> u32 {
@@ -243,11 +344,10 @@ fn occur_from(s: &str) -> Occur {
     }
 }
 
-/// fallible core: parses params, runs search_index, serializes hits. Errors are returned
-/// as String (the boundary converts them into PhpException).
-fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
-    let dto: ParamsDto =
-        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+/// Maps the shared search DTO into core `QueryParams` (used by both `run` and `run_semantic`).
+/// Takes `dto` by value and moves its fields — callers that still need `dto.min_score` /
+/// `dto.limit` afterward must read those (both `Copy`) before calling this.
+fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
     let similarity = match dto.similarity.as_deref() {
         None | Some("bm25") => Similarity::Bm25,
         Some("tfidf") => Similarity::TfIdf,
@@ -257,9 +357,8 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
             ));
         }
     };
-    let (total_cap, report_total) = total_tracking(dto.track_total_hits.as_ref());
     let sort = sort_spec_from(dto.sort, dto.sort_dir.as_deref())?;
-    let params = QueryParams {
+    Ok(QueryParams {
         text: dto.text,
         where_groups: dto
             .r#where
@@ -299,38 +398,114 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: dto.wildcard_min_prefix,
         accent_insensitive: dto.accent_insensitive,
+        synonyms: dto.synonyms,
         field_weights: dto.field_weights,
         similarity,
         sort,
-    };
-    let outcome = search_index_paged(
-        Path::new(index_dir),
-        &params,
-        dto.min_score,
-        dto.offset as usize,
-        dto.limit as usize,
-        total_cap,
-    )
-    .map_err(|e| format!("sdsearch: {e}"))?;
-    let hits: Vec<HitDto> = outcome
-        .hits
-        .into_iter()
+    })
+}
+
+/// Maps the PRF sub-DTO into core `PrfParams` (shared by `run_semantic` and `run_hybrid`).
+fn prf_params_from(dto: PrfDto) -> PrfParams {
+    PrfParams {
+        top_k: dto.top_k as usize,
+        num_terms: dto.num_terms as usize,
+        feedback_weight: dto.feedback_weight,
+        fields: dto.fields,
+        min_term_freq: dto.min_term_freq,
+        min_doc_freq: dto.min_doc_freq as usize,
+        max_doc_freq: dto.max_doc_freq.map(|v| v as usize),
+        posting_budget: dto.posting_budget.map(|v| v as usize),
+    }
+}
+
+fn hit_dtos(hits: Vec<Hit>) -> Vec<HitDto> {
+    hits.into_iter()
         .map(|h| HitDto {
             id: h.id as u64,
             score: h.score,
             fields: h.fields,
         })
-        .collect();
+        .collect()
+}
+
+/// Maps a `Vec<Hit>` into the bare hit-array JSON returned by `semantic_query` / `hybrid_query`.
+/// `search` has the richer `{hits,total,total_capped}` envelope; `run_mlt` projects its own.
+fn hits_to_json(hits: Vec<Hit>) -> Result<String, String> {
+    serde_json::to_string(&hit_dtos(hits)).map_err(|e| format!("sdsearch: serialize hits: {e}"))
+}
+
+/// fallible core: parses params, runs the paged search, serializes the `{hits,total,
+/// total_capped}` envelope. Errors are returned as String (the boundary converts them
+/// into PhpException).
+fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: ParamsDto =
+        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let min_score = dto.min_score;
+    let offset = dto.offset;
+    let limit = dto.limit;
+    let (total_cap, report_total) = total_tracking(dto.track_total_hits.as_ref());
+    let params = query_params_from(dto)?;
+    let outcome = search_index_paged(
+        Path::new(index_dir),
+        &params,
+        min_score,
+        offset as usize,
+        limit as usize,
+        total_cap,
+    )
+    .map_err(|e| format!("sdsearch: {e}"))?;
     let resp = SearchResponseDto {
-        hits,
-        total: if report_total {
-            Some(outcome.total as u64)
-        } else {
-            None
-        },
+        hits: hit_dtos(outcome.hits),
+        total: report_total.then_some(outcome.total as u64),
         total_capped: outcome.total_capped,
     };
     serde_json::to_string(&resp).map_err(|e| format!("sdsearch: serialize hits: {e}"))
+}
+
+/// fallible core of `Engine::semantic_query`: parses the search DTO + optional `prf`
+/// object, runs the two-pass PRF search, serializes hits. Errors as String.
+fn run_semantic(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: SemanticParamsDto =
+        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let min_score = dto.base.min_score;
+    let limit = dto.base.limit;
+    let params = query_params_from(dto.base)?;
+    let prf = prf_params_from(dto.prf);
+    let hits = search_prf_index(
+        Path::new(index_dir),
+        &params,
+        &prf,
+        min_score,
+        limit as usize,
+    )
+    .map_err(|e| format!("sdsearch: {e}"))?;
+    hits_to_json(hits)
+}
+
+/// fallible core of `Engine::hybrid_query`: parses the search DTO + optional `prf` and
+/// `hybrid` objects, runs the RRF-fused hybrid search, serializes hits. Errors as String.
+fn run_hybrid(index_dir: &str, params_json: &str) -> Result<String, String> {
+    let dto: HybridParamsDto =
+        serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    let min_score = dto.base.min_score;
+    let limit = dto.base.limit;
+    let params = query_params_from(dto.base)?;
+    let prf = prf_params_from(dto.prf);
+    let hybrid = HybridParams {
+        k: dto.hybrid.k as usize,
+        depth: dto.hybrid.depth as usize,
+    };
+    let hits = search_hybrid_index(
+        Path::new(index_dir),
+        &params,
+        &prf,
+        &hybrid,
+        min_score,
+        limit as usize,
+    )
+    .map_err(|e| format!("sdsearch: {e}"))?;
+    hits_to_json(hits)
 }
 
 /// fallible core of `Engine::more_like_this`: parses MLT params, runs the query, projects
@@ -433,6 +608,33 @@ impl Engine {
             )),
         }
     }
+
+    /// Semantic search via two-pass pseudo-relevance feedback. Same params object as
+    /// `search`, plus an optional `"prf"` object. Panic-safe boundary, like `search`.
+    pub fn semantic_query(&self, index_dir: String, params_json: String) -> PhpResult<String> {
+        let result = catch_unwind(AssertUnwindSafe(|| run_semantic(&index_dir, &params_json)));
+        match result {
+            Ok(Ok(json)) => Ok(json),
+            Ok(Err(msg)) => Err(PhpException::default(msg)),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic during semantic_query".to_string(),
+            )),
+        }
+    }
+
+    /// Hybrid search: fuses a plain `search` and a `semantic_query` (PRF) by Reciprocal Rank
+    /// Fusion. Same params object as `search`, plus optional `"prf"` and `"hybrid"` objects.
+    /// Panic-safe boundary, like `search`.
+    pub fn hybrid_query(&self, index_dir: String, params_json: String) -> PhpResult<String> {
+        let result = catch_unwind(AssertUnwindSafe(|| run_hybrid(&index_dir, &params_json)));
+        match result {
+            Ok(Ok(json)) => Ok(json),
+            Ok(Err(msg)) => Err(PhpException::default(msg)),
+            Err(_) => Err(PhpException::default(
+                "sdsearch: panic during hybrid_query".to_string(),
+            )),
+        }
+    }
 }
 
 // ---- write FFI: add_document JSON contract ----
@@ -511,6 +713,7 @@ fn resolve_doc_id(index: &ZslIndex, id_field: &str, value: &str) -> Result<i64, 
         fuzzy_prefix_len: 3,
         wildcard_min_prefix: 0, // inert: empty text => no wildcard leaf
         accent_insensitive: false,
+        synonyms: false,
         field_weights: HashMap::new(),
         similarity: Similarity::Bm25,
         sort: None, // resolving one id: order is irrelevant, the caller takes the first hit

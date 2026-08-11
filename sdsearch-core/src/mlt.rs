@@ -72,16 +72,19 @@ pub(crate) struct Selected {
     pub doc_freq: usize,
 }
 
-/// Extracts the source doc's most distinctive terms: reads its stored text per
-/// requested field, counts in-doc term frequency, scores each candidate by
-/// `tf * idf`, filters by the freq knobs, ranks, caps at `max_query_terms`, then
-/// applies the posting budget (always keeping at least the top term).
+/// Extracts the source docs' most distinctive terms: reads each doc's stored text per
+/// requested field, accumulates in-doc term frequency across all of them, scores each
+/// candidate by `tf * idf`, filters by the freq knobs, ranks, caps at `max_query_terms`,
+/// then applies the posting budget (always keeping at least the top term).
 pub(crate) fn select_terms(
     index: &impl IndexReader,
-    source_doc: usize,
+    source_docs: &[usize],
     p: &MltParams,
 ) -> Vec<Selected> {
-    let stored = index.stored_fields(source_doc);
+    let stored_per_doc: Vec<HashMap<String, String>> = source_docs
+        .iter()
+        .map(|&d| index.stored_fields(d))
+        .collect();
     let n_docs = index.total_docs();
     let n = n_docs as f32;
 
@@ -97,12 +100,16 @@ pub(crate) fn select_terms(
     let mut scored: Vec<(f32, Selected)> = Vec::new();
 
     for field in &p.fields {
-        let Some(text) = stored.get(field) else {
-            continue;
-        };
         let mut tf: HashMap<String, u32> = HashMap::new();
-        for tok in analyze(text) {
-            *tf.entry(tok).or_insert(0) += 1;
+        for stored in &stored_per_doc {
+            if let Some(text) = stored.get(field) {
+                for tok in analyze(text) {
+                    *tf.entry(tok).or_default() += 1;
+                }
+            }
+        }
+        if tf.is_empty() {
+            continue;
         }
         for (term, freq) in tf {
             if freq < p.min_term_freq {
@@ -168,7 +175,7 @@ fn weight_of(weights: &HashMap<String, f32>, field: &str) -> f32 {
 /// subsequent term the wall-clock deadline is checked and the union stops early
 /// if it has passed. Early stops yield approximate scores (a runaway guard).
 pub fn more_like_this(index: &impl IndexReader, source_doc: usize, p: &MltParams) -> Vec<Hit> {
-    let selected = select_terms(index, source_doc, p);
+    let selected = select_terms(index, &[source_doc], p);
     if selected.is_empty() {
         return Vec::new();
     }
@@ -297,7 +304,7 @@ mod tests {
     #[test]
     fn selects_distinctive_terms_over_common_ones() {
         let m = idx();
-        let terms = select_terms(&m, 0, &params(&["body"]));
+        let terms = select_terms(&m, &[0], &params(&["body"]));
         let picked: Vec<&str> = terms.iter().map(|t| t.term.as_str()).collect();
         assert!(
             picked.contains(&"zebra"),
@@ -312,7 +319,7 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
         p.min_doc_freq = 2; // "zebra" has df 1 -> filtered out
-        let picked: Vec<String> = select_terms(&m, 0, &p)
+        let picked: Vec<String> = select_terms(&m, &[0], &p)
             .into_iter()
             .map(|t| t.term)
             .collect();
@@ -324,7 +331,7 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
         p.max_query_terms = 1;
-        assert_eq!(select_terms(&m, 0, &p).len(), 1);
+        assert_eq!(select_terms(&m, &[0], &p).len(), 1);
     }
 
     #[test]
@@ -332,7 +339,7 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
         p.posting_budget = Some(1); // tiny budget; still keep the single top term
-        let terms = select_terms(&m, 0, &p);
+        let terms = select_terms(&m, &[0], &p);
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].term, "zebra");
     }
@@ -462,7 +469,7 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
         p.max_doc_freq = Some(1);
-        let picked: Vec<String> = select_terms(&m, 0, &p)
+        let picked: Vec<String> = select_terms(&m, &[0], &p)
             .into_iter()
             .map(|t| t.term)
             .collect();
@@ -518,7 +525,7 @@ mod tests {
         let mut p = params(&["body"]);
 
         p.posting_budget = Some(5);
-        let five: Vec<String> = select_terms(&m, 0, &p)
+        let five: Vec<String> = select_terms(&m, &[0], &p)
             .into_iter()
             .map(|t| t.term)
             .collect();
@@ -529,7 +536,7 @@ mod tests {
         );
 
         p.posting_budget = Some(7);
-        let seven: Vec<String> = select_terms(&m, 0, &p)
+        let seven: Vec<String> = select_terms(&m, &[0], &p)
             .into_iter()
             .map(|t| t.term)
             .collect();
@@ -544,7 +551,7 @@ mod tests {
         // Forgetting `fields` (or passing none) selects no terms -> [] (same as "no match").
         let m = sim_idx();
         let p = params(&[]);
-        assert!(select_terms(&m, 0, &p).is_empty());
+        assert!(select_terms(&m, &[0], &p).is_empty());
         assert!(more_like_this(&m, 0, &p).is_empty());
     }
 
@@ -584,7 +591,7 @@ mod tests {
         let m = idx();
         let mut p = params(&["body"]);
         p.max_doc_freq = None; // infer from index size
-        let picked: Vec<String> = select_terms(&m, 0, &p)
+        let picked: Vec<String> = select_terms(&m, &[0], &p)
             .into_iter()
             .map(|t| t.term)
             .collect();
@@ -726,6 +733,34 @@ mod tests {
         assert!(
             more_like_this(&m, 0, &p).is_empty(),
             "under a zero deadline only 1 term is processed, so msm=2 matches nothing"
+        );
+    }
+
+    #[test]
+    fn select_terms_accumulates_tf_across_docs() {
+        // Two source docs both contain "alpha"; its combined tf (2) must make it rank
+        // above "beta" (tf 1, only in doc 0). Passing both docs must select "alpha".
+        let mut m = MemoryIndex::new();
+        for text in [
+            "alpha beta",
+            "alpha gamma",
+            "delta",
+            "epsilon",
+            "zeta",
+            "eta",
+        ] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            m.add_document(d);
+        }
+        let mut p = params(&["body"]);
+        p.min_term_freq = 1;
+        p.min_doc_freq = 1;
+        let selected = select_terms(&m, &[0, 1], &p);
+        let terms: Vec<&str> = selected.iter().map(|s| s.term.as_str()).collect();
+        assert!(
+            terms.contains(&"alpha"),
+            "combined-tf term missing: {terms:?}"
         );
     }
 

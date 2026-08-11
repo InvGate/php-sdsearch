@@ -14,6 +14,7 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+#[derive(Debug, Clone)]
 pub struct Hit {
     pub id: usize,
     pub score: f32,
