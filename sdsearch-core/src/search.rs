@@ -319,14 +319,39 @@ pub(crate) fn fuzzy_terms(
     matched.into_iter().map(|(_, t)| t).collect()
 }
 
+/// doc -> positions merged over `terms`, plus the idf of their pooled doc frequency.
+/// `terms` is one phrase word: a single element in the plain case, or its accent variants.
+fn merged_positions(
+    index: &impl IndexReader,
+    sim: Similarity,
+    field: &str,
+    terms: &[String],
+) -> (HashMap<usize, Vec<u32>>, f32) {
+    let mut merged: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut df = 0usize;
+    for t in terms {
+        // pooled df: a doc holding two variants is counted twice, nudging idf down. The
+        // alternative (merged.len()) would silently change the single-variant scores this
+        // function already produces, so the approximation stays on the accent path only.
+        df += index.doc_freq(field, t);
+        for (doc, pos) in index.positions_all(field, t) {
+            merged.entry(doc).or_default().extend(pos);
+        }
+    }
+    (merged, sim.idf(index.total_docs() as f32, df as f32))
+}
+
 /// raw scores of a phrase (exact adjacency). The terms must appear at consecutive
 /// positions (p, p+1, ...) and in order, in the same field/doc.
+/// `accent_insensitive`: each word additionally matches its Spanish accent variants
+/// (`avion` also reaches `avión`); adjacency and order are unaffected.
 /// `restrict`: `None` scores all matching docs; `Some(set)` scores only docs in `set`. It filters WHICH docs are scored, never the score — idf uses collection-wide stats, so a scored doc's value is identical either way.
 pub(crate) fn phrase_scores(
     index: &impl IndexReader,
     sim: Similarity,
     field: &str,
     terms: &[&str],
+    accent_insensitive: bool,
     restrict: Option<&HashSet<usize>>,
 ) -> HashMap<usize, f32> {
     let mut scored: HashMap<usize, f32> = HashMap::new();
@@ -339,9 +364,12 @@ pub(crate) fn phrase_scores(
     let per_term: Vec<(HashMap<usize, Vec<u32>>, f32)> = terms
         .iter()
         .map(|t| {
-            let positions = index.positions_all(field, t);
-            let idf = sim.idf(index.total_docs() as f32, index.doc_freq(field, t) as f32);
-            (positions, idf)
+            let variants = if accent_insensitive {
+                accent_variant_terms(index, field, t)
+            } else {
+                vec![(*t).to_string()]
+            };
+            merged_positions(index, sim, field, &variants)
         })
         .collect();
 
@@ -619,7 +647,7 @@ pub fn phrase_query(
 ) -> Vec<Hit> {
     finalize(
         index,
-        phrase_scores(index, Similarity::Bm25, field, terms, None),
+        phrase_scores(index, Similarity::Bm25, field, terms, false, None),
         min_score,
         limit,
     )
@@ -630,6 +658,7 @@ mod tests {
     use super::*;
     use crate::doc::{Document, FieldKind};
     use crate::index::MemoryIndex;
+    use crate::query::Query;
 
     fn build() -> MemoryIndex {
         let mut idx = MemoryIndex::new();
@@ -1276,6 +1305,97 @@ mod tests {
             looked_up,
             vec![1, 2, 5],
             "docs filtered by min_score must never reach the .fdt"
+        );
+    }
+
+    /// dos campos de texto por doc, para probar que la frase busca en TODOS los campos.
+    fn phrase_multifield_corpus() -> MemoryIndex {
+        let mut idx = MemoryIndex::new();
+        for (title, body) in [
+            ("impresion rota", "todo bien por aca"),
+            ("otra cosa", "la impresion rota del piso 3"),
+            ("impresion", "rota"),
+            ("impresión rota", "con tilde"),
+        ] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("body", body, FieldKind::Text);
+            idx.add_document(d);
+        }
+        idx
+    }
+
+    #[test]
+    fn phrase_with_no_field_searches_every_indexed_field() {
+        let idx = phrase_multifield_corpus();
+        let q = Query::Phrase {
+            field: None,
+            terms: vec!["impresion".into(), "rota".into()],
+            accent_insensitive: false,
+        };
+        let hits = crate::query::search(&idx, &q, 0.0, 10);
+        let mut ids: Vec<usize> = hits.iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        // doc 0 la tiene en title, doc 1 en body. doc 2 la tiene partida entre dos campos
+        // (no es adyacencia dentro de un campo) y doc 3 la tiene con tilde.
+        assert_eq!(ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn phrase_scoped_to_one_field_ignores_the_other() {
+        let idx = phrase_multifield_corpus();
+        let q = Query::Phrase {
+            field: Some("title".into()),
+            terms: vec!["impresion".into(), "rota".into()],
+            accent_insensitive: false,
+        };
+        let hits = crate::query::search(&idx, &q, 0.0, 10);
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn phrase_never_spans_two_fields() {
+        // doc 2 es "impresion" en title y "rota" en body: NO es la frase.
+        let idx = phrase_multifield_corpus();
+        let q = Query::Phrase {
+            field: None,
+            terms: vec!["impresion".into(), "rota".into()],
+            accent_insensitive: false,
+        };
+        let hits = crate::query::search(&idx, &q, 0.0, 10);
+        assert!(
+            !hits.iter().any(|h| h.id == 2),
+            "una frase no puede cruzar el borde de un campo: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn accent_insensitive_phrase_matches_across_the_tilde() {
+        let idx = phrase_multifield_corpus();
+        let q = Query::Phrase {
+            field: None,
+            terms: vec!["impresion".into(), "rota".into()],
+            accent_insensitive: true,
+        };
+        let hits = crate::query::search(&idx, &q, 0.0, 10);
+        let mut ids: Vec<usize> = hits.iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        // ahora doc 3 ("impresión rota") también entra.
+        assert_eq!(ids, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn accent_insensitive_phrase_still_requires_adjacency() {
+        let idx = phrase_multifield_corpus();
+        let q = Query::Phrase {
+            field: None,
+            terms: vec!["rota".into(), "impresion".into()],
+            accent_insensitive: true,
+        };
+        let hits = crate::query::search(&idx, &q, 0.0, 10);
+        assert!(
+            hits.is_empty(),
+            "expandir acentos no debe aflojar el orden ni la adyacencia: {hits:?}"
         );
     }
 }

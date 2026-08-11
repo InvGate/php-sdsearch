@@ -17,7 +17,7 @@ pub enum Occur {
     MustNot,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     /// exact term; field None = all indexed fields (ZSL null-field rewrite).
     Term {
@@ -42,9 +42,15 @@ pub enum Query {
         similarity: f32,
         prefix_len: usize,
     },
+    /// phrase with exact adjacency. `field` None = the phrase must occur in at least one
+    /// indexed field, scored as an OR across fields — the host adapter's multi-field
+    /// `match_phrase` (`should` + `minimum_should_match: 1`). A phrase NEVER spans two
+    /// fields: adjacency is checked per field.
+    /// `accent_insensitive` folds Spanish accents per word, like `AccentTerm`.
     Phrase {
-        field: String,
+        field: Option<String>,
         terms: Vec<String>,
+        accent_insensitive: bool,
     },
     Boolean {
         clauses: Vec<(Occur, Query)>,
@@ -136,13 +142,20 @@ fn eval(
             }
             acc
         }
-        Query::Phrase { field, terms } => {
-            let w = field_weight(weights, field);
+        Query::Phrase {
+            field,
+            terms,
+            accent_insensitive,
+        } => {
             let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-            phrase_scores(index, sim, field, &refs, restrict)
-                .into_iter()
-                .map(|(id, s)| (id, s * w))
-                .collect()
+            let mut acc: HashMap<usize, f32> = HashMap::new();
+            for f in target_fields(index, field) {
+                let w = field_weight(weights, &f);
+                for (id, s) in phrase_scores(index, sim, &f, &refs, *accent_insensitive, restrict) {
+                    *acc.entry(id).or_insert(0.0) += s * w;
+                }
+            }
+            acc
         }
         Query::Boolean { clauses } => eval_boolean(index, clauses, weights, sim, restrict),
         Query::Boosted { boost, inner } => {
