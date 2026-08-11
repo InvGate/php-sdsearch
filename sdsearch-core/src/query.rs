@@ -532,6 +532,8 @@ pub enum QueryError {
     Empty,
     /// a where/in group has an empty field name.
     EmptyField,
+    /// a boolean tree nests deeper than `MAX_TREE_DEPTH`.
+    TreeTooDeep,
 }
 
 impl std::fmt::Display for QueryError {
@@ -539,6 +541,7 @@ impl std::fmt::Display for QueryError {
         match self {
             QueryError::Empty => write!(f, "empty query"),
             QueryError::EmptyField => write!(f, "empty field name in where/in group"),
+            QueryError::TreeTooDeep => write!(f, "boolean tree nested deeper than 32 levels"),
         }
     }
 }
@@ -547,6 +550,100 @@ impl std::error::Error for QueryError {}
 /// Score multiplier applied to every expanded (non-literal) synonym term. A synonym
 /// is weaker evidence than the literal token the user typed, so it ranks below it.
 pub const SYNONYM_BOOST: f32 = 0.6;
+
+/// A boolean expression tree over phrase leaves — the neutral shape the host's
+/// `IBooleanNode::toSearchArray()` emits (`and`/`or` with children, `not` with one child,
+/// `term` with a phrase).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoolNode {
+    And(Vec<BoolNode>),
+    Or(Vec<BoolNode>),
+    Not(Box<BoolNode>),
+    Term(String),
+}
+
+/// Max nesting accepted for a boolean tree. Both `map_bool_node` and `eval` recurse, and a
+/// stack overflow ABORTS the process — which `catch_unwind` at the FFI boundary cannot turn
+/// into a PHP exception, so it would take the worker down. `serde_json` already caps
+/// deserialization at 128 levels; this is the mapper's guard. The host's own parser caps at 20.
+const MAX_TREE_DEPTH: usize = 32;
+
+/// `NOT NOT x` == `x`. The host's parser can emit it (`foo AND NOT NOT bar` passes its
+/// positive-match check). Left alone it would map to a `MustNot` over a `Boolean` that
+/// evaluates to nothing, and a `MustNot` of nothing excludes nothing — so the query would
+/// silently widen to `foo` instead of returning fewer hits.
+fn strip_double_negation(node: &BoolNode) -> &BoolNode {
+    let mut cur = node;
+    while let BoolNode::Not(inner) = cur {
+        match inner.as_ref() {
+            BoolNode::Not(x) => cur = x,
+            _ => break,
+        }
+    }
+    cur
+}
+
+/// Maps a `BoolNode` tree to the equivalent `Query`. `accent_insensitive` is threaded to
+/// every phrase leaf.
+///
+/// A negation with no positive sibling (`NOT foo` at the root, a `not` under an `or`, an
+/// `and` whose children are all `not`) maps to a `Boolean` that `eval_boolean` resolves to
+/// zero hits: with no `Must` it takes the union-of-shoulds branch and accumulates nothing.
+/// That is deliberate — the host's parser rejects those trees upstream
+/// (`IBooleanNode::requiresPositiveMatch`), and answering them properly would need an
+/// "every live doc" leaf, i.e. a new `IndexReader` method with three implementations.
+// ponytail: pure negation returns empty silently. Upgrade path is `IndexReader::live_docs()`
+// plus a `Query::MatchAll` leaf, after which `not` is correct in any position.
+pub(crate) fn map_bool_node(
+    node: &BoolNode,
+    accent_insensitive: bool,
+    depth: usize,
+) -> Result<Query, QueryError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(QueryError::TreeTooDeep);
+    }
+    match strip_double_negation(node) {
+        BoolNode::Term(phrase) => Ok(Query::Phrase {
+            field: None,
+            terms: crate::analysis::analyze(phrase),
+            accent_insensitive,
+        }),
+        BoolNode::Not(inner) => Ok(Query::Boolean {
+            clauses: vec![(
+                Occur::MustNot,
+                map_bool_node(inner, accent_insensitive, depth + 1)?,
+            )],
+        }),
+        BoolNode::And(children) => {
+            let mut clauses = Vec::with_capacity(children.len());
+            for child in children {
+                // a negated child becomes THIS node's MustNot instead of a nested Boolean:
+                // that is Lucene's "required minus excluded", which eval_boolean implements.
+                match strip_double_negation(child) {
+                    BoolNode::Not(inner) => clauses.push((
+                        Occur::MustNot,
+                        map_bool_node(inner, accent_insensitive, depth + 1)?,
+                    )),
+                    other => clauses.push((
+                        Occur::Must,
+                        map_bool_node(other, accent_insensitive, depth + 1)?,
+                    )),
+                }
+            }
+            Ok(Query::Boolean { clauses })
+        }
+        BoolNode::Or(children) => {
+            let mut clauses = Vec::with_capacity(children.len());
+            for child in children {
+                clauses.push((
+                    Occur::Should,
+                    map_bool_node(child, accent_insensitive, depth + 1)?,
+                ));
+            }
+            Ok(Query::Boolean { clauses })
+        }
+    }
+}
 
 /// text subtree (port of the host's fuzzy-text subquery builder): per-word fuzzy + prefix
 /// wildcard, plus one all-fields analyzer term per token. All Should.
@@ -1790,5 +1887,115 @@ mod tests {
             ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
             vec![0]
         );
+    }
+
+    fn term(p: &str) -> BoolNode {
+        BoolNode::Term(p.into())
+    }
+
+    fn phrase_leaf(words: &[&str]) -> Query {
+        Query::Phrase {
+            field: None,
+            terms: words.iter().map(|w| (*w).to_string()).collect(),
+            accent_insensitive: false,
+        }
+    }
+
+    #[test]
+    fn term_node_maps_to_an_all_fields_phrase() {
+        let q = map_bool_node(&term("mi laptop"), false, 0).unwrap();
+        assert_eq!(q, phrase_leaf(&["mi", "laptop"]));
+    }
+
+    #[test]
+    fn and_node_maps_children_to_must() {
+        let node = BoolNode::And(vec![term("uno"), term("dos")]);
+        let Query::Boolean { clauses } = map_bool_node(&node, false, 0).unwrap() else {
+            panic!("and debe mapear a Boolean");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses.iter().all(|(o, _)| *o == Occur::Must));
+    }
+
+    #[test]
+    fn or_node_maps_children_to_should() {
+        let node = BoolNode::Or(vec![term("uno"), term("dos")]);
+        let Query::Boolean { clauses } = map_bool_node(&node, false, 0).unwrap() else {
+            panic!("or debe mapear a Boolean");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses.iter().all(|(o, _)| *o == Occur::Should));
+    }
+
+    #[test]
+    fn not_child_of_an_and_becomes_the_parents_mustnot() {
+        // `foo AND NOT bar`: la negación se aplana como MustNot del AND padre, que es
+        // exactamente lo que eval_boolean sabe resolver (requerido menos excluido).
+        let node = BoolNode::And(vec![term("foo"), BoolNode::Not(Box::new(term("bar")))]);
+        let Query::Boolean { clauses } = map_bool_node(&node, false, 0).unwrap() else {
+            panic!("and debe mapear a Boolean");
+        };
+        let occurs: Vec<Occur> = clauses.iter().map(|(o, _)| *o).collect();
+        assert_eq!(occurs, vec![Occur::Must, Occur::MustNot]);
+        // y el MustNot envuelve la frase directamente, sin un Boolean intermedio
+        assert_eq!(clauses[1].1, phrase_leaf(&["bar"]));
+    }
+
+    #[test]
+    fn double_negation_cancels() {
+        // el parser de SD puede emitir `foo AND NOT NOT bar` (pasa requiresPositiveMatch).
+        // Sin normalizar, el MustNot de un Boolean vacío no excluye nada y la query
+        // colapsa a `foo`: un resultado INCORRECTO, más amplio que lo pedido.
+        let node = BoolNode::And(vec![
+            term("foo"),
+            BoolNode::Not(Box::new(BoolNode::Not(Box::new(term("bar"))))),
+        ]);
+        let Query::Boolean { clauses } = map_bool_node(&node, false, 0).unwrap() else {
+            panic!("and debe mapear a Boolean");
+        };
+        let occurs: Vec<Occur> = clauses.iter().map(|(o, _)| *o).collect();
+        assert_eq!(occurs, vec![Occur::Must, Occur::Must], "NOT NOT x == x");
+    }
+
+    #[test]
+    fn accent_flag_reaches_every_leaf() {
+        let node = BoolNode::And(vec![term("uno"), BoolNode::Or(vec![term("dos")])]);
+        let q = map_bool_node(&node, true, 0).unwrap();
+        assert!(
+            !format!("{q:?}").contains("accent_insensitive: false"),
+            "el flag tiene que llegar a TODAS las hojas: {q:?}"
+        );
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_cap_is_rejected() {
+        let mut node = term("hoja");
+        for _ in 0..40 {
+            node = BoolNode::And(vec![node]);
+        }
+        assert_eq!(map_bool_node(&node, false, 0), Err(QueryError::TreeTooDeep));
+    }
+
+    #[test]
+    fn negation_without_a_positive_term_yields_no_hits() {
+        // Decisión explícita (spec, 2026-08-11): NO se soporta ni se rechaza; devuelve vacío.
+        // Si algún día se agrega una hoja MatchAll, este test falla y hay que revisarlo.
+        let idx = corpus();
+        for node in [
+            BoolNode::Not(Box::new(term("fox"))),
+            BoolNode::Or(vec![BoolNode::Not(Box::new(term("fox")))]),
+            BoolNode::And(vec![
+                BoolNode::Not(Box::new(term("fox"))),
+                BoolNode::Not(Box::new(term("dog"))),
+            ]),
+            BoolNode::And(vec![]),
+            BoolNode::Or(vec![]),
+        ] {
+            let q = map_bool_node(&node, false, 0).unwrap();
+            assert!(
+                search(&idx, &q, 0.0, 10).is_empty(),
+                "la negación pura devuelve vacío, sin panic: {node:?}"
+            );
+        }
     }
 }
