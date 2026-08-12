@@ -2010,6 +2010,48 @@ mod tests {
     }
 
     #[test]
+    fn a_term_leaf_that_analyzes_to_zero_tokens_matches_nothing() {
+        // A `term` leaf whose phrase the analyzer reduces to zero tokens (no letters/digits/
+        // the punctuation the tokenizer keeps — see analysis.rs's TOKEN_RE) must behave like
+        // "match nothing", never "match everything": this is guaranteed today only by
+        // phrase_scores' `terms.is_empty()` early return, not by any check here.
+        //
+        // NB: not every punctuation-only string qualifies — `analyze("...")`/`analyze("---")`
+        // actually yield a ONE-token phrase (`.`/`-` are inside TOKEN_RE's char class, see
+        // `emits_punctuation_only_tokens` in analysis.rs), so those are non-empty leaves, not
+        // this case. `!` and `?` are outside the class, so they do reduce to zero tokens.
+        let idx = corpus();
+        for phrase in ["!!!", "???"] {
+            assert!(
+                crate::analysis::analyze(phrase).is_empty(),
+                "test premise: {phrase:?} must analyze to zero tokens"
+            );
+            let q = map_bool_node(&term(phrase), false, 0).unwrap();
+            let hits = search(&idx, &q, 0.0, 10);
+            assert!(
+                hits.is_empty(),
+                "an empty-token leaf {phrase:?} must match zero docs, not everything: {:?}",
+                ids(&hits)
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_token_leaf_does_not_widen_an_or() {
+        // An empty-token leaf next to a real leaf inside an `or` must contribute nothing to
+        // the union — the sibling's result set must stay exactly as narrow as it would alone.
+        let idx = corpus();
+        let with_empty_sibling =
+            map_bool_node(&BoolNode::Or(vec![term("!!!"), term("vpn")]), false, 0).unwrap();
+        let alone = map_bool_node(&term("vpn"), false, 0).unwrap();
+        assert_eq!(
+            ids(&search(&idx, &with_empty_sibling, 0.0, 10)),
+            ids(&search(&idx, &alone, 0.0, 10)),
+            "a zero-token sibling must not widen the or's result"
+        );
+    }
+
+    #[test]
     fn a_tree_replaces_the_free_text_subquery() {
         let mut p = params("texto que se ignora");
         p.boolean_tree = Some(BoolNode::And(vec![term("quick"), term("brown")]));
@@ -2041,10 +2083,20 @@ mod tests {
             values: vec!["open".into()],
             occur: Occur::Must,
         }];
+        p.in_groups = vec![InGroup {
+            field: "category".into(),
+            values: vec!["10".into()],
+        }];
         let Query::Boolean { clauses } = build_query(&p).unwrap() else {
             panic!("build_query devuelve un Boolean");
         };
-        assert_eq!(clauses.len(), 2, "árbol + where, ambos Must: {clauses:?}");
+        // árbol (1 Must) + where (1 Must) + in (todos los grupos IN colapsan en UNA sola
+        // cláusula Must, ver el comentario de build_query junto a `in_clauses`) = 3.
+        assert_eq!(
+            clauses.len(),
+            3,
+            "árbol + where + in, las 3 en Must: {clauses:?}"
+        );
         assert!(clauses.iter().all(|(o, _)| *o == Occur::Must));
     }
 

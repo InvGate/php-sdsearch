@@ -111,9 +111,13 @@ namespace SdSearch {
          *   `{"type":"and","children":[…]}`, `{"type":"or","children":[…]}`,
          *   `{"type":"not","child":{…}}` (singular), `{"type":"term","phrase":"…"}`.
          *   `where` / `in` / `range` / `match_all` / `sort` / paging still apply on top.
-         *   A negation with no positive term to subtract from (`NOT foo` at the root, a `not`
-         *   under an `or`, an `and` whose children are all `not`) returns NO hits — the engine
-         *   has no "every document" leaf. Nesting deeper than 32 levels THROWS.
+         *   A negated branch (`not`) contributes NO documents of its own — it only subtracts
+         *   from whatever it's ANDed against. So `or(not(x), y)` returns whatever `y` matches,
+         *   NOT zero: the negated branch drops out silently rather than failing the whole
+         *   `or`. Only a tree where NO branch contributes any positive match at all (`NOT foo`
+         *   at the root, an `and` whose children are all `not`, `children: []`) returns ZERO
+         *   hits — the engine has no "every document" leaf to subtract from. Nesting deeper
+         *   than 32 levels THROWS.
          * - `accent_insensitive` applies INSIDE a phrase (`impresion rota` also matches
          *   `impresión rota`). `synonyms` does NOT: a phrase is literal.
          *
@@ -227,6 +231,12 @@ namespace SdSearch {
          * - `prf.fields` (optional, default `[]`): source fields to harvest terms from;
          *   empty = all indexed fields.
          *
+         * `boolean_tree`/`exact_match` are NOT accepted here: pseudo-relevance feedback
+         * relaxes the base query to a should clause, so the tree would stop being a hard
+         * filter — passing either THROWS. Use {@see Engine::search()} instead. (`where` and
+         * `in` have the same underlying softening, but that is pre-existing `search()`
+         * behavior and out of scope here — only these two new knobs are rejected.)
+         *
          * Returns the same JSON hit array shape as {@see Engine::search()}. The result is a
          * RERANK of the augmented query, not strictly a superset of {@see Engine::search()}:
          * with a nonzero `min_score` or a limit that binds, `semantic_query` may omit hits
@@ -235,8 +245,8 @@ namespace SdSearch {
          * @param string $indexDir   Path to the ZSL index directory.
          * @param string $paramsJson JSON-encoded query parameters + optional `prf` object (see above).
          * @return string JSON-encoded array of hits (see {@see Engine::search()}).
-         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
-         *                    internal engine error.
+         * @throws \Exception on malformed params JSON, `boolean_tree`/`exact_match` present in
+         *                    the params, a missing/unreadable index, or an internal engine error.
          */
         public function semantic_query(string $indexDir, string $paramsJson): string {}
 
@@ -259,6 +269,12 @@ namespace SdSearch {
          * - `hybrid.k`: RRF constant; damps the weight of top ranks (canonical default 60).
          * - `hybrid.depth`: candidate pool fetched per retriever before fusion (0 = unlimited).
          *
+         * `boolean_tree`/`exact_match` are NOT accepted here: pseudo-relevance feedback
+         * relaxes the base query to a should clause, so the tree would stop being a hard
+         * filter — passing either THROWS. Use {@see Engine::search()} instead. (`where` and
+         * `in` have the same underlying softening, but that is pre-existing `search()`
+         * behavior and out of scope here — only these two new knobs are rejected.)
+         *
          * `min_score` is applied inside each retriever on its own native score scale before
          * fusion; `limit` truncates the fused result (`limit == 0` = unlimited). Each returned
          * hit's `score` is the RRF fused score (small, ~0.01-0.03 per matching retriever) and is
@@ -268,8 +284,8 @@ namespace SdSearch {
          * @param string $indexDir   Path to the ZSL index directory.
          * @param string $paramsJson JSON query params + optional `prf` and `hybrid` objects.
          * @return string JSON-encoded array of hits (see {@see Engine::search()}).
-         * @throws \Exception on malformed params JSON, a missing/unreadable index, or an
-         *                    internal engine error.
+         * @throws \Exception on malformed params JSON, `boolean_tree`/`exact_match` present in
+         *                    the params, a missing/unreadable index, or an internal engine error.
          */
         public function hybrid_query(string $indexDir, string $paramsJson): string {}
     }

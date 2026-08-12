@@ -208,15 +208,24 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 ] }
 ```
 
-A negation with no positive term to subtract from (`NOT foo` at the root, a `not` under an
-`or`, an `and` whose children are all `not`) returns NO hits — the engine has no "every
-document" leaf. Nesting deeper than 32 levels THROWS.
+A negated branch (`not`) contributes NO documents of its own — it only subtracts from
+whatever it's ANDed against. So `or(not(x), y)` returns whatever `y` matches, NOT zero: the
+negated branch drops out silently rather than failing the whole `or`. Only a tree where NO
+branch contributes any positive match at all (`NOT foo` at the root, an `and` whose children
+are all `not`, `children: []`) returns ZERO hits — the engine has no "every document" leaf to
+subtract from. Nesting deeper than 32 levels THROWS.
 
 `accent_insensitive` applies INSIDE a phrase (`impresion rota` also matches `impresión
 rota`). `synonyms` does NOT: a phrase is literal.
 
 `exact_match` is pure sugar for `boolean_tree: {"type":"term","phrase":<text>}`; the
 precedence is `boolean_tree` > `exact_match` > free text.
+
+`boolean_tree`/`exact_match` are NOT accepted by `Engine::semantic_query()` or
+`Engine::hybrid_query()`: pseudo-relevance feedback relaxes the base query to a should
+clause, so the tree would stop being a hard filter — passing either THROWS. Use `search()`
+instead. (`where` and `in` have the same underlying softening, but that is pre-existing
+`search()` behavior and out of scope here — only these two new knobs are rejected.)
 
 ### Response shape
 

@@ -380,6 +380,24 @@ fn occur_from(s: &str) -> Occur {
     }
 }
 
+/// Rejects `boolean_tree`/`exact_match` for the PRF-backed callers (`semantic_query`,
+/// `hybrid_query`). Both desugar the base query into ONE clause of a
+/// `Boolean[Should(base), Should(Boosted(feedback))]` (see `prf::search_prf`), so a `Must`/
+/// `MustNot` inside the tree stops being a hard filter — a `NOT` can come back in the
+/// results. `where`/`in` have the same pre-existing softening and are intentionally left
+/// alone (out of scope: changing their semantics now would break callers already relying on
+/// them); this only closes the door on the two NEW knobs this branch adds.
+fn reject_tree_and_exact_for_prf(dto: &ParamsDto, caller: &str) -> Result<(), String> {
+    if dto.boolean_tree.is_some() || dto.exact_match {
+        return Err(format!(
+            "sdsearch: boolean_tree/exact_match are not supported by {caller}: \
+             pseudo-relevance feedback relaxes the base query to a should clause, so the \
+             tree would stop being a hard filter — use search() instead"
+        ));
+    }
+    Ok(())
+}
+
 /// Maps the shared search DTO into core `QueryParams` (used by both `run` and `run_semantic`).
 /// Takes `dto` by value and moves its fields — callers that still need `dto.min_score` /
 /// `dto.limit` afterward must read those (both `Copy`) before calling this.
@@ -511,6 +529,7 @@ fn run(index_dir: &str, params_json: &str) -> Result<String, String> {
 fn run_semantic(index_dir: &str, params_json: &str) -> Result<String, String> {
     let dto: SemanticParamsDto =
         serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    reject_tree_and_exact_for_prf(&dto.base, "semantic_query")?;
     let min_score = dto.base.min_score;
     let limit = dto.base.limit;
     let params = query_params_from(dto.base)?;
@@ -531,6 +550,7 @@ fn run_semantic(index_dir: &str, params_json: &str) -> Result<String, String> {
 fn run_hybrid(index_dir: &str, params_json: &str) -> Result<String, String> {
     let dto: HybridParamsDto =
         serde_json::from_str(params_json).map_err(|e| format!("sdsearch: bad params json: {e}"))?;
+    reject_tree_and_exact_for_prf(&dto.base, "hybrid_query")?;
     let min_score = dto.base.min_score;
     let limit = dto.base.limit;
     let params = query_params_from(dto.base)?;

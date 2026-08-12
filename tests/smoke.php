@@ -93,4 +93,21 @@ if (\count($andNot['hits']) >= \count($or['hits'])) {
 \fwrite(\STDOUT, "search boolean_tree OK: or=" . \count($or['hits'])
     . " andNot=" . \count($andNot['hits']) . "\n");
 
+// smoke test: hybrid_query rejects boolean_tree (and, by the same code path, exact_match).
+// PRF relaxes the base query into a "should" clause, so a NOT inside the tree stops being a
+// hard filter — hybrid_query/semantic_query must throw rather than silently soften it.
+$rejected = false;
+try {
+    $engine->hybrid_query($indexDir, \json_encode([
+        'boolean_tree' => ['type' => 'term', 'phrase' => 'vpn'],
+    ]));
+} catch (\Throwable $e) {
+    $rejected = true;
+}
+if (!$rejected) {
+    \fwrite(\STDERR, "FAIL: hybrid_query with boolean_tree did not throw\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "hybrid_query boolean_tree rejection OK\n");
+
 exit(0);
