@@ -121,7 +121,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p sdsearch-php --release
       - name: Smoke test (extension loads + sdsearch_version)
-        run: php -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
+        run: php -n -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
       - name: Stage Linux artifact
         run: |
           mkdir -p dist/linux
@@ -151,7 +151,7 @@ jobs:
           version: "18.1"
       - run: cargo build -p sdsearch-php --release
       - name: Smoke test (extension loads + sdsearch_version)
-        run: php -d extension="${{ github.workspace }}\target\release\sdsearch.dll" tests\smoke.php
+        run: php -n -d extension="${{ github.workspace }}\target\release\sdsearch.dll" tests\smoke.php
       - name: Stage Windows artifact
         shell: pwsh
         run: |

@@ -32,8 +32,12 @@ If you touch `sdsearch-php`, also build and smoke-test the extension:
 
 ```bash
 cargo build -p sdsearch-php --release
-php -d extension=$(pwd)/target/release/libsdsearch.so tests/smoke.php
+php -n -d extension=$(pwd)/target/release/libsdsearch.so tests/smoke.php
 ```
+
+`-n` skips the machine's `php.ini`. Without it, a `sdsearch.so` installed at the system level
+(e.g. for benchmarking) auto-loads from that ini and the smoke test silently runs against the
+*old* extension instead of the one you just built.
 
 ## Testing against the ZSL oracle (optional, local-only)
 

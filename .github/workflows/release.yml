@@ -39,7 +39,7 @@ jobs:
           version: "18.1"
       - run: cargo build -p sdsearch-php --release
       - name: Smoke test (extension loads + sdsearch_version)
-        run: php -d extension="${{ github.workspace }}\target\release\sdsearch.dll" tests\smoke.php
+        run: php -n -d extension="${{ github.workspace }}\target\release\sdsearch.dll" tests\smoke.php
       - name: Stage artifact
         shell: pwsh
         run: |
@@ -69,7 +69,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p sdsearch-php --release
       - name: Smoke test (extension loads + sdsearch_version)
-        run: php -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
+        run: php -n -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
       - name: Stage artifact
         run: |
           mkdir -p dist
@@ -115,7 +115,7 @@ jobs:
           php -v | grep -q '8\.4\.' || { echo "::error::expected PHP 8.4"; exit 1; }
       - run: cargo build -p sdsearch-php --release
       - name: Smoke test (extension loads + sdsearch_version)
-        run: php -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
+        run: php -n -d extension="$(pwd)/target/release/libsdsearch.so" tests/smoke.php
       - name: Stage artifact
         run: |
           mkdir -p dist
