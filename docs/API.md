@@ -186,6 +186,37 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 | `similarity` | string | Optional scoring algorithm: `"bm25"` (default) or `"tfidf"`. Unknown value → error. As of 0.2.0 BM25 is the default ranking; pass `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25. |
 | `wildcard_min_prefix` | int | Optional (default `2`). Minimum literal-prefix length before the first `*`/`?` in the free-text wildcard leaf, so a short single-word query does not scan the whole vocabulary. Pass `0`/`1` for typeahead surfaces. Changed in 0.3.0: previously always `0`. |
 | `synonyms` | bool | Optional (default `false`). When `true`, each query token is also matched against its bundled synonyms and cross-lingual (ES↔EN) translations, each added as a down-weighted `should` clause. See "Bundled data / attribution" below. |
+| `exact_match` | bool | Optional (default `false`). When `true`, `text` is matched as an exact PHRASE — the words must appear adjacent and in order inside a single field — instead of the default fuzzy/prefix/OR bag. The phrase must occur in at least ONE indexed field; it never spans two fields. No stemming and no slop: `"impresora rota"` does not match `"rota la impresora"` nor `"impresoras rotas"`. Ignored when `boolean_tree` is set. An empty `text` makes it a no-op. |
+| `boolean_tree` | object | Optional. A nested AND/OR/NOT expression whose leaves are phrases. When present it REPLACES the free-text sub-query — `text` no longer participates in matching (callers still use it for highlighting). `where` / `in` / `range` / `match_all` / `sort` / paging still apply on top. See "Boolean tree queries" below. |
+
+### Boolean tree queries
+
+`boolean_tree` node shapes — `and`/`or` carry `children`, `not` carries a single `child`
+(singular), `term` carries a `phrase`:
+
+```json
+{ "type": "and", "children": [
+    { "type": "term", "phrase": "impresora rota" },
+    { "type": "not", "child": { "type": "term", "phrase": "garantia" } }
+] }
+```
+
+```json
+{ "type": "or", "children": [
+    { "type": "term", "phrase": "vpn" },
+    { "type": "term", "phrase": "acceso remoto" }
+] }
+```
+
+A negation with no positive term to subtract from (`NOT foo` at the root, a `not` under an
+`or`, an `and` whose children are all `not`) returns NO hits — the engine has no "every
+document" leaf. Nesting deeper than 32 levels THROWS.
+
+`accent_insensitive` applies INSIDE a phrase (`impresion rota` also matches `impresión
+rota`). `synonyms` does NOT: a phrase is literal.
+
+`exact_match` is pure sugar for `boolean_tree: {"type":"term","phrase":<text>}`; the
+precedence is `boolean_tree` > `exact_match` > free text.
 
 ### Response shape
 

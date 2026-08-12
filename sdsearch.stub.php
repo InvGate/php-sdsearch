@@ -53,7 +53,9 @@ namespace SdSearch {
          *   "similarity": "bm25",
          *   "wildcard_min_prefix": 2,
          *   "sort": "created_at_key",
-         *   "sort_dir": "desc"
+         *   "sort_dir": "desc",
+         *   "exact_match": false,
+         *   "boolean_tree": null
          * }
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
@@ -97,6 +99,23 @@ namespace SdSearch {
          * - `offset` (optional, default `0`): number of leading hits to skip (pagination).
          * - `track_total_hits` (optional, default `1001`): integer caps the reported `total`
          *   at that value; `true` = exact count; `false` = omit `total`. Default caps at 1001.
+         * - `exact_match` (optional, default `false`): when `true`, `text` is matched as an exact
+         *   PHRASE — the words must appear adjacent and in order inside a single field — instead
+         *   of the default fuzzy/prefix/OR bag. The phrase must occur in at least ONE indexed
+         *   field; it never spans two fields. No stemming and no slop: `"impresora rota"` does not
+         *   match `"rota la impresora"` nor `"impresoras rotas"`. Ignored when `boolean_tree` is
+         *   set. An empty `text` makes it a no-op.
+         * - `boolean_tree` (optional): a nested AND/OR/NOT expression whose leaves are phrases.
+         *   When present it REPLACES the free-text sub-query — `text` no longer participates in
+         *   matching (callers still use it for highlighting). Node shapes:
+         *   `{"type":"and","children":[…]}`, `{"type":"or","children":[…]}`,
+         *   `{"type":"not","child":{…}}` (singular), `{"type":"term","phrase":"…"}`.
+         *   `where` / `in` / `range` / `match_all` / `sort` / paging still apply on top.
+         *   A negation with no positive term to subtract from (`NOT foo` at the root, a `not`
+         *   under an `or`, an `and` whose children are all `not`) returns NO hits — the engine
+         *   has no "every document" leaf. Nesting deeper than 32 levels THROWS.
+         * - `accent_insensitive` applies INSIDE a phrase (`impresion rota` also matches
+         *   `impresión rota`). `synonyms` does NOT: a phrase is literal.
          *
          * The return value is a JSON object: the `hits` array plus pagination metadata:
          * ```json

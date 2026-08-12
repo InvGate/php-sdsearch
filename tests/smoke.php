@@ -51,4 +51,46 @@ if (!\is_array($decodedSynonyms) || !\is_array($decodedSynonyms['hits'] ?? null)
 }
 \fwrite(\STDOUT, "search synonyms OK: " . \count($decodedSynonyms['hits']) . " hits\n");
 
+// smoke test: exact_match y boolean_tree marshallan por serde y llegan al motor. Igual que
+// el chequeo de synonyms de arriba, esto no asegura un ranking: prueba que las dos llaves
+// nuevas hacen round-trip por el borde PHP (sdsearch-php es cdylib, 0 unit tests) y que el
+// árbol acota de verdad — AND NOT no puede devolver más hits que el OR de las mismas hojas.
+// Términos elegidos contra la fixture real: "vpn" matchea 2 docs ("alpha vpn guide",
+// "gamma vpn tutorial"); "guide" matchea solo 1 de esos ("alpha vpn guide"), un subconjunto
+// propio de "vpn" — así OR(vpn,guide)=2 y AND(vpn, NOT guide)=1 son distintos de verdad.
+$exact = \json_decode($engine->search($indexDir, \json_encode([
+    'text' => 'vpn',
+    'exact_match' => true,
+])), true);
+if (!\is_array($exact['hits'] ?? null)) {
+    \fwrite(\STDERR, "FAIL: search with exact_match=true did not return the {hits,...} envelope\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "search exact_match OK: " . \count($exact['hits']) . " hits\n");
+
+$or = \json_decode($engine->search($indexDir, \json_encode([
+    'boolean_tree' => ['type' => 'or', 'children' => [
+        ['type' => 'term', 'phrase' => 'vpn'],
+        ['type' => 'term', 'phrase' => 'guide'],
+    ]],
+    'limit' => 50,
+])), true);
+$andNot = \json_decode($engine->search($indexDir, \json_encode([
+    'boolean_tree' => ['type' => 'and', 'children' => [
+        ['type' => 'term', 'phrase' => 'vpn'],
+        ['type' => 'not', 'child' => ['type' => 'term', 'phrase' => 'guide']],
+    ]],
+    'limit' => 50,
+])), true);
+if (!\is_array($or['hits'] ?? null) || !\is_array($andNot['hits'] ?? null)) {
+    \fwrite(\STDERR, "FAIL: search with boolean_tree did not return the {hits,...} envelope\n");
+    exit(1);
+}
+if (\count($andNot['hits']) >= \count($or['hits'])) {
+    \fwrite(\STDERR, "FAIL: boolean_tree AND-NOT did not return fewer hits than the OR of the same leaves\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "search boolean_tree OK: or=" . \count($or['hits'])
+    . " andNot=" . \count($andNot['hits']) . "\n");
+
 exit(0);

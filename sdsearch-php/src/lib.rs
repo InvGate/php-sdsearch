@@ -13,7 +13,7 @@ use sdsearch_core::hybrid::HybridParams;
 use sdsearch_core::mlt::{MinShouldMatch, MltParams, RangeFilter};
 use sdsearch_core::prf::PrfParams;
 use sdsearch_core::query::{
-    InGroup, MatchAllFilter, Occur, Query, QueryParams, RangeFilter as SearchRangeFilter,
+    BoolNode, InGroup, MatchAllFilter, Occur, Query, QueryParams, RangeFilter as SearchRangeFilter,
     WhereGroup, build_query, search,
 };
 use sdsearch_core::score::Similarity;
@@ -50,6 +50,34 @@ struct MatchAllDto {
     field: String,
     text: String,
 }
+
+/// One node of the host's boolean expression tree, in the EXACT shape
+/// `IBooleanNode::toSearchArray()` emits: `and`/`or` carry `children`, `not` carries a single
+/// `child` (singular), `term` carries a `phrase`. The host adapter forwards it verbatim.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum BoolNodeDto {
+    And { children: Vec<BoolNodeDto> },
+    Or { children: Vec<BoolNodeDto> },
+    Not { child: Box<BoolNodeDto> },
+    Term { phrase: String },
+}
+
+impl From<BoolNodeDto> for BoolNode {
+    fn from(d: BoolNodeDto) -> Self {
+        match d {
+            BoolNodeDto::And { children } => {
+                BoolNode::And(children.into_iter().map(Into::into).collect())
+            }
+            BoolNodeDto::Or { children } => {
+                BoolNode::Or(children.into_iter().map(Into::into).collect())
+            }
+            BoolNodeDto::Not { child } => BoolNode::Not(Box::new((*child).into())),
+            BoolNodeDto::Term { phrase } => BoolNode::Term(phrase),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ParamsDto {
     #[serde(default)]
@@ -97,6 +125,14 @@ struct ParamsDto {
     /// optional: `"asc"` or `"desc"`. Omitted = `"desc"` (OpenSearch-adapter parity).
     #[serde(default)]
     sort_dir: Option<String>,
+    /// optional: treat `text` as an exact phrase instead of the fuzzy/prefix/OR bag.
+    /// Pure sugar for `boolean_tree: {"type":"term","phrase":<text>}`; ignored when
+    /// `boolean_tree` is also set (host precedence: tree > exact > full text).
+    #[serde(default)]
+    exact_match: bool,
+    /// optional: boolean expression tree; when present it REPLACES the free-text subquery.
+    #[serde(default)]
+    boolean_tree: Option<BoolNodeDto>,
 }
 #[derive(Serialize)]
 struct HitDto {
@@ -358,6 +394,12 @@ fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
         }
     };
     let sort = sort_spec_from(dto.sort, dto.sort_dir.as_deref())?;
+    // host precedence: an explicit tree wins; otherwise `exact_match` desugars into a
+    // single term node so the core only ever sees one concept. Empty text with
+    // exact_match on is not a phrase — fall through to the normal empty-query handling.
+    let boolean_tree = dto.boolean_tree.map(Into::into).or_else(|| {
+        (dto.exact_match && !dto.text.trim().is_empty()).then(|| BoolNode::Term(dto.text.clone()))
+    });
     Ok(QueryParams {
         text: dto.text,
         where_groups: dto
@@ -402,7 +444,7 @@ fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
         field_weights: dto.field_weights,
         similarity,
         sort,
-        boolean_tree: None,
+        boolean_tree,
     })
 }
 
