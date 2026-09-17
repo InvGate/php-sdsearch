@@ -1168,6 +1168,54 @@ mod tests {
     }
 
     #[test]
+    fn build_query_where_ors_within_a_field_and_ands_between_fields() {
+        // Invariante del que depende traducir un in() AND-eado a where(): los valores de UN
+        // where group son Should entre sí (OR), y el grupo entero entra como Must (AND entre
+        // campos). Nunca `type=1 AND type=2`, que no matchearía nada. Es la misma forma que
+        // arma Zend (Boolean por campo, sign null por valor -> unión; sign true al grupo) y que
+        // arma ES/OpenSearch (un `terms` por campo dentro de bool.filter).
+        let mut idx = MemoryIndex::new();
+        for (title, ty, st) in [("vpn guide", "1", "4"), ("vpn setup", "2", "9")] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("type_key", ty, FieldKind::Keyword);
+            d.add("status_key", st, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        let group = |field: &str, values: &[&str]| WhereGroup {
+            field: field.into(),
+            values: values.iter().map(|v| (*v).to_string()).collect(),
+            occur: Occur::Must,
+        };
+
+        // OR adentro del campo: los dos docs pasan, ninguno tiene type 1 Y 2 a la vez.
+        let mut p = params("vpn");
+        p.where_groups = vec![group("type", &["1", "2"])];
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            vec![0, 1],
+            "los valores de un where group son OR, no AND"
+        );
+
+        // AND entre campos: type in (1,2) AND status in (4) => sólo doc0.
+        let mut p = params("vpn");
+        p.where_groups = vec![group("type", &["1", "2"]), group("status", &["4"])];
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            vec![0],
+            "dos where groups AND-ean"
+        );
+
+        // y el AND es real: un status que no matchea ningún doc vacía el resultado.
+        let mut p = params("vpn");
+        p.where_groups = vec![group("type", &["1", "2"]), group("status", &["7"])];
+        assert!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)).is_empty(),
+            "el segundo where group filtra de verdad"
+        );
+    }
+
+    #[test]
     fn build_query_empty_is_error() {
         assert!(matches!(build_query(&params("")), Err(QueryError::Empty)));
     }
@@ -1226,6 +1274,43 @@ mod tests {
         assert!(
             !query_mentions_field(&q, "id_key_key"),
             "IN must not duplicate _key"
+        );
+    }
+
+    #[test]
+    fn build_query_ors_in_groups_across_distinct_fields() {
+        // Dos in() sobre campos DISTINTOS se combinan con OR, no con AND: todos los grupos IN
+        // colapsan en un único Boolean de Shoulds agregado una sola vez como Must (ver el
+        // comentario junto a `in_clauses`). Es la semántica de Zend_Search_Lucene
+        // (ZendLucene::addQueriesIn arma UN MultiTerm con occur=null) y la espejamos a propósito:
+        // la búsqueda de KB filtra visibility_type y responsible con in() separados y depende de
+        // ese OR. El corpus discrimina las cuatro hipótesis: OR -> [0,1]; AND -> []; sólo el
+        // primer in -> [0]; sólo el último -> [1].
+        let mut idx = MemoryIndex::new();
+        for (title, ty, resp) in [("vpn guide", "8", "100"), ("vpn setup", "5", "101")] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("type_key", ty, FieldKind::Keyword);
+            d.add("responsible_key", resp, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+
+        let mut p = params("vpn");
+        p.in_groups = vec![
+            InGroup {
+                field: "type".into(),
+                values: vec!["8".into()],
+            },
+            InGroup {
+                field: "responsible".into(),
+                values: vec!["101".into()],
+            },
+        ];
+        let q = build_query(&p).unwrap();
+        assert_eq!(
+            ids(&search(&idx, &q, 0.0, 100)),
+            vec![0, 1],
+            "los grupos IN OR-ean entre campos distintos, no AND-ean"
         );
     }
 
