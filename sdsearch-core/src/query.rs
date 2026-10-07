@@ -2067,7 +2067,10 @@ mod tests {
 
         // query the Spanish term; without synonyms it must NOT match
         let mut p = params("impresora");
-        assert!(ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)).is_empty());
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            Vec::<usize>::new()
+        );
 
         // with synonyms on, "impresora" expands to "printer" and reaches the doc
         p.synonyms = true;

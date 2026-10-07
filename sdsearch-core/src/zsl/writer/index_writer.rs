@@ -551,7 +551,7 @@ mod tests {
         w.delete_document(9999); // outside [0, 20) -> no-op
         let rep = w.commit().unwrap();
         assert_eq!(rep.doc_count, 0);
-        assert!(rep.segments.is_empty());
+        assert_eq!(rep.segments, Vec::<String>::new());
         assert_eq!(rep.generation, 6); // KB generation unchanged (no effective delete)
         assert!(!dir.join("segments_7").exists());
         assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 20);
@@ -599,7 +599,7 @@ mod tests {
         w2.delete_document(20); // segment _3, local id 0 (first flushed doc)
         let rep2 = w2.commit().unwrap();
         assert_eq!(rep2.doc_count, 0); // no new docs, only deletes
-        assert!(rep2.segments.is_empty());
+        assert_eq!(rep2.segments, Vec::<String>::new());
 
         // the deletion must be reflected: 2 fewer live docs, no more no less.
         let idx = ZslIndex::open(&dir).unwrap();
@@ -1009,7 +1009,7 @@ mod tests {
         let w = IndexWriter::open(&dir, WriterOpts::default()).unwrap();
         let rep = w.commit().unwrap();
         assert_eq!(rep.doc_count, 0);
-        assert!(rep.segments.is_empty());
+        assert_eq!(rep.segments, Vec::<String>::new());
         assert_eq!(rep.generation, 6); // KB generation unchanged
         assert!(!dir.join("segments_7").exists());
         assert_eq!(ZslIndex::open(&dir).unwrap().num_docs(), 20);

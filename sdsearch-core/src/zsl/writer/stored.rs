@@ -259,6 +259,9 @@ mod tests {
             }]
         );
         // out-of-range doc → empty
-        assert!(read_stored_raw(&fdx, &fdt, 9).unwrap().is_empty());
+        assert_eq!(
+            read_stored_raw(&fdx, &fdt, 9).unwrap(),
+            Vec::<StoredRaw>::new()
+        );
     }
 }
