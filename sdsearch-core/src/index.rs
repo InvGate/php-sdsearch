@@ -52,6 +52,16 @@ pub trait IndexReader {
     fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
         self.stored_fields(doc_id).remove(field)
     }
+    /// Every doc's numeric value of `field` (index = doc id in `0..total_docs()`, `None` = the
+    /// doc has no value), read from the field's TERMS instead of its stored values: a few MB of
+    /// `.tis`/`.frq` instead of one `.fdt` read per doc. `None` overall = this reader cannot say
+    /// what `stored_value` would, and the caller must use that: the default, a stored-only field,
+    /// a non-numeric value, or a doc with more than one value (`stored_value` keeps the first in
+    /// write order; terms have no write order).
+    fn numeric_sort_values(&self, field: &str) -> Option<Vec<Option<i64>>> {
+        let _ = field;
+        None
+    }
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String>;
     /// Like `terms_with_prefix`, but returns at most `limit` terms (lexicographic-first).
     /// The default collects then truncates; the on-disk ZSL readers override it to stop the

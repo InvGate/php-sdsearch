@@ -34,11 +34,15 @@ breaking change bumps the **minor** version.
 
 ### Changed
 
-- A field-sorted `search()` reads each match's sort value in doc-id order instead of hash
-  order, so on a cold page cache the `.fdt` faults are sequential and readahead batches them.
-  On a 1 GB index with 42k matches: cold 1.6 s → 1.4 s, warm 0.21 s → 0.13 s. The first
-  sorted query on a cold cache is still paid; the value lives in the `.fdt` next to each
-  doc's full text.
+- **A field-sorted `search()` no longer pays a cold-cache spike on many matches.** Each match's
+  sort value used to be read from the `.fdt`, next to that doc's full text, so the first sorted
+  query on a cold page cache touched most of the file (1.5 s on a 1 GB index with 42k matches;
+  ~5 s reported on a 1.5 GB one). From ~1/128 of the index in matches, the numeric sort field
+  is now read once from its terms (a few MB, ~25 ms for 135k docs) into a per-query table:
+  that query now takes 0.13 s cold and 0.12 s warm (was 0.19 s), with identical results.
+  Fewer matches keep the per-match reads, now in doc-id order so readahead batches them. A
+  stored-only, non-numeric or multi-valued sort field always uses the per-match reads. Works
+  on existing Zend-written indexes; nothing is persisted.
 
 ### Fixed
 

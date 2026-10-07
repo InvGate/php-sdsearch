@@ -548,15 +548,33 @@ pub(crate) fn finalize_paged(
     }
 }
 
+/// Matches per index doc at which reading the sort field once from its terms beats reading each
+/// match's stored value (see `finalize_sorted`).
+// ponytail: one fixed fraction, measured on one 135k-doc index on NVMe. The table breaks even at
+// ~10k matches warm (~25 ms build vs ~2.5 µs per stored read) and at ~130 cold (~0.2 ms per
+// read). 1/128 (~1k matches here) sits between: 1,932 matches went 0.51 s -> 0.12 s cold and
+// 0.03 s -> 0.05 s warm. Re-measure on the deploy hardware if sorted queries regress.
+const TABLE_MIN_MATCH_FRACTION: usize = 128;
+
+fn worth_a_table(matches: usize, total_docs: usize) -> bool {
+    matches > 0 && matches >= total_docs / TABLE_MIN_MATCH_FRACTION
+}
+
 /// Field-sorted counterpart of `finalize_paged`: same filtering, paging and total semantics, but
 /// ordered by a field's value instead of by score.
 ///
-/// Walks the MATCHED docs (never the sort field's term dictionary) and resolves each one's value
-/// with `stored_value`, feeding a heap bounded to `offset + limit`. So:
-/// - the sort path performs ZERO term-dictionary lookups — no `terms_in_range`, no `doc_freq`,
-///   no per-term pre-pass. That is deliberate: an ordered term walk over a near-unique field
-///   measured 4.2 s at 500k docs, and it is paid up front regardless of how few docs match;
-/// - retained memory is `K' = offset + limit` entries, not one per match;
+/// Walks the MATCHED docs and resolves each one's value, feeding a heap bounded to
+/// `offset + limit`. Where the value comes from depends on how many docs matched:
+/// - few: `stored_value`, one `.fdt` read per match. Cheap per doc warm (~2.5 µs), but each read
+///   lands next to that doc's full text, so on a cold page cache 42k matches touch most of an
+///   877 MB `.fdt` (1.4 s on a 1 GB index);
+/// - many (`worth_a_table`): `numeric_sort_values`, the whole field read once from its terms —
+///   a few MB of `.tis`/`.frq`, ~25 ms for 135k docs warm or cold — then an array lookup per
+///   match. It costs the same however few docs match, hence the threshold. A reader that cannot
+///   build one (stored-only, non-numeric or multi-valued field) falls back to `stored_value`;
+/// - never the generic dictionary API (`terms_in_range`, `doc_freq`, per-term `info`): walking a
+///   near-unique field through it measured 4.2 s at 500k docs;
+/// - retained memory is `K' = offset + limit` entries, plus the table (16 B per doc) when used;
 /// - `min_score` is applied BEFORE the value lookup, so filtered-out docs never touch the `.fdt`.
 ///
 /// `limit == usize::MAX` (the runner's "unlimited") makes the bound vacuous and the heap retains
@@ -577,14 +595,18 @@ pub(crate) fn finalize_sorted(
     let mut heap: BinaryHeap<SortEntry> = BinaryHeap::new();
     let mut count = 0usize;
 
-    // `scored` arrives in hash order. On a cold page cache every `stored_value` below is a page
-    // fault in the .fdt; walking in doc-id order makes those faults ascending, so the kernel's
-    // readahead batches them instead of seeking at random. Measured on a 1 GB index, 42k
-    // matches: cold 1.6 s -> 1.4 s, warm 0.21 s -> 0.13 s. The floor is the .fdt itself: the
-    // value sits next to each doc's full text. The heap's tiebreak is by id, so the walk order
-    // never changes the result.
     let mut scored: Vec<(usize, f32)> = scored.into_iter().collect();
-    scored.sort_unstable_by_key(|&(id, _)| id);
+    // decided on the pre-`min_score` count: it only picks where values come from, never results
+    let table = (want > 0 && worth_a_table(scored.len(), index.total_docs()))
+        .then(|| index.numeric_sort_values(&sort.field))
+        .flatten();
+    if table.is_none() {
+        // `scored` arrives in hash order. On a cold page cache every `stored_value` below is a
+        // page fault in the .fdt; walking in doc-id order makes those faults ascending, so the
+        // kernel's readahead batches them instead of seeking at random (1.6 s -> 1.4 s cold on
+        // 42k matches). The heap's tiebreak is by id, so the walk order never changes the result.
+        scored.sort_unstable_by_key(|&(id, _)| id);
+    }
 
     for (id, score) in scored {
         if score < min_score {
@@ -595,8 +617,16 @@ pub(crate) fn finalize_sorted(
         if want == 0 {
             continue;
         }
+        let key = match &table {
+            Some(t) => t
+                .get(id)
+                .copied()
+                .flatten()
+                .map_or(SortKey::Missing, SortKey::Num),
+            None => SortKey::from_stored(index.stored_value(id, &sort.field)),
+        };
         let entry = SortEntry {
-            key: SortKey::from_stored(index.stored_value(id, &sort.field)),
+            key,
             id,
             score,
             ascending: sort.ascending,
@@ -1388,8 +1418,9 @@ mod tests {
 
     /// Pins the SHAPE of `finalize_sorted`'s reader access, so a refactor cannot quietly change
     /// the cost model. Two regressions this guards against are not hypothetical: an ordered term
-    /// walk over the sort field measured 4.2 s at 500k docs, and a per-term `doc_freq` pre-pass
-    /// cost a 1.9x regression in the range work.
+    /// walk over the sort field through the generic dictionary API measured 4.2 s at 500k docs,
+    /// and a per-term `doc_freq` pre-pass cost a 1.9x regression in the range work. The value
+    /// table may only come through `numeric_sort_values` (one forward decode per segment).
     ///
     /// Every method sort must NEVER reach is `unreachable!` rather than counted. That is a
     /// stronger assertion than comparing a counter to zero — it covers the whole surface instead
@@ -1398,6 +1429,7 @@ mod tests {
     /// absence from a coverage report is the property being asserted, not a gap in testing.
     struct CountingIndex {
         inner: MemoryIndex,
+        table: Option<Vec<Option<i64>>>,
         stored_value_calls: std::cell::RefCell<Vec<usize>>,
         stored_fields_calls: std::cell::Cell<usize>,
     }
@@ -1406,14 +1438,28 @@ mod tests {
         fn new(inner: MemoryIndex) -> CountingIndex {
             CountingIndex {
                 inner,
+                table: None,
                 stored_value_calls: std::cell::RefCell::new(Vec::new()),
                 stored_fields_calls: std::cell::Cell::new(0),
+            }
+        }
+        fn with_table(inner: MemoryIndex, table: Vec<Option<i64>>) -> CountingIndex {
+            CountingIndex {
+                table: Some(table),
+                ..CountingIndex::new(inner)
             }
         }
     }
 
     impl IndexReader for CountingIndex {
-        // --- the only two the sort path may use ---
+        // --- the only ones the sort path may use ---
+        fn numeric_sort_values(&self, _field: &str) -> Option<Vec<Option<i64>>> {
+            self.table.clone()
+        }
+        fn total_docs(&self) -> usize {
+            // a count the reader holds, not a statistic over postings: the table threshold
+            self.inner.num_docs()
+        }
         fn stored_value(&self, doc_id: usize, field: &str) -> Option<String> {
             self.stored_value_calls.borrow_mut().push(doc_id);
             self.inner.stored_value(doc_id, field)
@@ -1480,6 +1526,28 @@ mod tests {
         // That this test reached its end at all is the dictionary assertion: every term-dictionary
         // method of `CountingIndex` is `unreachable!`, so an ordered walk or a doc_freq pre-pass
         // would have panicked above rather than merely bumped a counter.
+    }
+
+    #[test]
+    fn finalize_sorted_over_many_matches_reads_the_table_not_the_stored_values() {
+        // d_key per doc in `sortable`: 20, 3, 20, (none), 3, 100
+        let table = vec![Some(20), Some(3), Some(20), None, Some(3), Some(100)];
+        for ascending in [true, false] {
+            let (inner, scored) = sortable();
+            let direct = CountingIndex::new(inner);
+            let expected =
+                finalize_sorted(&direct, scored, 0.0, &spec("d_key", ascending), 0, 10, None);
+
+            let (inner, scored) = sortable();
+            let idx = CountingIndex::with_table(inner, table.clone());
+            let out = finalize_sorted(&idx, scored, 0.0, &spec("d_key", ascending), 0, 10, None);
+            assert_eq!(ids(&out), ids(&expected), "ascending={ascending}");
+            assert_eq!(
+                *idx.stored_value_calls.borrow(),
+                Vec::<usize>::new(),
+                "no per-match .fdt read once the table is in hand"
+            );
+        }
     }
 
     #[test]

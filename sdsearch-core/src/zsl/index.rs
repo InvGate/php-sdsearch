@@ -63,6 +63,17 @@ impl IndexReader for ZslIndex {
             .is_some_and(|(e, local)| e.seg.is_deleted(local))
     }
 
+    /// The segments' tables back to back: segment `i`'s local doc `d` is global `base + d`, and
+    /// each table is exactly `max_doc` long. One segment that cannot answer sinks the whole
+    /// table, so the caller falls back to `stored_value` for every doc rather than mixing paths.
+    fn numeric_sort_values(&self, field: &str) -> Option<Vec<Option<i64>>> {
+        let mut table = Vec::with_capacity(self.total_docs);
+        for e in &self.entries {
+            table.extend(e.seg.numeric_sort_values(field)?);
+        }
+        Some(table)
+    }
+
     fn doc_freq(&self, field: &str, term: &str) -> usize {
         self.entries
             .iter()

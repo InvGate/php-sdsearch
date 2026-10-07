@@ -296,6 +296,27 @@ impl IndexReader for ZslSegment {
         .unwrap_or_default()
     }
 
+    fn numeric_sort_values(&self, field: &str) -> Option<Vec<Option<i64>>> {
+        let mut table = vec![None; self.max_doc()];
+        match self.fields.iter().find(|fi| fi.name == field) {
+            None => return Some(table), // not in this segment: every doc here has no value
+            Some(fi) if !fi.is_indexed => return None, // stored-only: no terms to read
+            Some(_) => {}
+        }
+        // degrade like `postings_for`: a missing/corrupt .frq means "use the stored values"
+        let frq = self.cfs.sub(&self.frq_name)?;
+        for (text, info) in self.dict.field_terms(field) {
+            let value = text.parse::<i64>().ok()?;
+            // postings are delete-agnostic on purpose: callers only look up live (matched) docs
+            for (doc, _) in read_freqs(frq, &info).ok()? {
+                if table.get_mut(doc)?.replace(value).is_some() {
+                    return None; // a second value: only `stored_value` knows which came first
+                }
+            }
+        }
+        Some(table)
+    }
+
     fn terms_with_prefix(&self, field: &str, prefix: &str) -> Vec<String> {
         let mut out = self.dict.terms_with_prefix(field, prefix);
         out.sort();
