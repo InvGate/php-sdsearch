@@ -62,6 +62,11 @@ namespace SdSearch {
          * ```
          * - `where[].occur` is one of `"must"`, `"mustnot"`, `"should"` (default `should`).
          * - `in[]` matches a field against any of the literal values (already-suffixed key fields).
+         *   An `in[]` whose values are all empty matches NOTHING (an empty allow-list, not "no
+         *   filter").
+         * - With no `text`, `boolean_tree`, `in[]`, nor a `must`/`should` `where[]`, the query
+         *   matches EVERY document (constant score), narrowed by `range[]`/`match_all[]` and minus
+         *   any `mustnot` `where[]` — like an empty text in OpenSearch.
          * - `range[]` filters docs whose `field` term is in the inclusive `[from, to]` range
          *   (either bound optional). `field` is used VERBATIM (pass the `_key` name). Bounds are
          *   strings compared lexicographically against the stored term; for numeric/date fields
@@ -121,10 +126,10 @@ namespace SdSearch {
          *   A negated branch (`not`) contributes NO documents of its own — it only subtracts
          *   from whatever it's ANDed against. So `or(not(x), y)` returns whatever `y` matches,
          *   NOT zero: the negated branch drops out silently rather than failing the whole
-         *   `or`. Only a tree where NO branch contributes any positive match at all (`NOT foo`
-         *   at the root, an `and` whose children are all `not`, `children: []`) returns ZERO
-         *   hits — the engine has no "every document" leaf to subtract from. Nesting deeper
-         *   than 32 levels THROWS.
+         *   `or`. A tree that only negates at the ROOT (`NOT foo`, an `and` whose children are
+         *   all `not`) subtracts from every document, like the equivalent `mustnot` `where`. Any
+         *   other tree with no positive match (`or(not(x))`, `children: []`) returns ZERO hits.
+         *   Nesting deeper than 32 levels THROWS.
          * - `accent_insensitive` applies INSIDE a phrase (`impresion rota` also matches
          *   `impresión rota`). `synonyms` does NOT: a phrase is literal.
          *

@@ -45,11 +45,6 @@ impl ZslSegment {
         !self.prx_name.is_empty()
     }
 
-    /// Is the local doc deleted according to this segment's `.del`?
-    pub fn is_deleted(&self, local_doc: usize) -> bool {
-        self.deletes.is_deleted(local_doc)
-    }
-
     /// column of the field's raw norm bytes (one per doc, incl. deletes), or `None`.
     /// The merge COPIES them verbatim (no re-encoding) into the merged segment.
     pub fn norm_bytes(&self, field: &str) -> Option<&[u8]> {
