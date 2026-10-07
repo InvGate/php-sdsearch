@@ -1319,6 +1319,10 @@ mod tests {
             self.inner.stored_fields(doc_id)
         }
 
+        fn is_deleted(&self, doc_id: usize) -> bool {
+            self.inner.is_deleted(doc_id)
+        }
+
         // --- term dictionary: reaching any of these is the regression ---
         fn doc_freq(&self, _field: &str, _term: &str) -> usize {
             unreachable!("field sort must not call doc_freq (dict.info() is a .tis seek+scan)")

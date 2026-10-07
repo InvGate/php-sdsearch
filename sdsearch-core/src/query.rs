@@ -175,15 +175,23 @@ fn eval(
             }
             acc
         }
-        // an allow-list only ever holds live ids (see `drop_if_universal`), so it is the answer
-        // as-is; without one, every id that is not deleted.
-        Query::MatchAll => match restrict {
-            Some(allowed) => allowed.iter().map(|&id| (id, 1.0)).collect(),
-            None => (0..index.total_docs())
-                .filter(|&id| !index.is_deleted(id))
-                .map(|id| (id, 1.0))
-                .collect(),
-        },
+        // `restrict` is caller input on the pub paged API, so it is narrowed like postings
+        // would be: only ids that exist and are not deleted.
+        Query::MatchAll => {
+            let live = |&id: &usize| id < index.total_docs() && !index.is_deleted(id);
+            match restrict {
+                Some(allowed) => allowed
+                    .iter()
+                    .copied()
+                    .filter(live)
+                    .map(|id| (id, 1.0))
+                    .collect(),
+                None => (0..index.total_docs())
+                    .filter(live)
+                    .map(|id| (id, 1.0))
+                    .collect(),
+            }
+        }
     }
 }
 
@@ -457,6 +465,15 @@ pub fn intersect_allow(
     }
 }
 
+/// The `range`/`match_all` allow-list of `p`, to pass as `restrict`. Every retriever applies it:
+/// it is what narrows the `MatchAll` base of a query with nothing positive to match.
+pub fn allow_list(index: &impl IndexReader, p: &QueryParams) -> Option<HashSet<usize>> {
+    intersect_allow(
+        range_allow_list(index, &p.range_filters),
+        match_all_allow_list(index, &p.match_all),
+    )
+}
+
 /// Doc allow-list for a set of matchAll filters, ANDed together. For each filter, the analyzed
 /// words must all occur in the field: intersect the words' postings, cheapest (rarest, by
 /// `doc_freq`) first, short-circuiting to empty as soon as the running set is empty or a word is
@@ -552,9 +569,6 @@ pub struct QueryParams {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryError {
-    /// no text, no tree, no where, no in, on a retriever that cannot answer "every doc"
-    /// (see `reject_empty`). `build_query` itself no longer returns it.
-    Empty,
     /// a where/in group has an empty field name.
     EmptyField,
     /// a boolean tree nests deeper than `MAX_TREE_DEPTH`.
@@ -564,7 +578,6 @@ pub enum QueryError {
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueryError::Empty => write!(f, "empty query"),
             QueryError::EmptyField => write!(f, "empty field name in where/in group"),
             QueryError::TreeTooDeep => write!(f, "boolean tree nested deeper than 32 levels"),
         }
@@ -611,13 +624,14 @@ fn strip_double_negation(node: &BoolNode) -> &BoolNode {
 /// Maps a `BoolNode` tree to the equivalent `Query`. `accent_insensitive` is threaded to
 /// every phrase leaf.
 ///
-/// A negation with no positive sibling (`NOT foo` at the root, a `not` under an `or`, an
-/// `and` whose children are all `not`) maps to a `Boolean` that `eval_boolean` resolves to
-/// zero hits: with no `Must` it takes the union-of-shoulds branch and accumulates nothing.
-/// That is deliberate — the host's parser rejects those trees upstream
-/// (`IBooleanNode::requiresPositiveMatch`).
-// ponytail: pure negation returns empty silently. Upgrade path: give `Not` a `Must` of
-// `Query::MatchAll` to subtract from, after which `not` is correct in any position.
+/// A negation with no positive sibling (`NOT foo`, a `not` under an `or`, an `and` whose
+/// children are all `not`) maps to a `Boolean` that `eval_boolean` resolves to zero hits: with
+/// no `Must` it takes the union-of-shoulds branch and accumulates nothing. At the ROOT,
+/// `build_query` hoists those `MustNot`s next to its `MatchAll` base, so they subtract from
+/// every doc; nested under an `or`, a `not` drops out (docs/API.md). The host's parser rejects
+/// all of these upstream anyway (`IBooleanNode::requiresPositiveMatch`).
+// ponytail: a nested pure negation still returns empty silently. Upgrade path: give `Not` a
+// `Must` of `Query::MatchAll` to subtract from, after which `not` is correct in any position.
 pub(crate) fn map_bool_node(
     node: &BoolNode,
     accent_insensitive: bool,
@@ -765,7 +779,16 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
 
     // a boolean tree REPLACES the free-text subquery (host precedence: tree > exact > text).
     if let Some(tree) = &p.boolean_tree {
-        top.push((Occur::Must, map_bool_node(tree, p.accent_insensitive, 0)?));
+        match map_bool_node(tree, p.accent_insensitive, 0)? {
+            // a root that only negates (`NOT x`, an `and` of nots) is a `mustnot` where in
+            // disguise: hoisted to the top, it subtracts from the `MatchAll` base below.
+            Query::Boolean { clauses }
+                if !clauses.is_empty() && clauses.iter().all(|(o, _)| *o == Occur::MustNot) =>
+            {
+                top.extend(clauses);
+            }
+            q => top.push((Occur::Must, q)),
+        }
     } else if has_text {
         top.push((Occur::Must, text_subquery(p)));
     }
@@ -836,21 +859,6 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
     }
 
     Ok(Query::Boolean { clauses: top })
-}
-
-/// The rule `build_query` enforced before it learned `MatchAll`, kept for the retrievers that
-/// do not apply the `range`/`match_all` allow-list (`lexical_search`, `search_prf`): there,
-/// "every doc" would ignore the caller's date filter, and PRF would draw feedback from
-/// arbitrary docs.
-pub(crate) fn reject_empty(p: &QueryParams) -> Result<(), QueryError> {
-    if p.text.trim().is_empty()
-        && p.boolean_tree.is_none()
-        && p.where_groups.is_empty()
-        && p.in_groups.is_empty()
-    {
-        return Err(QueryError::Empty);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1294,8 +1302,6 @@ mod tests {
     fn build_query_empty_matches_every_doc() {
         let q = build_query(&params("")).unwrap();
         assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0, 1, 2]);
-        // the retrievers without the allow-list still refuse it
-        assert_eq!(reject_empty(&params("")), Err(QueryError::Empty));
     }
 
     #[test]
@@ -2168,25 +2174,23 @@ mod tests {
     }
 
     #[test]
-    fn negation_without_a_positive_term_yields_no_hits() {
-        // Decisión explícita (spec, 2026-08-11): NO se soporta ni se rechaza; devuelve vacío.
-        // Si algún día se agrega una hoja MatchAll, este test falla y hay que revisarlo.
+    fn a_tree_that_only_negates_at_the_root_subtracts_from_every_doc() {
+        // Igual que un `where mustnot`: todo menos lo negado. Un `not` anidado bajo un `or`
+        // sigue sin aportar nada propio (docs/API.md), y un `and`/`or` vacío no matchea nada.
+        // corpus: doc0 "vpn guide", doc1 "vpn setup", doc2 "mysql notes".
+        let not = |p: &str| BoolNode::Not(Box::new(term(p)));
         let idx = corpus();
-        for node in [
-            BoolNode::Not(Box::new(term("fox"))),
-            BoolNode::Or(vec![BoolNode::Not(Box::new(term("fox")))]),
-            BoolNode::And(vec![
-                BoolNode::Not(Box::new(term("fox"))),
-                BoolNode::Not(Box::new(term("dog"))),
-            ]),
-            BoolNode::And(vec![]),
-            BoolNode::Or(vec![]),
+        for (node, expected) in [
+            (not("vpn"), vec![2]),
+            (BoolNode::And(vec![not("guide"), not("mysql")]), vec![1]),
+            (BoolNode::Or(vec![not("vpn")]), vec![]),
+            (BoolNode::And(vec![]), vec![]),
+            (BoolNode::Or(vec![]), vec![]),
         ] {
-            let q = map_bool_node(&node, false, 0).unwrap();
-            assert!(
-                search(&idx, &q, 0.0, 10).is_empty(),
-                "la negación pura devuelve vacío, sin panic: {node:?}"
-            );
+            let mut p = params("");
+            p.boolean_tree = Some(node.clone());
+            let q = build_query(&p).unwrap();
+            assert_eq!(ids(&search(&idx, &q, 0.0, 10)), expected, "{node:?}");
         }
     }
 
