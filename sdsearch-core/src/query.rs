@@ -4,8 +4,8 @@
 use crate::index::IndexReader;
 use crate::score::Similarity;
 use crate::search::{
-    Hit, SearchOutcome, SortSpec, accent_variant_terms, finalize_paged, finalize_sorted,
-    fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms,
+    Hit, SearchOutcome, SortSpec, accent_variant_terms, accent_wildcard_terms, finalize_paged,
+    finalize_sorted, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -31,10 +31,12 @@ pub enum Query {
         field: Option<String>,
         text: String,
     },
+    /// `accent_insensitive` expands `pattern` to its accent variants, like `AccentTerm`.
     Wildcard {
         field: Option<String>,
         pattern: String,
         min_prefix_len: usize,
+        accent_insensitive: bool,
     },
     Fuzzy {
         field: Option<String>,
@@ -116,11 +118,16 @@ fn eval(
             field,
             pattern,
             min_prefix_len,
+            accent_insensitive,
         } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                let terms = wildcard_terms(index, &f, pattern, *min_prefix_len);
+                let terms = if *accent_insensitive {
+                    accent_wildcard_terms(index, &f, pattern, *min_prefix_len)
+                } else {
+                    wildcard_terms(index, &f, pattern, *min_prefix_len)
+                };
                 let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
                 for (id, s) in union_scores(index, sim, &f, &refs, restrict) {
                     *acc.entry(id).or_insert(0.0) += s * w;
@@ -710,6 +717,7 @@ fn text_subquery_with_dict(p: &QueryParams, dict: Option<&crate::synonyms::Synon
             field: None,
             pattern: format!("{lc}*"),
             min_prefix_len: p.wildcard_min_prefix,
+            accent_insensitive: p.accent_insensitive,
         },
     ));
     // QueryParser::parse(RAW text): the analyzer tokenizes the original text ->
@@ -943,6 +951,39 @@ mod tests {
         assert!(!query_has_accent_term(
             &build_query(&params("avion")).unwrap()
         ));
+    }
+
+    #[test]
+    fn accent_insensitive_prefix_reaches_the_same_docs_either_way() {
+        // "camioneta" is reachable only through the wildcard leaf (fuzzy stops at distance 3),
+        // so before the fold "camion" found it and "camión" did not.
+        let mut idx = MemoryIndex::new();
+        for title in ["camión rojo", "camioneta azul", "otra cosa"] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            idx.add_document(d);
+        }
+        let hits_for = |text: &str| {
+            let mut p = params(text);
+            p.accent_insensitive = true;
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100))
+        };
+        assert_eq!(hits_for("camion"), vec![0, 1]);
+        assert_eq!(hits_for("camión"), vec![0, 1]);
+    }
+
+    #[test]
+    fn accent_insensitive_prefix_keeps_the_min_prefix_gate() {
+        // "a" is one byte (gated) but its "á" variant is two: the gate is measured on the
+        // folded form, or a one-letter query would expand over every "á…" term.
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("title", "área común", FieldKind::Text);
+        idx.add_document(d);
+        let mut p = params("a");
+        p.accent_insensitive = true;
+        p.wildcard_min_prefix = 2;
+        assert!(search(&idx, &build_query(&p).unwrap(), 0.0, 100).is_empty());
     }
 
     #[test]

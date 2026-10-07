@@ -18,6 +18,10 @@ breaking change bumps the **minor** version.
 - **An `in` with no values matches nothing instead of being dropped.** Hosts use `in` for
   visibility; an empty one ("visible in none") used to be ignored, so a text search
   returned every text match regardless of the filter.
+- **`accent_insensitive` now covers the free-text prefix leaf.** The `text*` wildcard was
+  only lowercased, so `configuracion` and `configuración` returned different totals and
+  rankings. It now expands to the same accent variants as the exact term; the
+  `wildcard_min_prefix` gate is measured on the folded prefix.
 
 ## [0.3.0] - 2026-08-26
 

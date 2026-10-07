@@ -181,7 +181,7 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 | `track_total_hits` | int\|bool | Optional (default `1001`). Integer `n` caps the reported `total` at `n`; `true` = exact count; `false` = omit `total` from the response. |
 | `sort` | string | Optional. Keyword field to order by, used VERBATIM (pass the `_key` name). Omitted or `"_score"` = relevance order. A field the index does not have → error. See the ordering rules below. |
 | `sort_dir` | string | Optional (default `"desc"`). `"asc"` or `"desc"`; any other value → error. Only read when `sort` is set. |
-| `accent_insensitive` | bool | Optional (default `false`). When `true`, text matching is Spanish accent-insensitive (`avion` also matches `avión` and vice-versa). |
+| `accent_insensitive` | bool | Optional (default `false`). When `true`, text matching is Spanish accent-insensitive (`avion` also matches `avión` and vice-versa), including the free-text prefix leaf (`camión` also reaches `camioneta`). |
 | `field_weights` | object | Optional (default `{}`). Per-field score multipliers (`{"title": 3.0}`); a field not listed weighs `1.0`. |
 | `similarity` | string | Optional scoring algorithm: `"bm25"` (default) or `"tfidf"`. Unknown value → error. As of 0.2.0 BM25 is the default ranking; pass `"similarity": "tfidf"` to select the legacy TF-IDF scoring shape instead of BM25. |
 | `wildcard_min_prefix` | int | Optional (default `2`). Minimum literal-prefix length before the first `*`/`?` in the free-text wildcard leaf, so a short single-word query does not scan the whole vocabulary. Pass `0`/`1` for typeahead surfaces. Changed in 0.3.0: previously always `0`. |

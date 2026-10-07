@@ -237,11 +237,7 @@ pub(crate) fn wildcard_terms(
     pattern: &str,
     min_prefix_len: usize,
 ) -> Vec<String> {
-    let first_wild = pattern.find(['*', '?']);
-    let prefix = match first_wild {
-        Some(i) => &pattern[..i],
-        None => pattern,
-    };
+    let prefix = literal_prefix(pattern);
     if prefix.len() < min_prefix_len {
         return Vec::new();
     }
@@ -256,6 +252,33 @@ pub(crate) fn wildcard_terms(
         .into_iter()
         .filter(|t| re.is_match(t))
         .collect()
+}
+
+/// the literal part of a wildcard pattern: everything before the first `*`/`?`.
+fn literal_prefix(pattern: &str) -> &str {
+    pattern.find(['*', '?']).map_or(pattern, |i| &pattern[..i])
+}
+
+/// `wildcard_terms` over every accent variant of `pattern` (the `accent_variant_terms` rule),
+/// deduped. The `min_prefix_len` gate is measured on the FOLDED pattern, so a typed "a" stays
+/// gated instead of expanding through its two-byte "á" variant.
+pub(crate) fn accent_wildcard_terms(
+    index: &impl IndexReader,
+    field: &str,
+    pattern: &str,
+    min_prefix_len: usize,
+) -> Vec<String> {
+    let variants = crate::analysis::accent_variants(pattern);
+    if literal_prefix(&variants[0]).len() < min_prefix_len {
+        return Vec::new();
+    }
+    let mut terms: Vec<String> = variants
+        .iter()
+        .flat_map(|v| wildcard_terms(index, field, v, 0))
+        .collect();
+    terms.sort_unstable();
+    terms.dedup();
+    terms
 }
 
 /// terms of `field` matching fuzzy (without scoring). Faithful port of
