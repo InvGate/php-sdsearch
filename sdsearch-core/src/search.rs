@@ -709,7 +709,10 @@ mod tests {
     #[test]
     fn accent_variant_terms_empty_when_nothing_matches() {
         let idx = accent_corpus();
-        assert!(accent_variant_terms(&idx, "body", "zzz").is_empty());
+        assert_eq!(
+            accent_variant_terms(&idx, "body", "zzz"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

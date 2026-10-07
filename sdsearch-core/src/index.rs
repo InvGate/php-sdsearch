@@ -542,6 +542,6 @@ mod tests {
             vec!["200".to_string(), "300".to_string()]
         );
         // unknown field => empty
-        assert!(idx.terms_in_range("nope", None, None).is_empty());
+        assert_eq!(idx.terms_in_range("nope", None, None), Vec::<String>::new());
     }
 }

@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn version_is_not_empty() {
-        assert!(!version().is_empty());
+        assert_ne!(version(), "");
     }
 
     /// The FFI boundary in sdsearch-php relies on `catch_unwind`, which only works
