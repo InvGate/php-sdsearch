@@ -75,7 +75,11 @@ namespace SdSearch {
          *   with other `match_all[]` entries. Matching is on the engine's analyzed tokens (no ES
          *   `.multilang` stemming): "impresora" does not match "impresoras".
          * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
-         *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa).
+         *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa), including
+         *   the free-text prefix leaf (`camión` also reaches `camioneta`). The per-word typo
+         *   (fuzzy) match is NOT: `camion` is a typo away from `camino`, `camión` is not, so
+         *   totals can still differ by spelling. A token longer than 64 characters matches only
+         *   its folded and typed forms.
          * - `synonyms` (optional, default `false`): when `true`, each query token is
          *   also matched against its bundled synonyms and cross-lingual translations
          *   (Spanish↔English), scored below the literal token. Widens recall.
@@ -87,6 +91,8 @@ namespace SdSearch {
          * - `wildcard_min_prefix` (optional, default `2`): minimum literal-prefix length before
          *   the first `*`/`?` for the free-text wildcard leaf. Omitted = `2` (short single-word
          *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
+         *   With `accent_insensitive`, measured on the accent-folded prefix (`có` counts as 2
+         *   bytes, not 3).
          * - `sort` (optional): keyword field to order by, used VERBATIM (pass the `_key` name).
          *   A field the index does not have THROWS — otherwise every doc ties on a missing value
          *   and the tiebreak order comes back looking like working sorting. Stored-only fields

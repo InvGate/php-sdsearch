@@ -44,9 +44,19 @@ fn fold_char(c: char) -> char {
 /// base plus one variant per vowel position carrying a single accent. `u` yields
 /// both `ú` and `ü` (diéresis). `ñ` is preserved. Folding the input first means
 /// this works whether the user typed the accented or the plain form.
+///
+/// Past `MAX_VARIANT_CHARS` only the folded and the typed forms are returned.
 pub fn accent_variants(token: &str) -> Vec<String> {
-    let base: Vec<char> = fold_accents(token).chars().collect();
-    let mut out = vec![base.iter().collect::<String>()];
+    let folded = fold_accents(token);
+    let base: Vec<char> = folded.chars().collect();
+    if base.len() > MAX_VARIANT_CHARS {
+        return if folded == token {
+            vec![folded]
+        } else {
+            vec![folded, token.to_string()]
+        };
+    }
+    let mut out = vec![folded];
     for (i, c) in base.iter().enumerate() {
         for &accented in accented_forms(*c) {
             let mut variant = base.clone();
@@ -56,6 +66,12 @@ pub fn accent_variants(token: &str) -> Vec<String> {
     }
     out
 }
+
+/// Longest token, in chars, that gets one variant per vowel. Spanish words are far shorter; a
+/// longer run is a pasted path or `a,a,a,…` (the wildcard prefix is the whole whitespace-free
+/// text), whose expansion is O(n²) memory — and an allocation failure aborts the PHP worker
+/// past `catch_unwind`.
+const MAX_VARIANT_CHARS: usize = 64;
 
 /// the single-accent forms a base vowel can take (empty for non-vowels).
 fn accented_forms(c: char) -> &'static [char] {
@@ -72,6 +88,15 @@ fn accented_forms(c: char) -> &'static [char] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accent_variants_of_a_long_run_stay_bounded() {
+        // A whitespace-free run (`á,á,…`, a pasted path) would yield one variant per vowel, each
+        // as long as the run: O(n²) memory, and an allocation failure aborts the PHP worker past
+        // `catch_unwind`. Past the cap only the folded and the typed forms remain.
+        let long = "á,".repeat(8000);
+        assert_eq!(accent_variants(&long), vec![fold_accents(&long), long]);
+    }
 
     #[test]
     fn splits_on_whitespace_and_lowercases() {

@@ -266,9 +266,9 @@ fn wildcard_regex(pattern: &str) -> Option<regex::Regex> {
     .ok()
 }
 
-/// `wildcard_terms`, accent-insensitive. Only the literal prefix picks dictionary buckets, so
-/// only the prefix is expanded to its accent variants (the `accent_variant_terms` rule); each
-/// variant is its own bucket, disjoint from the others. The rest of the pattern is matched
+/// `wildcard_terms`, accent-insensitive. Only the literal prefix picks dictionary buckets: the
+/// prefix as typed, then its accent variants (the `accent_variant_terms` rule). The buckets are
+/// disjoint (same length in chars, different strings). The rest of the pattern is matched
 /// against the folded term. `MAX_WILDCARD_TERMS` bounds the whole union, as it bounds a plain
 /// leaf, and the `min_prefix_len` gate is measured on the folded prefix, so a typed "a" stays
 /// gated instead of expanding through its two-byte "á" variant.
@@ -291,17 +291,21 @@ pub(crate) fn accent_wildcard_terms(
     let Some(re) = wildcard_regex(&folded) else {
         return Vec::new();
     };
-    // ponytail: `accent_variants` is O(len²) on one whitespace-free run, the same cost
-    // `AccentTerm` already pays per token; a text-length cap at the JSON boundary bounds both.
+    // The typed spelling goes first: the cap is filled in bucket order, and it is not always
+    // one of the single-tilde variants (`información-gestión` carries two).
+    let typed = literal_prefix(pattern);
+    let variants = crate::analysis::accent_variants(prefix);
+    let buckets =
+        std::iter::once(typed).chain(variants.iter().map(String::as_str).filter(|v| *v != typed));
     let mut terms = Vec::new();
-    for variant in crate::analysis::accent_variants(prefix) {
+    for bucket in buckets {
         let room = MAX_WILDCARD_TERMS - terms.len();
         if room == 0 {
             break;
         }
         terms.extend(
             index
-                .terms_with_prefix_limited(field, &variant, room)
+                .terms_with_prefix_limited(field, bucket, room)
                 .into_iter()
                 .filter(|t| re.is_match(&crate::analysis::fold_accents(t))),
         );
@@ -857,6 +861,41 @@ mod tests {
         idx.add_document(d);
         let terms = accent_wildcard_terms(&idx, "body", "co*", 0);
         assert_eq!(terms.len(), MAX_WILDCARD_TERMS);
+    }
+
+    #[test]
+    fn accent_wildcard_terms_searches_the_typed_prefix_first() {
+        // the cap is filled in bucket order: a full unaccented bucket must not crowd out the
+        // spelling the user actually typed
+        let mut words: Vec<String> = (0..MAX_WILDCARD_TERMS)
+            .map(|i| format!("co{i:05}"))
+            .collect();
+        words.extend(["código".to_string(), "cómo".to_string()]);
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", &words.join(" "), FieldKind::Text);
+        idx.add_document(d);
+        let terms = accent_wildcard_terms(&idx, "body", "có*", 0);
+        for typed in ["código", "cómo"] {
+            assert!(terms.iter().any(|t| t == typed), "{typed} crowded out");
+        }
+    }
+
+    #[test]
+    fn accent_wildcard_terms_reaches_a_typed_prefix_with_two_accents() {
+        // the analyzer keeps `-` inside a token, so one term can carry two tildes: no
+        // single-tilde variant spells it, the typed prefix does
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add(
+            "body",
+            "información-gestión información-gestiónes",
+            FieldKind::Text,
+        );
+        idx.add_document(d);
+        let mut got = accent_wildcard_terms(&idx, "body", "información-gestión*", 0);
+        got.sort();
+        assert_eq!(got, vec!["información-gestión", "información-gestiónes"]);
     }
 
     #[test]
