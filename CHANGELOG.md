@@ -6,6 +6,12 @@ breaking change bumps the **minor** version.
 
 ## [Unreleased]
 
+### Added
+
+- `search()` params `fuzzy_similarity` (default `0.5`, must be in `[0, 1)`) and
+  `fuzzy_prefix_len` (default `3`), until now fixed in the extension, so hosts can tune typo
+  matching without a release.
+
 ### Fixed
 
 - **`search()` with nothing positive to match returns every document instead of throwing
@@ -22,6 +28,11 @@ breaking change bumps the **minor** version.
   only lowercased, so `configuracion` and `configuración` returned different totals and
   rankings. It now expands to the same accent variants as the exact term; the
   `wildcard_min_prefix` gate is measured on the folded prefix.
+- **A typo variant no longer weighs as much as the exact word.** The fuzzy leaf computed each
+  term's similarity and dropped it, so every variant scored at full weight; with length
+  normalization, a request containing the exact word could rank below fuzzy-only ones. Each
+  variant now scores times `(sim - min) / (1 - min)`, the boost Zend's `Fuzzy::rewrite`
+  applies (1 for the exact word).
 
 ## [0.3.0] - 2026-08-26
 

@@ -309,17 +309,40 @@ pub(crate) fn accent_wildcard_terms(
     terms
 }
 
-/// terms of `field` matching fuzzy (without scoring). Faithful port of
+/// Fuzzy leaf scores: each matched term's score times its Zend boost (see `fuzzy_terms`),
+/// summed per doc — so a typo variant counts for less than the exact word.
+pub(crate) fn fuzzy_scores(
+    index: &impl IndexReader,
+    sim: Similarity,
+    field: &str,
+    term: &str,
+    min_similarity: f32,
+    prefix_length: usize,
+    restrict: Option<&HashSet<usize>>,
+) -> HashMap<usize, f32> {
+    let mut scored: HashMap<usize, f32> = HashMap::new();
+    for (matched, boost) in fuzzy_terms(index, field, term, min_similarity, prefix_length) {
+        for (doc_id, s) in term_scores(index, sim, field, &matched, restrict) {
+            *scored.entry(doc_id).or_insert(0.0) += s * boost;
+        }
+    }
+    scored
+}
+
+/// terms of `field` matching fuzzy, with their boost. Faithful port of
 /// Zend_Search_Lucene Fuzzy::rewrite (non-empty prefix branch): exact prefix of
 /// `prefix_length` chars, classic byte-based Levenshtein over the rest, maxDistance
-/// varying per candidate, and match iff `similarity > min_similarity` (strict).
-pub(crate) fn fuzzy_terms(
+/// varying per candidate, and match iff `similarity > min_similarity` (strict). Each term's
+/// boost is Zend's `(similarity - min_similarity) / (1 - min_similarity)`: 1 for the exact
+/// word, falling to 0 at the threshold. `similarity > min_similarity` keeps the divisor
+/// positive.
+fn fuzzy_terms(
     index: &impl IndexReader,
     field: &str,
     term: &str,
     min_similarity: f32,
     prefix_length: usize,
-) -> Vec<String> {
+) -> Vec<(String, f32)> {
     let min_sim = f64::from(min_similarity);
     // exact prefix = first prefix_length UTF-8 chars
     let prefix: String = term.chars().take(prefix_length).collect();
@@ -367,7 +390,10 @@ pub(crate) fn fuzzy_terms(
         });
         matched.truncate(MAX_FUZZY_TERMS);
     }
-    matched.into_iter().map(|(_, t)| t).collect()
+    matched
+        .into_iter()
+        .map(|(similarity, t)| (t, ((similarity - min_sim) / (1.0 - min_sim)) as f32))
+        .collect()
 }
 
 /// doc -> positions merged over `terms`, plus the idf of their pooled doc frequency.
@@ -662,11 +688,17 @@ pub fn fuzzy_query(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
-    let terms = fuzzy_terms(index, field, term, min_similarity, prefix_length);
-    let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
     finalize(
         index,
-        union_scores(index, Similarity::Bm25, field, &refs, None),
+        fuzzy_scores(
+            index,
+            Similarity::Bm25,
+            field,
+            term,
+            min_similarity,
+            prefix_length,
+            None,
+        ),
         min_score,
         limit,
     )
@@ -878,6 +910,22 @@ mod tests {
         // "testintg" (one extra letter) shares prefix "tes"; high similarity => matches doc 0
         let hits = fuzzy_query(&idx, "body", "testintg", 0.6, 3, 0.0, 10);
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn fuzzy_scores_the_exact_term_above_a_variant() {
+        // Same length, tf and doc_freq: only the similarity tells them apart. Zend boosts each
+        // matched term by (sim - min) / (1 - min); without it a typo variant ties the exact word.
+        let mut idx = MemoryIndex::new();
+        for text in ["porfavor", "porfavr"] {
+            let mut d = Document::new();
+            d.add("body", text, FieldKind::Text);
+            idx.add_document(d);
+        }
+        let hits = fuzzy_query(&idx, "body", "porfavor", 0.5, 3, 0.0, 10);
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![0, 1]);
+        // "porfavr": distance 1 over 3 + 4 chars -> sim 6/7 -> boost (6/7 - 0.5) / 0.5 = 5/7
+        assert!((hits[1].score / hits[0].score - 5.0 / 7.0).abs() < 1e-4);
     }
 
     #[test]

@@ -118,6 +118,12 @@ struct ParamsDto {
     /// scan the whole vocabulary). Pass 0/1 for typeahead surfaces.
     #[serde(default = "default_wildcard_min_prefix")]
     wildcard_min_prefix: usize,
+    /// optional: minimum similarity, in `[0, 1)`, for a free-text fuzzy match. Omitted = 0.5.
+    #[serde(default = "default_fuzzy_similarity")]
+    fuzzy_similarity: f32,
+    /// optional: leading chars a fuzzy match must share exactly. Omitted = 3.
+    #[serde(default = "default_fuzzy_prefix_len")]
+    fuzzy_prefix_len: usize,
     /// optional: keyword field to order by, used VERBATIM (pass the `_key` name). Omitted or
     /// `"_score"` = relevance order.
     #[serde(default)]
@@ -296,6 +302,12 @@ fn default_min_doc_freq() -> u64 {
 fn default_wildcard_min_prefix() -> usize {
     2
 }
+fn default_fuzzy_similarity() -> f32 {
+    0.5
+}
+fn default_fuzzy_prefix_len() -> usize {
+    3
+}
 
 #[derive(Deserialize)]
 struct MltTermFilterDto {
@@ -411,6 +423,13 @@ fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
             ));
         }
     };
+    // Zend throws outside [0, 1) too; a typo like 5.0 would otherwise switch fuzzy off silently
+    if !(0.0..1.0).contains(&dto.fuzzy_similarity) {
+        return Err(format!(
+            "sdsearch: fuzzy_similarity {} out of range (expected 0 <= x < 1)",
+            dto.fuzzy_similarity
+        ));
+    }
     let sort = sort_spec_from(dto.sort, dto.sort_dir.as_deref())?;
     // host precedence: an explicit tree wins; otherwise `exact_match` desugars into a
     // single term node so the core only ever sees one concept. Empty text with
@@ -454,8 +473,8 @@ fn query_params_from(dto: ParamsDto) -> Result<QueryParams, String> {
                 text: m.text,
             })
             .collect(),
-        fuzzy_similarity: 0.5,
-        fuzzy_prefix_len: 3,
+        fuzzy_similarity: dto.fuzzy_similarity,
+        fuzzy_prefix_len: dto.fuzzy_prefix_len,
         wildcard_min_prefix: dto.wildcard_min_prefix,
         accent_insensitive: dto.accent_insensitive,
         synonyms: dto.synonyms,
