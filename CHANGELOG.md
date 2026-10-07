@@ -39,7 +39,11 @@ breaking change bumps the **minor** version.
   typo away from `camino`, `camión` is not.
 - **Accent variants stop at 64-character tokens.** A longer whitespace-free run (a pasted
   path, `a,a,a,…`) expanded to one variant per vowel, O(n²) memory that could abort the PHP
-  worker; past the cap only its folded and typed forms are searched.
+  worker; past the cap only its typed and folded forms are searched.
+- **`accent_insensitive` finds a token typed exactly as indexed with two or more tildes**
+  (`información-gestión`, a compound the analyzer keeps whole). Only single-tilde variants
+  were searched, so the exact term and phrase leaves matched nothing and the doc lost that
+  part of its score.
 
 ## [0.3.0] - 2026-08-26
 

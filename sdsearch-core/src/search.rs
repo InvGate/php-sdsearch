@@ -291,21 +291,16 @@ pub(crate) fn accent_wildcard_terms(
     let Some(re) = wildcard_regex(&folded) else {
         return Vec::new();
     };
-    // The typed spelling goes first: the cap is filled in bucket order, and it is not always
-    // one of the single-tilde variants (`información-gestión` carries two).
-    let typed = literal_prefix(pattern);
-    let variants = crate::analysis::accent_variants(prefix);
-    let buckets =
-        std::iter::once(typed).chain(variants.iter().map(String::as_str).filter(|v| *v != typed));
+    // the typed spelling comes first (see `accent_variants`): the cap is filled in bucket order
     let mut terms = Vec::new();
-    for bucket in buckets {
+    for bucket in crate::analysis::accent_variants(literal_prefix(pattern)) {
         let room = MAX_WILDCARD_TERMS - terms.len();
         if room == 0 {
             break;
         }
         terms.extend(
             index
-                .terms_with_prefix_limited(field, bucket, room)
+                .terms_with_prefix_limited(field, &bucket, room)
                 .into_iter()
                 .filter(|t| re.is_match(&crate::analysis::fold_accents(t))),
         );
@@ -759,6 +754,20 @@ mod tests {
         let got = accent_variant_terms(&idx, "body", "avión");
         assert!(got.contains(&"avion".to_string()));
         assert!(got.contains(&"avión".to_string()));
+    }
+
+    #[test]
+    fn accent_variant_terms_reaches_the_typed_form_with_two_accents() {
+        // the analyzer keeps `-` inside a token, so one term can carry two tildes: no
+        // single-tilde variant spells it, so the typed form itself must be one of the variants
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", "información-gestión", FieldKind::Text);
+        idx.add_document(d);
+        assert_eq!(
+            accent_variant_terms(&idx, "body", "información-gestión"),
+            vec!["información-gestión"]
+        );
     }
 
     #[test]
