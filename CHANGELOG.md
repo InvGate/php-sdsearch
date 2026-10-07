@@ -15,6 +15,9 @@ breaking change bumps the **minor** version.
   matches every live document, narrowed by the filters, like an empty text in OpenSearch.
   `semantic_query()` and `hybrid_query()` keep throwing there, since they do not apply
   `range`/`match_all`.
+- **An `in` with no values matches nothing instead of being dropped.** Hosts use `in` for
+  visibility; an empty one ("visible in none") used to be ignored, so a text search
+  returned every text match regardless of the filter.
 
 ## [0.3.0] - 2026-08-26
 

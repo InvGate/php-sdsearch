@@ -172,7 +172,7 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 |---|---|---|
 | `text` | string | Free-text query over tokenized fields. With no `text`, `boolean_tree`, `in`, nor a `must`/`should` `where`, `search()` matches EVERY document (constant score), narrowed by `range`/`match_all` and minus any `mustnot` `where` — like an empty text in OpenSearch. `semantic_query()`/`hybrid_query()` still THROW `empty query` there (they do not apply `range`/`match_all`). |
 | `where` | array | Each `{field, values[], occur}`; `occur` ∈ `must` \| `mustnot` \| `should` (default `should`). |
-| `in` | array | Each `{field, values[]}`; matches the (literal, key-suffixed) field against any value. |
+| `in` | array | Each `{field, values[]}`; matches the (literal, key-suffixed) field against any value. Groups whose values are ALL empty match NOTHING (an empty allow-list, not "no filter"). |
 | `range` | array | Optional (default `[]`). Each `{field, from?, to?}`; keeps docs whose `field` term is in the inclusive `[from, to]` range (either bound optional). `field` verbatim. Multiple entries are ANDed. Docs missing the field are excluded. **Bounds are compared as bytes, not numerically** — see the note below. |
 | `match_all` | array | Optional (default `[]`). Each `{field, text}`; keeps docs whose `field` contains ALL the analyzed words of `text` (AND). A non-scoring filter, ANDed with `range` and with the other `match_all` entries. Matching is on the engine's analyzed tokens: `"impresora"` does not match `"impresoras"`. |
 | `min_score` | float | Drop hits below this score. |

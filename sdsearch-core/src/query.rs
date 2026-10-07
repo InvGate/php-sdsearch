@@ -806,7 +806,9 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
             ));
         }
     }
-    if !in_clauses.is_empty() {
+    // groups present but no values at all is "allowed in none", not "no filter": the empty
+    // Boolean is still required, so it matches nothing (fails closed).
+    if !p.in_groups.is_empty() {
         top.push((
             Occur::Must,
             Query::Boolean {
@@ -1281,6 +1283,21 @@ mod tests {
             query_mentions_field(&q, "status_key"),
             "WHERE must suffix _key"
         );
+    }
+
+    #[test]
+    fn build_query_in_group_without_values_matches_nothing() {
+        // The host restricts visibility with `in`: "allowed in none of these" must not read as
+        // "no filter". It used to drop the group, leaking every text match — and, with no
+        // text, the whole index through the `MatchAll` base.
+        let mut p = params("");
+        p.in_groups = vec![InGroup {
+            field: "lang".into(),
+            values: vec![],
+        }];
+        assert!(search(&corpus(), &build_query(&p).unwrap(), 0.0, 100).is_empty());
+        p.text = "vpn".into();
+        assert!(search(&corpus(), &build_query(&p).unwrap(), 0.0, 100).is_empty());
     }
 
     #[test]
