@@ -23,12 +23,9 @@ pub trait IndexReader {
     fn total_docs(&self) -> usize {
         self.num_docs()
     }
-    /// `true` if `doc_id` (in `0..total_docs()`) is deleted. Default = `false` (correct for
-    /// readers without deletes); the ZSL readers answer from the `.del` file.
-    fn is_deleted(&self, doc_id: usize) -> bool {
-        let _ = doc_id;
-        false
-    }
+    /// `true` if `doc_id` (in `0..total_docs()`) is deleted. Deliberately not defaulted: a
+    /// reader with deletes that forgot it would leak deleted docs through `Query::MatchAll`.
+    fn is_deleted(&self, doc_id: usize) -> bool;
     fn doc_freq(&self, field: &str, term: &str) -> usize;
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)>;
     fn field_len(&self, doc_id: usize, field: &str) -> u32;
@@ -295,6 +292,10 @@ impl MemoryIndex {
 impl IndexReader for MemoryIndex {
     fn num_docs(&self) -> usize {
         self.num_docs
+    }
+
+    fn is_deleted(&self, _doc_id: usize) -> bool {
+        false // never deletes
     }
 
     /// doc_freq: how many docs the term appears in for the field
