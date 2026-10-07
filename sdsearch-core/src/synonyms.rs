@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn missing_token_returns_empty() {
         let d = from_pairs(&[("laptop", &["notebook"])]);
-        assert!(d.expand("nonexistent").is_empty());
+        assert_eq!(d.expand("nonexistent"), [] as [String; 0]);
     }
 
     #[test]
@@ -239,7 +239,7 @@ mod tests {
         assert!(d.expand("impresora").iter().any(|s| s == "printer"));
         assert!(d.expand("printer").iter().any(|s| s == "impresora"));
         // accent/case-insensitive lookup against the bundled data
-        assert!(!d.expand("Portatil").is_empty());
+        assert_ne!(d.expand("Portatil"), [] as [String; 0]);
         // spot-checks against the full OMW bundle
         assert!(
             global()

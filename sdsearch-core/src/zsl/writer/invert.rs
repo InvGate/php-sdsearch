@@ -284,7 +284,7 @@ mod tests {
         assert!(inv.terms.iter().all(|t| t.field_num == 0));
         assert!(!inv.fields[1].indexed);
         // empty norm column for the non-indexed field
-        assert!(inv.norm_lengths[1].is_empty());
+        assert_eq!(inv.norm_lengths[1], Vec::<Option<u32>>::new());
         // both fields stored (by default), in order of appearance; title tokenized, id_attr not
         assert_eq!(
             inv.stored[0],
