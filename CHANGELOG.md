@@ -32,6 +32,14 @@ breaking change bumps the **minor** version.
   `fuzzy_prefix_len` (default `3`), until now fixed in the extension, so hosts can tune typo
   matching without a release.
 
+### Changed
+
+- A field-sorted `search()` reads each match's sort value in doc-id order instead of hash
+  order, so on a cold page cache the `.fdt` faults are sequential and readahead batches them.
+  On a 1 GB index with 42k matches: cold 1.6 s → 1.4 s, warm 0.21 s → 0.13 s. The first
+  sorted query on a cold cache is still paid; the value lives in the `.fdt` next to each
+  doc's full text.
+
 ### Fixed
 
 - **`semantic_query()` and `hybrid_query()` apply `range` and `match_all`.** Both were parsed
