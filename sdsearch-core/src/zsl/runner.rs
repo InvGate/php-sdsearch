@@ -7,7 +7,7 @@ use crate::mlt::{MltParams, more_like_this};
 use crate::prf::{PrfParams, search_prf};
 use crate::query::{
     InGroup, QueryError, QueryParams, build_query, intersect_allow, match_all_allow_list,
-    range_allow_list, search, search_with_weights, search_with_weights_paged,
+    range_allow_list, reject_empty, search, search_with_weights, search_with_weights_paged,
 };
 use crate::search::{Hit, SearchOutcome, SortSpec};
 use crate::zsl::index::ZslIndex;
@@ -22,6 +22,7 @@ fn lexical_search(
     min_score: f32,
     limit: usize,
 ) -> Result<Vec<Hit>, QueryError> {
+    reject_empty(params)?;
     let query = build_query(params)?;
     let lim = if limit == 0 { usize::MAX } else { limit };
     let hits = search_with_weights(
@@ -474,6 +475,75 @@ mod tests {
         assert_eq!(capped.total, 1);
         assert!(capped.total_capped);
         assert_eq!(ids(&capped.hits), full_ids, "cap bounds total, not hits");
+    }
+
+    // Live docs of the multiseg fixture: doc 3 ("delta backup notes") is deleted by `_1_1.del`.
+    const MULTISEG_LIVE: [usize; 5] = [0, 1, 2, 4, 5];
+
+    fn in_only(field: &str, values: &[&str]) -> QueryParams {
+        let mut p = params("");
+        p.in_groups = vec![InGroup {
+            field: field.into(),
+            values: values.iter().map(|v| (*v).to_string()).collect(),
+        }];
+        p
+    }
+
+    #[test]
+    fn search_index_paged_with_nothing_to_match_returns_every_live_doc() {
+        // No text, tree, where or in is "everything", as OpenSearch answers an empty text.
+        // It used to throw "empty query", which the host adapter turned into zero rows.
+        let out = search_index_paged(&multiseg(), &params(""), 0.0, 0, 0, None)
+            .expect("an empty query is not an error on the paged path");
+        assert_eq!(ids(&out.hits), MULTISEG_LIVE, "the deleted doc stays out");
+        assert_eq!(out.total, MULTISEG_LIVE.len());
+        // `search_index` ignores `range`/`match_all`, so there "everything" would leak past them
+        assert!(search_index(&multiseg(), &params(""), 0.0, 0).is_err());
+    }
+
+    #[test]
+    fn search_index_paged_with_only_a_range_narrows_every_live_doc() {
+        // The "only a date filter" screen: `range` is an allow-list, not a clause, so it never
+        // counted as something to match.
+        let mut p = params("");
+        p.range_filters = vec![crate::query::RangeFilter {
+            field: "cat_key".into(),
+            lower: Some("1".into()),
+            upper: Some("1".into()),
+        }];
+        let expected = search_index(&multiseg(), &in_only("cat", &["1"]), 0.0, 0).unwrap();
+        assert!(
+            !expected.is_empty() && expected.len() < MULTISEG_LIVE.len(),
+            "fixture sanity: the range must keep some live docs and drop others"
+        );
+
+        let out = search_index_paged(&multiseg(), &p, 0.0, 0, 0, None)
+            .expect("a range-only query is not an error on the paged path");
+        assert_eq!(ids(&out.hits), ids(&expected));
+    }
+
+    #[test]
+    fn search_index_paged_with_only_a_mustnot_where_returns_everything_but_the_excluded() {
+        // A lone `mustnot` used to have nothing to subtract from and returned zero hits.
+        let mut p = params("");
+        p.where_groups = vec![crate::query::WhereGroup {
+            field: "lang".into(),
+            values: vec!["en".into()],
+            occur: crate::query::Occur::MustNot,
+        }];
+        let english: HashSet<usize> = search_index(&multiseg(), &in_only("lang", &["en"]), 0.0, 0)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert!(!english.is_empty(), "fixture sanity: some doc is lang=en");
+        let expected: Vec<usize> = MULTISEG_LIVE
+            .into_iter()
+            .filter(|d| !english.contains(d))
+            .collect();
+
+        let out = search_index_paged(&multiseg(), &p, 0.0, 0, 0, None).unwrap();
+        assert_eq!(ids(&out.hits), expected);
     }
 
     use crate::mlt::MltParams;

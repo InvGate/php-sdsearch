@@ -61,6 +61,9 @@ pub enum Query {
         boost: f32,
         inner: Box<Query>,
     },
+    /// every live doc, constant score. The base `build_query` gives a query with nothing
+    /// positive to match, so `range`/`match_all` narrow it and a `mustnot` subtracts from it.
+    MatchAll,
 }
 
 /// target fields of a leaf: the given one, or all indexed fields if None.
@@ -165,6 +168,15 @@ fn eval(
             }
             acc
         }
+        // an allow-list only ever holds live ids (see `drop_if_universal`), so it is the answer
+        // as-is; without one, every id that is not deleted.
+        Query::MatchAll => match restrict {
+            Some(allowed) => allowed.iter().map(|&id| (id, 1.0)).collect(),
+            None => (0..index.total_docs())
+                .filter(|&id| !index.is_deleted(id))
+                .map(|id| (id, 1.0))
+                .collect(),
+        },
     }
 }
 
@@ -533,7 +545,8 @@ pub struct QueryParams {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryError {
-    /// no text, no where, no in: nothing to search.
+    /// no text, no tree, no where, no in, on a retriever that cannot answer "every doc"
+    /// (see `reject_empty`). `build_query` itself no longer returns it.
     Empty,
     /// a where/in group has an empty field name.
     EmptyField,
@@ -595,10 +608,9 @@ fn strip_double_negation(node: &BoolNode) -> &BoolNode {
 /// `and` whose children are all `not`) maps to a `Boolean` that `eval_boolean` resolves to
 /// zero hits: with no `Must` it takes the union-of-shoulds branch and accumulates nothing.
 /// That is deliberate — the host's parser rejects those trees upstream
-/// (`IBooleanNode::requiresPositiveMatch`), and answering them properly would need an
-/// "every live doc" leaf, i.e. a new `IndexReader` method with three implementations.
-// ponytail: pure negation returns empty silently. Upgrade path is `IndexReader::live_docs()`
-// plus a `Query::MatchAll` leaf, after which `not` is correct in any position.
+/// (`IBooleanNode::requiresPositiveMatch`).
+// ponytail: pure negation returns empty silently. Upgrade path: give `Not` a `Must` of
+// `Query::MatchAll` to subtract from, after which `not` is correct in any position.
 pub(crate) fn map_bool_node(
     node: &BoolNode,
     accent_insensitive: bool,
@@ -741,11 +753,6 @@ fn key_field_in(field: &str) -> String {
 /// builds the boolean Query equivalent to Zend Lucene's boolean query builder for the supported surface.
 pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
     let has_text = !p.text.trim().is_empty();
-    if !has_text && p.boolean_tree.is_none() && p.where_groups.is_empty() && p.in_groups.is_empty()
-    {
-        return Err(QueryError::Empty);
-    }
-
     let mut top: Vec<(Occur, Query)> = Vec::new();
 
     // a boolean tree REPLACES the free-text subquery (host precedence: tree > exact > text).
@@ -808,7 +815,32 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
         ));
     }
 
+    // Nothing positive to match (no text/tree, nothing at all, or only `mustnot` groups) means
+    // "every doc", narrowed by the `range`/`match_all` allow-list and minus the `mustnot`s — the
+    // same answer OpenSearch gives an empty text. A `should`-only where keeps its old meaning.
+    if !top
+        .iter()
+        .any(|(o, _)| matches!(o, Occur::Must | Occur::Should))
+    {
+        top.push((Occur::Must, Query::MatchAll));
+    }
+
     Ok(Query::Boolean { clauses: top })
+}
+
+/// The rule `build_query` enforced before it learned `MatchAll`, kept for the retrievers that
+/// do not apply the `range`/`match_all` allow-list (`lexical_search`, `search_prf`): there,
+/// "every doc" would ignore the caller's date filter, and PRF would draw feedback from
+/// arbitrary docs.
+pub(crate) fn reject_empty(p: &QueryParams) -> Result<(), QueryError> {
+    if p.text.trim().is_empty()
+        && p.boolean_tree.is_none()
+        && p.where_groups.is_empty()
+        && p.in_groups.is_empty()
+    {
+        return Err(QueryError::Empty);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1216,8 +1248,11 @@ mod tests {
     }
 
     #[test]
-    fn build_query_empty_is_error() {
-        assert!(matches!(build_query(&params("")), Err(QueryError::Empty)));
+    fn build_query_empty_matches_every_doc() {
+        let q = build_query(&params("")).unwrap();
+        assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0, 1, 2]);
+        // the retrievers without the allow-list still refuse it
+        assert_eq!(reject_empty(&params("")), Err(QueryError::Empty));
     }
 
     #[test]

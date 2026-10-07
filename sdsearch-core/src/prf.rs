@@ -7,7 +7,9 @@
 
 use crate::index::IndexReader;
 use crate::mlt::{MltParams, select_terms};
-use crate::query::{Occur, Query, QueryError, QueryParams, build_query, search_with_weights};
+use crate::query::{
+    Occur, Query, QueryError, QueryParams, build_query, reject_empty, search_with_weights,
+};
 use crate::search::Hit;
 use std::collections::HashMap;
 
@@ -67,6 +69,7 @@ pub fn search_prf(
     limit: usize,
 ) -> Result<Vec<Hit>, QueryError> {
     let lim = if limit == 0 { usize::MAX } else { limit };
+    reject_empty(params)?;
     let base = build_query(params)?;
 
     // Plain search closure (the graceful-degradation fallback and the final pass share it).

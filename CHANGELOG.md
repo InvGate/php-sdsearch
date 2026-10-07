@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0, so a
 breaking change bumps the **minor** version.
 
+## [Unreleased]
+
+### Fixed
+
+- **`search()` with nothing positive to match returns every document instead of throwing
+  `empty query`.** A query with only `range`/`match_all` filters, only `mustnot` `where`
+  groups, or no parameters at all used to throw (only `range`/`match_all`) or return zero
+  hits (only `mustnot`); hosts that catch the exception showed an empty screen. It now
+  matches every live document, narrowed by the filters, like an empty text in OpenSearch.
+  `semantic_query()` and `hybrid_query()` keep throwing there, since they do not apply
+  `range`/`match_all`.
+
 ## [0.3.0] - 2026-08-26
 
 ### Breaking

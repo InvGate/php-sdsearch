@@ -23,6 +23,12 @@ pub trait IndexReader {
     fn total_docs(&self) -> usize {
         self.num_docs()
     }
+    /// `true` if `doc_id` (in `0..total_docs()`) is deleted. Default = `false` (correct for
+    /// readers without deletes); the ZSL readers answer from the `.del` file.
+    fn is_deleted(&self, doc_id: usize) -> bool {
+        let _ = doc_id;
+        false
+    }
     fn doc_freq(&self, field: &str, term: &str) -> usize;
     fn postings_for(&self, field: &str, term: &str) -> Vec<(usize, u32)>;
     fn field_len(&self, doc_id: usize, field: &str) -> u32;

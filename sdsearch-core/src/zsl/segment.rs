@@ -243,6 +243,10 @@ impl IndexReader for ZslSegment {
         self.num_docs_total
     }
 
+    fn is_deleted(&self, doc_id: usize) -> bool {
+        self.deletes.is_deleted(doc_id)
+    }
+
     fn doc_freq(&self, field: &str, term: &str) -> usize {
         self.dict
             .info(field, term)
