@@ -76,12 +76,13 @@ namespace SdSearch {
          *   ALL the analyzed words of `text` (AND). A non-scoring filter, ANDed with `range[]` and
          *   with other `match_all[]` entries. Matching is on the engine's analyzed tokens (no ES
          *   `.multilang` stemming): "impresora" does not match "impresoras".
-         * - `accent_insensitive` (optional, default `false`): when `true`, text matching is
-         *   Spanish accent-insensitive (`avion` also matches `avión` and vice-versa), including
-         *   the free-text prefix leaf (`camión` also reaches `camioneta`). The per-word typo
-         *   (fuzzy) match is NOT: `camion` is a typo away from `camino`, `camión` is not, so
-         *   totals can still differ by spelling. A token longer than 64 characters matches only
-         *   its folded and typed forms.
+         * - `accent_insensitive` (optional, default `true`): text matching is Spanish
+         *   accent-insensitive (`avion` also matches `avión` and vice-versa), including the
+         *   free-text prefix leaf (`camión` also reaches `camioneta`) and the per-word typo
+         *   (fuzzy) match, which measures the distance between the folded forms, so both
+         *   spellings return the same totals and ranking. `false` matches accents as typed. A
+         *   token longer than 64 characters matches only its folded and typed forms. Changed in
+         *   0.4.0: previously defaulted to `false`.
          * - `synonyms` (optional, default `false`): when `true`, each query token is
          *   also matched against its bundled synonyms and cross-lingual translations
          *   (Spanish↔English), scored below the literal token. Widens recall.

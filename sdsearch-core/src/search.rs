@@ -308,20 +308,18 @@ pub(crate) fn accent_wildcard_terms(
     terms
 }
 
-/// Fuzzy leaf scores: each matched term's score times its Zend boost (see `fuzzy_terms`),
-/// summed per doc — so a typo variant counts for less than the exact word.
+/// Fuzzy leaf scores: each of `terms` (from `fuzzy_terms`) scored times its Zend boost, summed
+/// per doc — so a typo variant counts for less than the exact word.
 pub(crate) fn fuzzy_scores(
     index: &impl IndexReader,
     sim: Similarity,
     field: &str,
-    term: &str,
-    min_similarity: f32,
-    prefix_length: usize,
+    terms: &[(String, f32)],
     restrict: Option<&HashSet<usize>>,
 ) -> HashMap<usize, f32> {
     let mut scored: HashMap<usize, f32> = HashMap::new();
-    for (matched, boost) in fuzzy_terms(index, field, term, min_similarity, prefix_length) {
-        for (doc_id, s) in term_scores(index, sim, field, &matched, restrict) {
+    for (matched, boost) in terms {
+        for (doc_id, s) in term_scores(index, sim, field, matched, restrict) {
             *scored.entry(doc_id).or_insert(0.0) += s * boost;
         }
     }
@@ -335,48 +333,56 @@ pub(crate) fn fuzzy_scores(
 /// boost is Zend's `(similarity - min_similarity) / (1 - min_similarity)`: 1 for the exact
 /// word, falling to 0 at the threshold. `similarity > min_similarity` keeps the divisor
 /// positive.
-fn fuzzy_terms(
+///
+/// `accent_insensitive`: the prefix also picks the buckets of its accent variants (the
+/// `accent_wildcard_terms` rule; disjoint, same length in chars) and the distance is measured
+/// between the folded forms, so `camión` is the word `camion` itself, not a typo of it.
+pub(crate) fn fuzzy_terms(
     index: &impl IndexReader,
     field: &str,
     term: &str,
     min_similarity: f32,
     prefix_length: usize,
+    accent_insensitive: bool,
 ) -> Vec<(String, f32)> {
     let min_sim = f64::from(min_similarity);
     // exact prefix = first prefix_length UTF-8 chars
     let prefix: String = term.chars().take(prefix_length).collect();
-    let prefix_byte_len = prefix.len();
     let prefix_utf8_len = prefix.chars().count();
-    let term_rest = &term.as_bytes()[prefix_byte_len..];
-    let term_rest_len = term_rest.len();
+    let (seed, buckets) = if accent_insensitive {
+        (
+            crate::analysis::fold_accents(term),
+            crate::analysis::accent_variants(&prefix),
+        )
+    } else {
+        (term.to_string(), vec![prefix])
+    };
+    // every bucket folds to the seed's prefix, so one byte length cuts every candidate
+    let prefix_byte_len = seed
+        .char_indices()
+        .nth(prefix_utf8_len)
+        .map_or(seed.len(), |(i, _)| i);
+    let term_rest = &seed.as_bytes()[prefix_byte_len..];
 
     let mut matched: Vec<(f64, String)> = Vec::new();
-    for cand in index.terms_with_prefix(field, &prefix) {
-        let target = &cand.as_bytes()[prefix_byte_len..];
-        let target_len = target.len();
-        // maxDistance = (int)((1-minSim)*(min(termRest,target)+prefixUtf8Len))
-        let max_distance =
-            ((1.0 - min_sim) * ((term_rest_len.min(target_len) + prefix_utf8_len) as f64)) as i64;
-        let similarity: f64 = if term_rest_len == 0 {
-            if prefix_utf8_len == 0 {
-                0.0
-            } else {
-                1.0 - (target_len as f64) / (prefix_utf8_len as f64)
+    for bucket in &buckets {
+        for cand in index.terms_with_prefix(field, bucket) {
+            let similarity = {
+                let key = if accent_insensitive {
+                    std::borrow::Cow::Owned(crate::analysis::fold_accents(&cand))
+                } else {
+                    std::borrow::Cow::Borrowed(cand.as_str())
+                };
+                zend_similarity(
+                    term_rest,
+                    &key.as_bytes()[prefix_byte_len..],
+                    prefix_utf8_len,
+                    min_sim,
+                )
+            };
+            if similarity > min_sim {
+                matched.push((similarity, cand));
             }
-        } else if target_len == 0 {
-            if prefix_utf8_len == 0 {
-                0.0
-            } else {
-                1.0 - (term_rest_len as f64) / (prefix_utf8_len as f64)
-            }
-        } else if max_distance < (term_rest_len as i64 - target_len as i64).abs() {
-            0.0
-        } else {
-            let d = levenshtein_bytes(term_rest, target) as f64;
-            1.0 - d / ((prefix_utf8_len + term_rest_len.min(target_len)) as f64)
-        };
-        if similarity > min_sim {
-            matched.push((similarity, cand));
         }
     }
     // ZSL Fuzzy parity: keep at most the 1024 most similar terms.
@@ -393,6 +399,33 @@ fn fuzzy_terms(
         .into_iter()
         .map(|(similarity, t)| (t, ((similarity - min_sim) / (1.0 - min_sim)) as f32))
         .collect()
+}
+
+/// Zend's similarity of a candidate to the query word, both past the shared prefix of
+/// `prefix_utf8_len` chars (bytes in the rest, chars in the prefix, as Zend counts them).
+fn zend_similarity(term_rest: &[u8], target: &[u8], prefix_utf8_len: usize, min_sim: f64) -> f64 {
+    let (term_rest_len, target_len) = (term_rest.len(), target.len());
+    // maxDistance = (int)((1-minSim)*(min(termRest,target)+prefixUtf8Len))
+    let max_distance =
+        ((1.0 - min_sim) * ((term_rest_len.min(target_len) + prefix_utf8_len) as f64)) as i64;
+    if term_rest_len == 0 {
+        if prefix_utf8_len == 0 {
+            0.0
+        } else {
+            1.0 - (target_len as f64) / (prefix_utf8_len as f64)
+        }
+    } else if target_len == 0 {
+        if prefix_utf8_len == 0 {
+            0.0
+        } else {
+            1.0 - (term_rest_len as f64) / (prefix_utf8_len as f64)
+        }
+    } else if max_distance < (term_rest_len as i64 - target_len as i64).abs() {
+        0.0
+    } else {
+        let d = levenshtein_bytes(term_rest, target) as f64;
+        1.0 - d / ((prefix_utf8_len + term_rest_len.min(target_len)) as f64)
+    }
 }
 
 /// doc -> positions merged over `terms`, plus the idf of their pooled doc frequency.
@@ -726,17 +759,10 @@ pub fn fuzzy_query(
     min_score: f32,
     limit: usize,
 ) -> Vec<Hit> {
+    let terms = fuzzy_terms(index, field, term, min_similarity, prefix_length, false);
     finalize(
         index,
-        fuzzy_scores(
-            index,
-            Similarity::Bm25,
-            field,
-            term,
-            min_similarity,
-            prefix_length,
-            None,
-        ),
+        fuzzy_scores(index, Similarity::Bm25, field, &terms, None),
         min_score,
         limit,
     )
