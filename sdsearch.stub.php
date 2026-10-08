@@ -52,6 +52,8 @@ namespace SdSearch {
          *   "field_weights": { "title": 3.0, "description": 1.0 },
          *   "similarity": "bm25",
          *   "wildcard_min_prefix": 2,
+         *   "fuzzy_similarity": 0.5,
+         *   "fuzzy_prefix_len": 3,
          *   "sort": "created_at_key",
          *   "sort_dir": "desc",
          *   "exact_match": false,
@@ -93,6 +95,11 @@ namespace SdSearch {
          *   queries no longer scan the whole vocabulary). Pass `0`/`1` for typeahead surfaces.
          *   With `accent_insensitive`, measured on the accent-folded prefix (`có` counts as 2
          *   bytes, not 3).
+         * - `fuzzy_similarity` (optional, default `0.5`): minimum similarity, in `[0, 1)`, for a
+         *   free-text typo match; outside the range THROWS. Each matched variant scores times
+         *   `(sim - min) / (1 - min)`, so the exact word always weighs more than its variants.
+         * - `fuzzy_prefix_len` (optional, default `3`): leading characters a typo match must
+         *   share exactly with the query word.
          * - `sort` (optional): keyword field to order by, used VERBATIM (pass the `_key` name).
          *   A field the index does not have THROWS — otherwise every doc ties on a missing value
          *   and the tiebreak order comes back looking like working sorting. Stored-only fields

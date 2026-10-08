@@ -26,6 +26,12 @@ breaking change bumps the **minor** version.
   `accent_insensitive` field, `QueryError::Empty` is gone (`build_query` no longer rejects an
   empty query), and `IndexReader::is_deleted` is a new required method.
 
+### Added
+
+- `search()` params `fuzzy_similarity` (default `0.5`, must be in `[0, 1)`) and
+  `fuzzy_prefix_len` (default `3`), until now fixed in the extension, so hosts can tune typo
+  matching without a release.
+
 ### Fixed
 
 - **`semantic_query()` and `hybrid_query()` apply `range` and `match_all`.** Both were parsed
@@ -44,6 +50,11 @@ breaking change bumps the **minor** version.
   (`información-gestión`, a compound the analyzer keeps whole). Only single-tilde variants
   were searched, so the exact term and phrase leaves matched nothing and the doc lost that
   part of its score.
+- **A typo variant no longer weighs as much as the exact word.** The fuzzy leaf computed each
+  term's similarity and dropped it, so every variant scored at full weight; with length
+  normalization, a request containing the exact word could rank below fuzzy-only ones. Each
+  variant now scores times `(sim - min) / (1 - min)`, the boost Zend's `Fuzzy::rewrite`
+  applies (1 for the exact word).
 
 ## [0.3.0] - 2026-08-26
 

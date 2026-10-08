@@ -110,4 +110,29 @@ if (!$rejected) {
 }
 \fwrite(\STDOUT, "hybrid_query boolean_tree rejection OK\n");
 
+// smoke test: fuzzy_similarity / fuzzy_prefix_len reach the engine. "mysgl" reaches the
+// "mysql" doc only through the fuzzy leaf (similarity 0.8 with the default prefix of 3), so
+// raising the threshold past it, or the prefix past the shared "mys", must drop the hit; a
+// threshold outside [0, 1) must throw instead of silently switching fuzzy off.
+$fuzzyHits = static fn (array $extra): int => \count(\json_decode($engine->search(
+    $indexDir,
+    \json_encode(['text' => 'mysgl', 'wildcard_min_prefix' => 0] + $extra)
+), true)['hits']);
+if ($fuzzyHits([]) !== 1 || $fuzzyHits(['fuzzy_similarity' => 0.9]) !== 0
+    || $fuzzyHits(['fuzzy_prefix_len' => 4]) !== 0) {
+    \fwrite(\STDERR, "FAIL: fuzzy_similarity/fuzzy_prefix_len did not reach the engine\n");
+    exit(1);
+}
+$rejected = false;
+try {
+    $fuzzyHits(['fuzzy_similarity' => 1.0]);
+} catch (\Throwable $e) {
+    $rejected = true;
+}
+if (!$rejected) {
+    \fwrite(\STDERR, "FAIL: fuzzy_similarity 1.0 did not throw\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "search fuzzy knobs OK\n");
+
 exit(0);

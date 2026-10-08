@@ -5,7 +5,7 @@ use crate::index::IndexReader;
 use crate::score::Similarity;
 use crate::search::{
     Hit, SearchOutcome, SortSpec, accent_variant_terms, accent_wildcard_terms, finalize_paged,
-    finalize_sorted, fuzzy_terms, phrase_scores, term_scores, union_scores, wildcard_terms,
+    finalize_sorted, fuzzy_scores, phrase_scores, term_scores, union_scores, wildcard_terms,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -145,9 +145,9 @@ fn eval(
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                let terms = fuzzy_terms(index, &f, text, *similarity, *prefix_len);
-                let refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                for (id, s) in union_scores(index, sim, &f, &refs, restrict) {
+                for (id, s) in
+                    fuzzy_scores(index, sim, &f, text, *similarity, *prefix_len, restrict)
+                {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
