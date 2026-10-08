@@ -192,6 +192,6 @@ fn accent_insensitive_phrase_on_disk() {
 fn a_phrase_never_spans_two_fields_on_disk() {
     // el doc 0 termina el title con "fox" y arranca el body con "impresion": no es una frase.
     let (dir, _base_offset, idx) = on_disk("fields");
-    assert!(ids(&idx, term("fox impresion"), false).is_empty());
+    assert_eq!(ids(&idx, term("fox impresion"), false), Vec::<usize>::new());
     std::fs::remove_dir_all(&dir).ok();
 }

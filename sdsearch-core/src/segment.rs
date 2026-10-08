@@ -127,6 +127,10 @@ impl IndexReader for Segment {
         self.num_docs
     }
 
+    fn is_deleted(&self, _doc_id: usize) -> bool {
+        false // build-once format: no deletes
+    }
+
     fn doc_freq(&self, field: &str, term: &str) -> usize {
         match self.offset_of(field, term) {
             Some(off) => {

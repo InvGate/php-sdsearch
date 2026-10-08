@@ -709,7 +709,10 @@ mod tests {
     #[test]
     fn accent_variant_terms_empty_when_nothing_matches() {
         let idx = accent_corpus();
-        assert!(accent_variant_terms(&idx, "body", "zzz").is_empty());
+        assert_eq!(
+            accent_variant_terms(&idx, "body", "zzz"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1235,6 +1238,10 @@ mod tests {
             self.stored_fields_calls
                 .set(self.stored_fields_calls.get() + 1);
             self.inner.stored_fields(doc_id)
+        }
+
+        fn is_deleted(&self, doc_id: usize) -> bool {
+            self.inner.is_deleted(doc_id)
         }
 
         // --- term dictionary: reaching any of these is the regression ---

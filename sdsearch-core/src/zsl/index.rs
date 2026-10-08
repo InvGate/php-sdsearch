@@ -58,6 +58,11 @@ impl IndexReader for ZslIndex {
         self.total_docs
     }
 
+    fn is_deleted(&self, doc_id: usize) -> bool {
+        self.locate(doc_id)
+            .is_some_and(|(e, local)| e.seg.is_deleted(local))
+    }
+
     fn doc_freq(&self, field: &str, term: &str) -> usize {
         self.entries
             .iter()

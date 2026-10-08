@@ -6,8 +6,7 @@ use crate::index::IndexReader;
 use crate::mlt::{MltParams, more_like_this};
 use crate::prf::{PrfParams, search_prf};
 use crate::query::{
-    InGroup, QueryError, QueryParams, build_query, intersect_allow, match_all_allow_list,
-    range_allow_list, search, search_with_weights, search_with_weights_paged,
+    InGroup, QueryError, QueryParams, allow_list, build_query, search, search_with_weights_paged,
 };
 use crate::search::{Hit, SearchOutcome, SortSpec};
 use crate::zsl::index::ZslIndex;
@@ -24,15 +23,20 @@ fn lexical_search(
 ) -> Result<Vec<Hit>, QueryError> {
     let query = build_query(params)?;
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let hits = search_with_weights(
+    let restrict = allow_list(index, params);
+    Ok(search_with_weights_paged(
         index,
         &query,
         &params.field_weights,
         params.similarity,
         min_score,
+        0,
         lim,
-    );
-    Ok(hits)
+        None,
+        restrict.as_ref(),
+        None,
+    )
+    .hits)
 }
 
 /// Searches a ZSL index reproducing the host application's Zend Lucene search adapter:
@@ -121,10 +125,7 @@ pub fn search_index_paged(
     let query = build_query(params)?;
     reject_unknown_sort_field(&index, params.sort.as_ref())?;
     let lim = if limit == 0 { usize::MAX } else { limit };
-    let restrict = intersect_allow(
-        range_allow_list(&index, &params.range_filters),
-        match_all_allow_list(&index, &params.match_all),
-    );
+    let restrict = allow_list(&index, params);
     Ok(search_with_weights_paged(
         &index,
         &query,
@@ -339,17 +340,28 @@ mod tests {
         assert_eq!(prf_ids, plain_ids);
     }
 
+    /// A where group with no field name: the query `build_query` rejects.
+    fn invalid_params() -> QueryParams {
+        let mut p = params("vpn");
+        p.where_groups = vec![crate::query::WhereGroup {
+            field: String::new(),
+            values: vec!["x".into()],
+            occur: crate::query::Occur::Should,
+        }];
+        p
+    }
+
     #[test]
     fn search_prf_index_propagates_query_error() {
-        // An invalid query (empty text) must propagate as an Err through the runner's
-        // Box<dyn Error> boundary, not get swallowed into an empty Ok(vec![]) — mirrors
-        // search_prf's own invalid_query_propagates_err test, one layer up the stack.
+        // An invalid query must propagate as an Err through the runner's Box<dyn Error>
+        // boundary, not get swallowed into an empty Ok(vec![]) — mirrors search_prf's own
+        // invalid_query_propagates_err test, one layer up the stack.
         use crate::prf::PrfParams;
         let dir = multiseg();
-        let result = search_prf_index(&dir, &params(""), &PrfParams::default(), 0.0, 0);
+        let result = search_prf_index(&dir, &invalid_params(), &PrfParams::default(), 0.0, 0);
         assert!(
             result.is_err(),
-            "empty-text query must propagate an error through search_prf_index"
+            "an invalid query must propagate an error through search_prf_index"
         );
     }
 
@@ -476,6 +488,146 @@ mod tests {
         assert_eq!(ids(&capped.hits), full_ids, "cap bounds total, not hits");
     }
 
+    // Live docs of the multiseg fixture: doc 3 ("delta backup notes") is deleted by `_1_1.del`.
+    const MULTISEG_LIVE: [usize; 5] = [0, 1, 2, 4, 5];
+
+    fn in_only(field: &str, values: &[&str]) -> QueryParams {
+        let mut p = params("");
+        p.in_groups = vec![InGroup {
+            field: field.into(),
+            values: values.iter().map(|v| (*v).to_string()).collect(),
+        }];
+        p
+    }
+
+    #[test]
+    fn search_index_paged_with_nothing_to_match_returns_every_live_doc() {
+        // No text, tree, where or in is "everything", as OpenSearch answers an empty text.
+        // It used to throw "empty query", which the host adapter turned into zero rows.
+        let out = search_index_paged(&multiseg(), &params(""), 0.0, 0, 0, None)
+            .expect("an empty query is not an error on the paged path");
+        assert_eq!(ids(&out.hits), MULTISEG_LIVE, "the deleted doc stays out");
+        assert_eq!(out.total, MULTISEG_LIVE.len());
+        let flat = search_index(&multiseg(), &params(""), 0.0, 0).expect("nor on the flat one");
+        assert_eq!(ids(&flat), MULTISEG_LIVE);
+    }
+
+    #[test]
+    fn search_index_paged_with_only_a_range_narrows_every_live_doc() {
+        // The "only a date filter" screen: `range` is an allow-list, not a clause, so it never
+        // counted as something to match.
+        let mut p = params("");
+        p.range_filters = cat_1_range();
+        let expected = search_index(&multiseg(), &in_only("cat", &["1"]), 0.0, 0).unwrap();
+        assert!(
+            !expected.is_empty() && expected.len() < MULTISEG_LIVE.len(),
+            "fixture sanity: the range must keep some live docs and drop others"
+        );
+
+        let out = search_index_paged(&multiseg(), &p, 0.0, 0, 0, None)
+            .expect("a range-only query is not an error on the paged path");
+        assert_eq!(ids(&out.hits), ids(&expected));
+    }
+
+    #[test]
+    fn search_index_paged_with_only_a_mustnot_where_returns_everything_but_the_excluded() {
+        // A lone `mustnot` used to have nothing to subtract from and returned zero hits.
+        let mut p = params("");
+        p.where_groups = mustnot_lang_en();
+        let english: HashSet<usize> = search_index(&multiseg(), &in_only("lang", &["en"]), 0.0, 0)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert!(!english.is_empty(), "fixture sanity: some doc is lang=en");
+        let expected: Vec<usize> = MULTISEG_LIVE
+            .into_iter()
+            .filter(|d| !english.contains(d))
+            .collect();
+
+        let out = search_index_paged(&multiseg(), &p, 0.0, 0, 0, None).unwrap();
+        assert_eq!(ids(&out.hits), expected);
+    }
+
+    fn cat_1_range() -> Vec<crate::query::RangeFilter> {
+        vec![crate::query::RangeFilter {
+            field: "cat_key".into(),
+            lower: Some("1".into()),
+            upper: Some("1".into()),
+        }]
+    }
+
+    fn mustnot_lang_en() -> Vec<crate::query::WhereGroup> {
+        vec![crate::query::WhereGroup {
+            field: "lang".into(),
+            values: vec!["en".into()],
+            occur: crate::query::Occur::MustNot,
+        }]
+    }
+
+    #[test]
+    fn every_retriever_applies_the_range_like_the_paged_one() {
+        // `search_index` and the semantic/hybrid paths used to skip the `range`/`match_all`
+        // allow-list: with text, a date filter was silently dropped; with only a `mustnot`, the
+        // `MatchAll` base leaked every live doc past it.
+        let allowed: HashSet<usize> =
+            ids(&search_index(&multiseg(), &in_only("cat", &["1"]), 0.0, 0).unwrap())
+                .into_iter()
+                .collect();
+        let unfiltered = ids(&search_index(&multiseg(), &params("how"), 0.0, 0).unwrap());
+        assert!(
+            unfiltered.iter().any(|d| !allowed.contains(d)),
+            "fixture sanity: the range must drop a text match"
+        );
+
+        let mut text = params("how");
+        text.range_filters = cat_1_range();
+        let mut mustnot_only = params("");
+        mustnot_only.range_filters = cat_1_range();
+        mustnot_only.where_groups = mustnot_lang_en();
+
+        for p in [text, mustnot_only] {
+            let paged = search_index_paged(&multiseg(), &p, 0.0, 0, 0, None).unwrap();
+            let flat = search_index(&multiseg(), &p, 0.0, 0).unwrap();
+            assert_eq!(ids(&flat), ids(&paged.hits), "text={:?}", p.text);
+
+            let prf = PrfParams::default();
+            let semantic = search_prf_index(&multiseg(), &p, &prf, 0.0, 0).unwrap();
+            let hybrid =
+                search_hybrid_index(&multiseg(), &p, &prf, &HybridParams::default(), 0.0, 0)
+                    .unwrap();
+            for (name, hits) in [("semantic", semantic), ("hybrid", hybrid)] {
+                assert!(
+                    ids(&hits).iter().all(|d| allowed.contains(d)),
+                    "{name} leaked past the range (text={:?}): {:?}",
+                    p.text,
+                    ids(&hits)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn match_all_under_a_restrict_drops_deleted_and_unknown_ids() {
+        // `restrict` is caller input on the pub paged API: `MatchAll` must narrow it to live
+        // docs, not echo it back. Doc 3 is deleted in this fixture; 99 does not exist.
+        let index = ZslIndex::open(&multiseg()).unwrap();
+        let allow: HashSet<usize> = [0, 3, 99].into();
+        let out = search_with_weights_paged(
+            &index,
+            &build_query(&params("")).unwrap(),
+            &std::collections::HashMap::new(),
+            crate::score::Similarity::Bm25,
+            0.0,
+            0,
+            usize::MAX,
+            None,
+            Some(&allow),
+            None,
+        );
+        assert_eq!(ids(&out.hits), vec![0]);
+    }
+
     use crate::mlt::MltParams;
     use crate::zsl::writer::{IndexWriter, WriterDoc, WriterField, WriterOpts};
     use std::collections::HashMap as StdHashMap;
@@ -589,19 +741,19 @@ mod tests {
 
     #[test]
     fn search_hybrid_index_propagates_query_error() {
-        // Empty-text query is invalid and must propagate as Err, not an empty Ok.
+        // An invalid query must propagate as Err, not an empty Ok.
         use crate::hybrid::HybridParams;
         use crate::prf::PrfParams;
         let dir = multiseg();
         let r = search_hybrid_index(
             &dir,
-            &params(""),
+            &invalid_params(),
             &PrfParams::default(),
             &HybridParams::default(),
             0.0,
             0,
         );
-        assert!(r.is_err(), "empty-text query must propagate an error");
+        assert!(r.is_err(), "an invalid query must propagate an error");
     }
 
     #[test]

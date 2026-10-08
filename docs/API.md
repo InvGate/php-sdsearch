@@ -170,9 +170,9 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 
 | Key | Type | Meaning |
 |---|---|---|
-| `text` | string | Free-text query over tokenized fields. |
+| `text` | string | Free-text query over tokenized fields. With no `text`, `boolean_tree`, `in`, nor a `must`/`should` `where`, the query matches EVERY document (constant score), narrowed by `range`/`match_all` and minus any `mustnot` `where` — like an empty text in OpenSearch. `semantic_query()`/`hybrid_query()` have nothing to expand there and return the same listing. |
 | `where` | array | Each `{field, values[], occur}`; `occur` ∈ `must` \| `mustnot` \| `should` (default `should`). |
-| `in` | array | Each `{field, values[]}`; matches the (literal, key-suffixed) field against any value. |
+| `in` | array | Each `{field, values[]}`; matches the (literal, key-suffixed) field against any value. Groups whose values are ALL empty match NOTHING (an empty allow-list, not "no filter"). |
 | `range` | array | Optional (default `[]`). Each `{field, from?, to?}`; keeps docs whose `field` term is in the inclusive `[from, to]` range (either bound optional). `field` verbatim. Multiple entries are ANDed. Docs missing the field are excluded. **Bounds are compared as bytes, not numerically** — see the note below. |
 | `match_all` | array | Optional (default `[]`). Each `{field, text}`; keeps docs whose `field` contains ALL the analyzed words of `text` (AND). A non-scoring filter, ANDed with `range` and with the other `match_all` entries. Matching is on the engine's analyzed tokens: `"impresora"` does not match `"impresoras"`. |
 | `min_score` | float | Drop hits below this score. |
@@ -210,10 +210,10 @@ printf("%d%s matches\n", $res['total'], $res['total_capped'] ? '+' : '');
 
 A negated branch (`not`) contributes NO documents of its own — it only subtracts from
 whatever it's ANDed against. So `or(not(x), y)` returns whatever `y` matches, NOT zero: the
-negated branch drops out silently rather than failing the whole `or`. Only a tree where NO
-branch contributes any positive match at all (`NOT foo` at the root, an `and` whose children
-are all `not`, `children: []`) returns ZERO hits — the engine has no "every document" leaf to
-subtract from. Nesting deeper than 32 levels THROWS.
+negated branch drops out silently rather than failing the whole `or`. A tree that only negates
+at the ROOT (`NOT foo`, an `and` whose children are all `not`) subtracts from every document,
+like the equivalent `mustnot` `where`. Any other tree with no positive match (`or(not(x))`,
+`children: []`) returns ZERO hits. Nesting deeper than 32 levels THROWS.
 
 `accent_insensitive` applies INSIDE a phrase (`impresion rota` also matches `impresión
 rota`). `synonyms` does NOT: a phrase is literal.

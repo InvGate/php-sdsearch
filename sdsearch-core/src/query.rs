@@ -61,6 +61,9 @@ pub enum Query {
         boost: f32,
         inner: Box<Query>,
     },
+    /// every live doc, constant score. The base `build_query` gives a query with nothing
+    /// positive to match, so `range`/`match_all` narrow it and a `mustnot` subtracts from it.
+    MatchAll,
 }
 
 /// target fields of a leaf: the given one, or all indexed fields if None.
@@ -164,6 +167,23 @@ fn eval(
                 *s *= *boost;
             }
             acc
+        }
+        // `restrict` is caller input on the pub paged API, so it is narrowed like postings
+        // would be: only ids that exist and are not deleted.
+        Query::MatchAll => {
+            let live = |&id: &usize| id < index.total_docs() && !index.is_deleted(id);
+            match restrict {
+                Some(allowed) => allowed
+                    .iter()
+                    .copied()
+                    .filter(live)
+                    .map(|id| (id, 1.0))
+                    .collect(),
+                None => (0..index.total_docs())
+                    .filter(live)
+                    .map(|id| (id, 1.0))
+                    .collect(),
+            }
         }
     }
 }
@@ -438,6 +458,15 @@ pub fn intersect_allow(
     }
 }
 
+/// The `range`/`match_all` allow-list of `p`, to pass as `restrict`. Every retriever applies it:
+/// it is what narrows the `MatchAll` base of a query with nothing positive to match.
+pub fn allow_list(index: &impl IndexReader, p: &QueryParams) -> Option<HashSet<usize>> {
+    intersect_allow(
+        range_allow_list(index, &p.range_filters),
+        match_all_allow_list(index, &p.match_all),
+    )
+}
+
 /// Doc allow-list for a set of matchAll filters, ANDed together. For each filter, the analyzed
 /// words must all occur in the field: intersect the words' postings, cheapest (rarest, by
 /// `doc_freq`) first, short-circuiting to empty as soon as the running set is empty or a word is
@@ -533,8 +562,6 @@ pub struct QueryParams {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryError {
-    /// no text, no where, no in: nothing to search.
-    Empty,
     /// a where/in group has an empty field name.
     EmptyField,
     /// a boolean tree nests deeper than `MAX_TREE_DEPTH`.
@@ -544,7 +571,6 @@ pub enum QueryError {
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueryError::Empty => write!(f, "empty query"),
             QueryError::EmptyField => write!(f, "empty field name in where/in group"),
             QueryError::TreeTooDeep => write!(f, "boolean tree nested deeper than 32 levels"),
         }
@@ -591,14 +617,14 @@ fn strip_double_negation(node: &BoolNode) -> &BoolNode {
 /// Maps a `BoolNode` tree to the equivalent `Query`. `accent_insensitive` is threaded to
 /// every phrase leaf.
 ///
-/// A negation with no positive sibling (`NOT foo` at the root, a `not` under an `or`, an
-/// `and` whose children are all `not`) maps to a `Boolean` that `eval_boolean` resolves to
-/// zero hits: with no `Must` it takes the union-of-shoulds branch and accumulates nothing.
-/// That is deliberate — the host's parser rejects those trees upstream
-/// (`IBooleanNode::requiresPositiveMatch`), and answering them properly would need an
-/// "every live doc" leaf, i.e. a new `IndexReader` method with three implementations.
-// ponytail: pure negation returns empty silently. Upgrade path is `IndexReader::live_docs()`
-// plus a `Query::MatchAll` leaf, after which `not` is correct in any position.
+/// A negation with no positive sibling (`NOT foo`, a `not` under an `or`, an `and` whose
+/// children are all `not`) maps to a `Boolean` that `eval_boolean` resolves to zero hits: with
+/// no `Must` it takes the union-of-shoulds branch and accumulates nothing. At the ROOT,
+/// `build_query` hoists those `MustNot`s next to its `MatchAll` base, so they subtract from
+/// every doc; nested under an `or`, a `not` drops out (docs/API.md). The host's parser rejects
+/// all of these upstream anyway (`IBooleanNode::requiresPositiveMatch`).
+// ponytail: a nested pure negation still returns empty silently. Upgrade path: give `Not` a
+// `Must` of `Query::MatchAll` to subtract from, after which `not` is correct in any position.
 pub(crate) fn map_bool_node(
     node: &BoolNode,
     accent_insensitive: bool,
@@ -741,16 +767,20 @@ fn key_field_in(field: &str) -> String {
 /// builds the boolean Query equivalent to Zend Lucene's boolean query builder for the supported surface.
 pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
     let has_text = !p.text.trim().is_empty();
-    if !has_text && p.boolean_tree.is_none() && p.where_groups.is_empty() && p.in_groups.is_empty()
-    {
-        return Err(QueryError::Empty);
-    }
-
     let mut top: Vec<(Occur, Query)> = Vec::new();
 
     // a boolean tree REPLACES the free-text subquery (host precedence: tree > exact > text).
     if let Some(tree) = &p.boolean_tree {
-        top.push((Occur::Must, map_bool_node(tree, p.accent_insensitive, 0)?));
+        match map_bool_node(tree, p.accent_insensitive, 0)? {
+            // a root that only negates (`NOT x`, an `and` of nots) is a `mustnot` where in
+            // disguise: hoisted to the top, it subtracts from the `MatchAll` base below.
+            Query::Boolean { clauses }
+                if !clauses.is_empty() && clauses.iter().all(|(o, _)| *o == Occur::MustNot) =>
+            {
+                top.extend(clauses);
+            }
+            q => top.push((Occur::Must, q)),
+        }
     } else if has_text {
         top.push((Occur::Must, text_subquery(p)));
     }
@@ -799,13 +829,25 @@ pub fn build_query(p: &QueryParams) -> Result<Query, QueryError> {
             ));
         }
     }
-    if !in_clauses.is_empty() {
+    // groups present but no values at all is "allowed in none", not "no filter": the empty
+    // Boolean is still required, so it matches nothing (fails closed).
+    if !p.in_groups.is_empty() {
         top.push((
             Occur::Must,
             Query::Boolean {
                 clauses: in_clauses,
             },
         ));
+    }
+
+    // Nothing positive to match (no text/tree, nothing at all, or only `mustnot` groups) means
+    // "every doc", narrowed by the `range`/`match_all` allow-list and minus the `mustnot`s — the
+    // same answer OpenSearch gives an empty text. A `should`-only where keeps its old meaning.
+    if !top
+        .iter()
+        .any(|(o, _)| matches!(o, Occur::Must | Occur::Should))
+    {
+        top.push((Occur::Must, Query::MatchAll));
     }
 
     Ok(Query::Boolean { clauses: top })
@@ -1168,8 +1210,57 @@ mod tests {
     }
 
     #[test]
-    fn build_query_empty_is_error() {
-        assert!(matches!(build_query(&params("")), Err(QueryError::Empty)));
+    fn build_query_where_ors_within_a_field_and_ands_between_fields() {
+        // Invariante del que depende traducir un in() AND-eado a where(): los valores de UN
+        // where group son Should entre sí (OR), y el grupo entero entra como Must (AND entre
+        // campos). Nunca `type=1 AND type=2`, que no matchearía nada. Es la misma forma que
+        // arma Zend (Boolean por campo, sign null por valor -> unión; sign true al grupo) y que
+        // arma ES/OpenSearch (un `terms` por campo dentro de bool.filter).
+        let mut idx = MemoryIndex::new();
+        for (title, ty, st) in [("vpn guide", "1", "4"), ("vpn setup", "2", "9")] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("type_key", ty, FieldKind::Keyword);
+            d.add("status_key", st, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+        let group = |field: &str, values: &[&str]| WhereGroup {
+            field: field.into(),
+            values: values.iter().map(|v| (*v).to_string()).collect(),
+            occur: Occur::Must,
+        };
+
+        // OR adentro del campo: los dos docs pasan, ninguno tiene type 1 Y 2 a la vez.
+        let mut p = params("vpn");
+        p.where_groups = vec![group("type", &["1", "2"])];
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            vec![0, 1],
+            "los valores de un where group son OR, no AND"
+        );
+
+        // AND entre campos: type in (1,2) AND status in (4) => sólo doc0.
+        let mut p = params("vpn");
+        p.where_groups = vec![group("type", &["1", "2"]), group("status", &["4"])];
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            vec![0],
+            "dos where groups AND-ean"
+        );
+
+        // y el AND es real: un status que no matchea ningún doc vacía el resultado.
+        let mut p = params("vpn");
+        p.where_groups = vec![group("type", &["1", "2"]), group("status", &["7"])];
+        assert!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)).is_empty(),
+            "el segundo where group filtra de verdad"
+        );
+    }
+
+    #[test]
+    fn build_query_empty_matches_every_doc() {
+        let q = build_query(&params("")).unwrap();
+        assert_eq!(ids(&search(&corpus(), &q, 0.0, 100)), vec![0, 1, 2]);
     }
 
     #[test]
@@ -1201,6 +1292,21 @@ mod tests {
     }
 
     #[test]
+    fn build_query_in_group_without_values_matches_nothing() {
+        // The host restricts visibility with `in`: "allowed in none of these" must not read as
+        // "no filter". It used to drop the group, leaking every text match — and, with no
+        // text, the whole index through the `MatchAll` base.
+        let mut p = params("");
+        p.in_groups = vec![InGroup {
+            field: "lang".into(),
+            values: vec![],
+        }];
+        assert!(search(&corpus(), &build_query(&p).unwrap(), 0.0, 100).is_empty());
+        p.text = "vpn".into();
+        assert!(search(&corpus(), &build_query(&p).unwrap(), 0.0, 100).is_empty());
+    }
+
+    #[test]
     fn build_query_in_suffixes_key_conditionally() {
         // IN uses key-field naming: "cat" -> "cat_key"; "id_key" stays "id_key" (already contains it).
         let mut p = params("x");
@@ -1226,6 +1332,43 @@ mod tests {
         assert!(
             !query_mentions_field(&q, "id_key_key"),
             "IN must not duplicate _key"
+        );
+    }
+
+    #[test]
+    fn build_query_ors_in_groups_across_distinct_fields() {
+        // Dos in() sobre campos DISTINTOS se combinan con OR, no con AND: todos los grupos IN
+        // colapsan en un único Boolean de Shoulds agregado una sola vez como Must (ver el
+        // comentario junto a `in_clauses`). Es la semántica de Zend_Search_Lucene
+        // (ZendLucene::addQueriesIn arma UN MultiTerm con occur=null) y la espejamos a propósito:
+        // la búsqueda de KB filtra visibility_type y responsible con in() separados y depende de
+        // ese OR. El corpus discrimina las cuatro hipótesis: OR -> [0,1]; AND -> []; sólo el
+        // primer in -> [0]; sólo el último -> [1].
+        let mut idx = MemoryIndex::new();
+        for (title, ty, resp) in [("vpn guide", "8", "100"), ("vpn setup", "5", "101")] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            d.add("type_key", ty, FieldKind::Keyword);
+            d.add("responsible_key", resp, FieldKind::Keyword);
+            idx.add_document(d);
+        }
+
+        let mut p = params("vpn");
+        p.in_groups = vec![
+            InGroup {
+                field: "type".into(),
+                values: vec!["8".into()],
+            },
+            InGroup {
+                field: "responsible".into(),
+                values: vec!["101".into()],
+            },
+        ];
+        let q = build_query(&p).unwrap();
+        assert_eq!(
+            ids(&search(&idx, &q, 0.0, 100)),
+            vec![0, 1],
+            "los grupos IN OR-ean entre campos distintos, no AND-ean"
         );
     }
 
@@ -1889,7 +2032,10 @@ mod tests {
 
         // query the Spanish term; without synonyms it must NOT match
         let mut p = params("impresora");
-        assert!(ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)).is_empty());
+        assert_eq!(
+            ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+            Vec::<usize>::new()
+        );
 
         // with synonyms on, "impresora" expands to "printer" and reaches the doc
         p.synonyms = true;
@@ -1987,25 +2133,23 @@ mod tests {
     }
 
     #[test]
-    fn negation_without_a_positive_term_yields_no_hits() {
-        // Decisión explícita (spec, 2026-08-11): NO se soporta ni se rechaza; devuelve vacío.
-        // Si algún día se agrega una hoja MatchAll, este test falla y hay que revisarlo.
+    fn a_tree_that_only_negates_at_the_root_subtracts_from_every_doc() {
+        // Igual que un `where mustnot`: todo menos lo negado. Un `not` anidado bajo un `or`
+        // sigue sin aportar nada propio (docs/API.md), y un `and`/`or` vacío no matchea nada.
+        // corpus: doc0 "vpn guide", doc1 "vpn setup", doc2 "mysql notes".
+        let not = |p: &str| BoolNode::Not(Box::new(term(p)));
         let idx = corpus();
-        for node in [
-            BoolNode::Not(Box::new(term("fox"))),
-            BoolNode::Or(vec![BoolNode::Not(Box::new(term("fox")))]),
-            BoolNode::And(vec![
-                BoolNode::Not(Box::new(term("fox"))),
-                BoolNode::Not(Box::new(term("dog"))),
-            ]),
-            BoolNode::And(vec![]),
-            BoolNode::Or(vec![]),
+        for (node, expected) in [
+            (not("vpn"), vec![2]),
+            (BoolNode::And(vec![not("guide"), not("mysql")]), vec![1]),
+            (BoolNode::Or(vec![not("vpn")]), vec![]),
+            (BoolNode::And(vec![]), vec![]),
+            (BoolNode::Or(vec![]), vec![]),
         ] {
-            let q = map_bool_node(&node, false, 0).unwrap();
-            assert!(
-                search(&idx, &q, 0.0, 10).is_empty(),
-                "la negación pura devuelve vacío, sin panic: {node:?}"
-            );
+            let mut p = params("");
+            p.boolean_tree = Some(node.clone());
+            let q = build_query(&p).unwrap();
+            assert_eq!(ids(&search(&idx, &q, 0.0, 10)), expected, "{node:?}");
         }
     }
 

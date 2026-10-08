@@ -746,8 +746,6 @@ mod tests {
             got.contains(&("title".to_string(), "workflow".to_string())),
             "got={got:?}"
         );
-        // total count = sum of terms per field (non-empty)
-        assert!(!got.is_empty());
     }
 
     fn fixture_dict_bytes() -> (Vec<u8>, Vec<u8>, Vec<String>) {

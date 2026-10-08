@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project is pre-1.0, so a
 breaking change bumps the **minor** version.
 
+## [Unreleased]
+
+### Breaking
+
+- **A query with nothing positive to match returns every document instead of throwing
+  `empty query`**, in `search()`, `semantic_query()` and `hybrid_query()`. Nothing positive
+  means no `text`, `boolean_tree` or `in`, and no `must`/`should` `where`: only
+  `range`/`match_all` filters, only `mustnot` `where` groups, or no parameters at all. It used
+  to throw (or return zero hits with only `mustnot`); hosts that catch the exception showed an
+  empty screen. It now matches every live document, narrowed by the filters and minus the
+  `mustnot`s, like an empty text in OpenSearch. `semantic_query()` has nothing to expand there
+  and returns the same listing as `search()`.
+- **An `in` with no values matches nothing instead of being dropped.** Hosts use `in` for
+  visibility; an empty one ("visible in none") used to be ignored, so a text search
+  returned every text match regardless of the filter.
+- **A `boolean_tree` that only negates at the root** (`NOT x`, an `and` whose children are all
+  `not`) returns every document minus the negated ones, like the equivalent `mustnot` `where`,
+  instead of zero hits. A `not` nested under an `or` still drops out.
+- **Rust API:** `Query` gains a `MatchAll` variant, `QueryError::Empty` is gone (`build_query`
+  no longer rejects an empty query), and `IndexReader::is_deleted` is a new required method.
+
+### Fixed
+
+- **`semantic_query()` and `hybrid_query()` apply `range` and `match_all`.** Both were parsed
+  and silently ignored, so a date filter did nothing in semantic/hybrid mode and PRF drew its
+  feedback from documents outside it.
+
 ## [0.3.0] - 2026-08-26
 
 ### Breaking

@@ -7,7 +7,9 @@
 
 use crate::index::IndexReader;
 use crate::mlt::{MltParams, select_terms};
-use crate::query::{Occur, Query, QueryError, QueryParams, build_query, search_with_weights};
+use crate::query::{
+    Occur, Query, QueryError, QueryParams, allow_list, build_query, search_with_weights_paged,
+};
 use crate::search::Hit;
 use std::collections::HashMap;
 
@@ -69,12 +71,29 @@ pub fn search_prf(
     let lim = if limit == 0 { usize::MAX } else { limit };
     let base = build_query(params)?;
 
-    // Plain search closure (the graceful-degradation fallback and the final pass share it).
+    // Plain search closure (the graceful-degradation fallback and both passes share it). The
+    // allow-list bounds both passes, so feedback is drawn from, and lands on, filtered docs only.
+    let restrict = allow_list(index, params);
     let plain = |q: &Query, ms: f32, l: usize| {
-        search_with_weights(index, q, &params.field_weights, params.similarity, ms, l)
+        search_with_weights_paged(
+            index,
+            q,
+            &params.field_weights,
+            params.similarity,
+            ms,
+            0,
+            l,
+            None,
+            restrict.as_ref(),
+            None,
+        )
+        .hits
     };
 
-    if prf.top_k == 0 || prf.num_terms == 0 {
+    // `build_query` fell back to `MatchAll`: a listing, with no query to seed feedback from.
+    let nothing_to_expand = matches!(&base, Query::Boolean { clauses }
+        if clauses.iter().any(|(_, q)| *q == Query::MatchAll));
+    if prf.top_k == 0 || prf.num_terms == 0 || nothing_to_expand {
         return Ok(plain(&base, min_score, lim));
     }
 
@@ -346,15 +365,27 @@ mod tests {
     }
 
     #[test]
-    fn invalid_query_propagates_err() {
-        // Empty text -> QueryError::Empty (mirrors build_query itself). PRF must not
-        // swallow an invalid query into an empty Ok(vec![]) result.
+    fn nothing_to_expand_degrades_to_the_plain_listing() {
+        // An empty query has no seed: pass 1 would be just the first docs by id, and their terms
+        // would reorder the listing around them. PRF has nothing to add, so it is plain search.
         let idx = corpus();
-        let empty_text = search_prf(&idx, &params(""), &PrfParams::default(), 0.0, 100);
-        assert!(matches!(empty_text, Err(QueryError::Empty)));
+        let scored = |hits: Vec<Hit>| {
+            hits.into_iter()
+                .map(|h| (h.id, h.score))
+                .collect::<Vec<_>>()
+        };
+        let plain = search(&idx, &build_query(&params("")).unwrap(), 0.0, 100);
+        let prf = search_prf(&idx, &params(""), &PrfParams::default(), 0.0, 100)
+            .expect("an empty query is the listing, not an error");
+        assert_eq!(scored(prf), scored(plain));
+    }
 
-        // Empty WHERE-group field name -> QueryError::EmptyField (mirrors query.rs's
-        // own build_query_empty_field_is_error test).
+    #[test]
+    fn invalid_query_propagates_err() {
+        // Empty WHERE-group field name -> QueryError::EmptyField (mirrors query.rs's own
+        // build_query_empty_field_is_error test). PRF must not swallow an invalid query into an
+        // empty Ok(vec![]) result.
+        let idx = corpus();
         let mut p = params("printer");
         p.where_groups = vec![WhereGroup {
             field: String::new(),
