@@ -5,7 +5,8 @@ use crate::index::IndexReader;
 use crate::score::Similarity;
 use crate::search::{
     Hit, SearchOutcome, SortSpec, accent_variant_terms, accent_wildcard_terms, finalize_paged,
-    finalize_sorted, fuzzy_scores, phrase_scores, term_scores, union_scores, wildcard_terms,
+    finalize_sorted, fuzzy_scores, fuzzy_terms, phrase_scores, term_scores, union_scores,
+    wildcard_terms,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -39,11 +40,14 @@ pub enum Query {
         min_prefix_len: usize,
         accent_insensitive: bool,
     },
+    /// `accent_insensitive`: the prefix also reaches its accent variants and the distance is
+    /// measured folded (see `fuzzy_terms`).
     Fuzzy {
         field: Option<String>,
         text: String,
         similarity: f32,
         prefix_len: usize,
+        accent_insensitive: bool,
     },
     /// phrase with exact adjacency. `field` None = the phrase must occur in at least one
     /// indexed field, scored as an OR across fields — the host adapter's multi-field
@@ -141,13 +145,20 @@ fn eval(
             text,
             similarity,
             prefix_len,
+            accent_insensitive,
         } => {
             let mut acc: HashMap<usize, f32> = HashMap::new();
             for f in target_fields(index, field) {
                 let w = field_weight(weights, &f);
-                for (id, s) in
-                    fuzzy_scores(index, sim, &f, text, *similarity, *prefix_len, restrict)
-                {
+                let terms = fuzzy_terms(
+                    index,
+                    &f,
+                    text,
+                    *similarity,
+                    *prefix_len,
+                    *accent_insensitive,
+                );
+                for (id, s) in fuzzy_scores(index, sim, &f, &terms, restrict) {
                     *acc.entry(id).or_insert(0.0) += s * w;
                 }
             }
@@ -721,6 +732,7 @@ fn text_subquery_with_dict(p: &QueryParams, dict: Option<&crate::synonyms::Synon
                 text: w.to_string(),
                 similarity: p.fuzzy_similarity,
                 prefix_len: p.fuzzy_prefix_len,
+                accent_insensitive: p.accent_insensitive,
             },
         ));
     }
@@ -979,6 +991,64 @@ mod tests {
         };
         assert_eq!(hits_for("camion"), vec![0, 1]);
         assert_eq!(hits_for("camión"), vec![0, 1]);
+    }
+
+    #[test]
+    fn accent_insensitive_fuzzy_treats_both_spellings_alike() {
+        // "camino" is a typo away from "camion" but, unfolded, three bytes from "camión": only
+        // the plain spelling reached it. And the fuzzy leaf scored the accented form of the
+        // word as a typo of it (boost 1/3) instead of as the word itself.
+        let mut idx = MemoryIndex::new();
+        for title in ["camino largo", "camión rojo", "camion viejo", "otra cosa"] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            idx.add_document(d);
+        }
+        let hits_for = |text: &str| {
+            let mut p = params(text);
+            p.accent_insensitive = true;
+            search(&idx, &build_query(&p).unwrap(), 0.0, 100)
+        };
+        let (plain, accented) = (hits_for("camion"), hits_for("camión"));
+        let order = |hits: &[Hit]| hits.iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(
+            order(&plain),
+            vec![1, 2, 0],
+            "the two spellings tie, then the typo"
+        );
+        assert_eq!(order(&accented), order(&plain));
+        for (a, b) in accented.iter().zip(&plain) {
+            assert!(
+                (a.score - b.score).abs() < 1e-6,
+                "doc {}: {a:?} vs {b:?}",
+                a.id
+            );
+        }
+        assert!(
+            (plain[0].score - plain[1].score).abs() < 1e-6,
+            "camión ties camion"
+        );
+    }
+
+    #[test]
+    fn accent_insensitive_fuzzy_reaches_a_tilde_inside_the_prefix() {
+        // "últmo" is reachable only through the fuzzy leaf, and its tilde sits inside the
+        // exact prefix: the "ult" bucket never holds it, only the "últ" variant does.
+        let mut idx = MemoryIndex::new();
+        for title in ["últmo aviso", "otra cosa"] {
+            let mut d = Document::new();
+            d.add("title", title, FieldKind::Text);
+            idx.add_document(d);
+        }
+        for text in ["ultimo", "último"] {
+            let mut p = params(text);
+            p.accent_insensitive = true;
+            assert_eq!(
+                ids(&search(&idx, &build_query(&p).unwrap(), 0.0, 100)),
+                vec![0],
+                "{text}"
+            );
+        }
     }
 
     #[test]

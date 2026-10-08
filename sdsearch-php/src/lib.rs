@@ -100,8 +100,8 @@ struct ParamsDto {
     /// exact count; `false` = do not report a total. Absent ⇒ default cap of 1001.
     #[serde(default)]
     track_total_hits: Option<TrackTotalHitsDto>,
-    /// optional: accent-insensitive text matching (Spanish). Omitted = false.
-    #[serde(default)]
+    /// optional: accent-insensitive text matching (Spanish). Omitted = true.
+    #[serde(default = "default_accent_insensitive")]
     accent_insensitive: bool,
     /// optional: expand each query token with bundled synonyms/translations
     /// (cross-lingual ES↔EN). Omitted = false.
@@ -301,6 +301,9 @@ fn default_min_doc_freq() -> u64 {
 }
 fn default_wildcard_min_prefix() -> usize {
     2
+}
+fn default_accent_insensitive() -> bool {
+    true
 }
 fn default_fuzzy_similarity() -> f32 {
     0.5

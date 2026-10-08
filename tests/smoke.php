@@ -135,4 +135,31 @@ if (!$rejected) {
 }
 \fwrite(\STDOUT, "search fuzzy knobs OK\n");
 
+// smoke test: accent_insensitive defaults to true. "codigo" reaches "código" only through the
+// accent variants: the tilde sits inside the 3-char fuzzy prefix, so no typo match covers it.
+$accentDir = \sys_get_temp_dir() . '/sdsearch_smoke_accent_' . \getmypid();
+@\mkdir($accentDir);
+foreach (\glob(__DIR__ . '/../sdsearch-core/tests/fixtures/zsl_index_kb/*') as $f) {
+    \copy($f, $accentDir . '/' . \basename($f));
+}
+$writer = new \SdSearch\Writer();
+$writer->open($accentDir);
+$writer->add_document(\json_encode(['fields' => [
+    ['name' => 'title', 'value' => 'código de error', 'kind' => 'text'],
+]]));
+$writer->commit();
+$codigoHits = static fn (array $extra): int => \count(\array_filter(
+    \json_decode($engine->search($accentDir, \json_encode(['text' => 'codigo'] + $extra)), true)['hits'],
+    static fn (array $h): bool => ($h['fields']['title'] ?? '') === 'código de error'
+));
+$byDefault = $codigoHits([]);
+$optedOut = $codigoHits(['accent_insensitive' => false]);
+\array_map('unlink', \glob($accentDir . '/*'));
+\rmdir($accentDir);
+if ($byDefault !== 1 || $optedOut !== 0) {
+    \fwrite(\STDERR, "FAIL: accent_insensitive default (omitted: $byDefault hits, false: $optedOut)\n");
+    exit(1);
+}
+\fwrite(\STDOUT, "search accent_insensitive default OK\n");
+
 exit(0);

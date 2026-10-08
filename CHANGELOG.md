@@ -22,7 +22,10 @@ breaking change bumps the **minor** version.
 - **A `boolean_tree` that only negates at the root** (`NOT x`, an `and` whose children are all
   `not`) returns every document minus the negated ones, like the equivalent `mustnot` `where`,
   instead of zero hits. A `not` nested under an `or` still drops out.
-- **Rust API:** `Query` gains a `MatchAll` variant and `Query::Wildcard` an
+- **`accent_insensitive` defaults to `true`** in `search()`, `semantic_query()` and
+  `hybrid_query()`. A host that omits it now gets accent-insensitive matching; pass `false`
+  for accents as typed.
+- **Rust API:** `Query` gains a `MatchAll` variant and `Query::Wildcard` and `Query::Fuzzy` an
   `accent_insensitive` field, `QueryError::Empty` is gone (`build_query` no longer rejects an
   empty query), and `IndexReader::is_deleted` is a new required method.
 
@@ -52,9 +55,14 @@ breaking change bumps the **minor** version.
 - **`accent_insensitive` now covers the free-text prefix leaf.** The `text*` wildcard was
   only lowercased, so `camion` reached `camioneta` through it and `camión` did not. The prefix
   as typed is searched first, then its single-tilde variants; the `wildcard_min_prefix` gate is
-  measured on the folded prefix. The per-word typo (fuzzy) match still counts an accent as a
-  different letter, so the two spellings can still return different totals: `camion` is a
-  typo away from `camino`, `camión` is not.
+  measured on the folded prefix.
+- **`accent_insensitive` now covers the per-word typo (fuzzy) match**, so both spellings
+  return the same totals and ranking. It counted an accent as a different letter: `camion` was
+  a typo away from `camino` and `camión` was not, and in a `camion` query a doc with `camión`
+  scored as a typo (boost 1/3) of the word it is. The distance is now measured between the
+  folded forms, and the exact prefix also reaches its accent variants (`ultimo` finds the
+  typo `últmo`). The accented spelling now reaches the same typos as the plain one, so its
+  total can grow.
 - **Accent variants stop at 64-character tokens.** A longer whitespace-free run (a pasted
   path, `a,a,a,…`) expanded to one variant per vowel, O(n²) memory that could abort the PHP
   worker; past the cap only its typed and folded forms are searched.
