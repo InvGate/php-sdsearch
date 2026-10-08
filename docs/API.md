@@ -22,7 +22,7 @@ extension=sdsearch.so     ; Linux
 ```
 
 ```php
-echo sdsearch_version(); // "0.3.0" — also a smoke test that the extension loaded
+echo sdsearch_version(); // "0.4.0" — also a smoke test that the extension loaded
 ```
 
 ## Method reference

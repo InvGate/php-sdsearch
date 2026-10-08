@@ -6,6 +6,8 @@ breaking change bumps the **minor** version.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-08
+
 ### Breaking
 
 - **A query with nothing positive to match returns every document instead of throwing
@@ -192,6 +194,7 @@ breaking change bumps the **minor** version.
 Initial public release: a native Rust engine that reads and writes the Zend Search Lucene
 index format byte-for-byte, plus the PHP extension that exposes it.
 
+[0.4.0]: https://github.com/InvGate/php-sdsearch/releases/tag/v0.4.0
 [0.3.0]: https://github.com/InvGate/php-sdsearch/releases/tag/v0.3.0
 [0.2.1]: https://github.com/InvGate/php-sdsearch/releases/tag/v0.2.1
 [0.2.0]: https://github.com/InvGate/php-sdsearch/releases/tag/v0.2.0
