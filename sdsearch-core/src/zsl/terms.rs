@@ -491,6 +491,42 @@ impl TermDict {
         out
     }
 
+    /// Every term of `field` with its `TermInfo`, in `.tis` order: one seek, then a forward
+    /// decode — no per-term `info` lookup, which is what made a whole-field walk through
+    /// `terms_in_range` + `info` cost ~1 s on 135k terms. Field sort builds its value table on it.
+    pub fn field_terms(&self, field: &str) -> Vec<(String, TermInfo)> {
+        let gt = self
+            .index
+            .partition_point(|e| (e.field.as_str(), e.text.as_str()) <= (field, ""));
+        // No term is empty, so the anchor (largest index entry <= (field, "")) always precedes
+        // the field's first term and is never one of them: decoding starts right after it.
+        let anchor = &self.index[gt - 1];
+        let mut out = Vec::new();
+        let mut pos = anchor.tis_offset;
+        let mut prev = anchor.text.clone();
+        let (mut fp, mut pp) = (anchor.info.freq_pointer, anchor.info.prox_pointer);
+        while pos < self.tis.len() {
+            let Ok((f, t, ti)) = decode_entry(
+                &self.tis,
+                &mut pos,
+                &prev,
+                &mut fp,
+                &mut pp,
+                &self.field_names,
+            ) else {
+                break;
+            };
+            if f.as_str() > field {
+                break;
+            }
+            if f == field {
+                out.push((t.clone(), ti));
+            }
+            prev = t;
+        }
+        out
+    }
+
     /// Sequentially decodes the WHOLE `.tis` from just past its 24-byte header.
     /// `.tis` is physically written in canonical `(field_name asc, text asc)`
     /// order (see `EagerTermCursor`'s doc comment and `zsl/writer/terms.rs`), so a

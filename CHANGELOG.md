@@ -32,6 +32,18 @@ breaking change bumps the **minor** version.
   `fuzzy_prefix_len` (default `3`), until now fixed in the extension, so hosts can tune typo
   matching without a release.
 
+### Changed
+
+- **A field-sorted `search()` no longer pays a cold-cache spike on many matches.** Each match's
+  sort value used to be read from the `.fdt`, next to that doc's full text, so the first sorted
+  query on a cold page cache touched most of the file (1.5 s on a 1 GB index with 42k matches;
+  ~5 s reported on a 1.5 GB one). From ~1/128 of the index in matches, the numeric sort field
+  is now read once from its terms (a few MB, ~25 ms for 135k docs) into a per-query table:
+  that query now takes 0.13 s cold and 0.12 s warm (was 0.19 s), with identical results.
+  Fewer matches keep the per-match reads, now in doc-id order so readahead batches them. A
+  stored-only, non-numeric or multi-valued sort field always uses the per-match reads. Works
+  on existing Zend-written indexes; nothing is persisted.
+
 ### Fixed
 
 - **`semantic_query()` and `hybrid_query()` apply `range` and `match_all`.** Both were parsed
