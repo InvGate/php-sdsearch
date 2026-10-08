@@ -31,7 +31,8 @@ pub enum Query {
         field: Option<String>,
         text: String,
     },
-    /// `accent_insensitive` expands `pattern` to its accent variants, like `AccentTerm`.
+    /// `accent_insensitive`: the literal prefix also reaches its accent variants and the rest
+    /// of the pattern is matched folded (see `accent_wildcard_terms`).
     Wildcard {
         field: Option<String>,
         pattern: String,

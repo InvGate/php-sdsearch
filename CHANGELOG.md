@@ -22,8 +22,9 @@ breaking change bumps the **minor** version.
 - **A `boolean_tree` that only negates at the root** (`NOT x`, an `and` whose children are all
   `not`) returns every document minus the negated ones, like the equivalent `mustnot` `where`,
   instead of zero hits. A `not` nested under an `or` still drops out.
-- **Rust API:** `Query` gains a `MatchAll` variant, `QueryError::Empty` is gone (`build_query`
-  no longer rejects an empty query), and `IndexReader::is_deleted` is a new required method.
+- **Rust API:** `Query` gains a `MatchAll` variant and `Query::Wildcard` an
+  `accent_insensitive` field, `QueryError::Empty` is gone (`build_query` no longer rejects an
+  empty query), and `IndexReader::is_deleted` is a new required method.
 
 ### Added
 
@@ -37,9 +38,18 @@ breaking change bumps the **minor** version.
   and silently ignored, so a date filter did nothing in semantic/hybrid mode and PRF drew its
   feedback from documents outside it.
 - **`accent_insensitive` now covers the free-text prefix leaf.** The `text*` wildcard was
-  only lowercased, so `configuracion` and `configuración` returned different totals and
-  rankings. It now expands to the same accent variants as the exact term; the
-  `wildcard_min_prefix` gate is measured on the folded prefix.
+  only lowercased, so `camion` reached `camioneta` through it and `camión` did not. The prefix
+  as typed is searched first, then its single-tilde variants; the `wildcard_min_prefix` gate is
+  measured on the folded prefix. The per-word typo (fuzzy) match still counts an accent as a
+  different letter, so the two spellings can still return different totals: `camion` is a
+  typo away from `camino`, `camión` is not.
+- **Accent variants stop at 64-character tokens.** A longer whitespace-free run (a pasted
+  path, `a,a,a,…`) expanded to one variant per vowel, O(n²) memory that could abort the PHP
+  worker; past the cap only its typed and folded forms are searched.
+- **`accent_insensitive` finds a token typed exactly as indexed with two or more tildes**
+  (`información-gestión`, a compound the analyzer keeps whole). Only single-tilde variants
+  were searched, so the exact term and phrase leaves matched nothing and the doc lost that
+  part of its score.
 - **A typo variant no longer weighs as much as the exact word.** The fuzzy leaf computed each
   term's similarity and dropped it, so every variant scored at full weight; with length
   normalization, a request containing the exact word could rank below fuzzy-only ones. Each

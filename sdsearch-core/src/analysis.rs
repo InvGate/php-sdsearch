@@ -39,23 +39,43 @@ fn fold_char(c: char) -> char {
     }
 }
 
-/// accent variants of a token for accent-insensitive matching. Spanish allows at
-/// most one written tilde per word, so the candidate set is LINEAR: the folded
-/// base plus one variant per vowel position carrying a single accent. `u` yields
-/// both `ú` and `ü` (diéresis). `ñ` is preserved. Folding the input first means
-/// this works whether the user typed the accented or the plain form.
+/// accent variants of a token for accent-insensitive matching, each once: the typed form
+/// first, then the folded base, then one variant per vowel position carrying a single accent.
+/// Spanish allows at most one written tilde per word, so the set is LINEAR; the typed form
+/// covers a token that carries more (`información-gestión`, kept whole by the analyzer), and
+/// goes first because the wildcard fills its term cap in this order. `u` yields both `ú` and
+/// `ü` (diéresis). `ñ` is preserved. Folding the input first means this works whether the user
+/// typed the accented or the plain form.
+///
+/// Past `MAX_VARIANT_CHARS` only the typed and folded forms are returned.
 pub fn accent_variants(token: &str) -> Vec<String> {
-    let base: Vec<char> = fold_accents(token).chars().collect();
-    let mut out = vec![base.iter().collect::<String>()];
+    let folded = fold_accents(token);
+    let base: Vec<char> = folded.chars().collect();
+    let mut out = vec![token.to_string()];
+    if folded != token {
+        out.push(folded);
+    }
+    if base.len() > MAX_VARIANT_CHARS {
+        return out;
+    }
     for (i, c) in base.iter().enumerate() {
         for &accented in accented_forms(*c) {
             let mut variant = base.clone();
             variant[i] = accented;
-            out.push(variant.into_iter().collect());
+            let variant: String = variant.into_iter().collect();
+            if variant != token {
+                out.push(variant);
+            }
         }
     }
     out
 }
+
+/// Longest token, in chars, that gets one variant per vowel. Spanish words are far shorter; a
+/// longer run is a pasted path or `a,a,a,…` (the wildcard prefix is the whole whitespace-free
+/// text), whose expansion is O(n²) memory — and an allocation failure aborts the PHP worker
+/// past `catch_unwind`.
+const MAX_VARIANT_CHARS: usize = 64;
 
 /// the single-accent forms a base vowel can take (empty for non-vowels).
 fn accented_forms(c: char) -> &'static [char] {
@@ -72,6 +92,27 @@ fn accented_forms(c: char) -> &'static [char] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accent_variants_of_a_long_run_stay_bounded() {
+        // A whitespace-free run (`á,á,…`, a pasted path) would yield one variant per vowel, each
+        // as long as the run: O(n²) memory, and an allocation failure aborts the PHP worker past
+        // `catch_unwind`. Past the cap only the folded and the typed forms remain.
+        let long = "á,".repeat(8000);
+        assert_eq!(
+            accent_variants(&long),
+            vec![long.clone(), fold_accents(&long)]
+        );
+    }
+
+    #[test]
+    fn accent_variants_put_the_typed_form_first_once() {
+        // first because the wildcard fills its term cap in this order; once because a
+        // single-tilde form is also one of the per-vowel variants
+        let v = accent_variants("avión");
+        assert_eq!(v[0], "avión");
+        assert_eq!(v.iter().filter(|x| *x == "avión").count(), 1);
+    }
 
     #[test]
     fn splits_on_whitespace_and_lowercases() {
