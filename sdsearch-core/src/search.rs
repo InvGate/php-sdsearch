@@ -237,18 +237,11 @@ pub(crate) fn wildcard_terms(
     pattern: &str,
     min_prefix_len: usize,
 ) -> Vec<String> {
-    let first_wild = pattern.find(['*', '?']);
-    let prefix = match first_wild {
-        Some(i) => &pattern[..i],
-        None => pattern,
-    };
+    let prefix = literal_prefix(pattern);
     if prefix.len() < min_prefix_len {
         return Vec::new();
     }
-    // preg_quote + wildcard replacement (equivalent to ZSL)
-    let escaped = regex::escape(pattern);
-    let regex_str = format!("^{}$", escaped.replace("\\*", ".*").replace("\\?", "."));
-    let Ok(re) = regex::Regex::new(&regex_str) else {
+    let Some(re) = wildcard_regex(pattern) else {
         return Vec::new();
     };
     index
@@ -256,6 +249,63 @@ pub(crate) fn wildcard_terms(
         .into_iter()
         .filter(|t| re.is_match(t))
         .collect()
+}
+
+/// the literal part of a wildcard pattern: everything before the first `*`/`?`.
+fn literal_prefix(pattern: &str) -> &str {
+    pattern.find(['*', '?']).map_or(pattern, |i| &pattern[..i])
+}
+
+/// preg_quote + wildcard replacement (equivalent to ZSL): `?`->`.`, `*`->`.*`, anchored.
+fn wildcard_regex(pattern: &str) -> Option<regex::Regex> {
+    let escaped = regex::escape(pattern);
+    regex::Regex::new(&format!(
+        "^{}$",
+        escaped.replace("\\*", ".*").replace("\\?", ".")
+    ))
+    .ok()
+}
+
+/// `wildcard_terms`, accent-insensitive. Only the literal prefix picks dictionary buckets: the
+/// prefix as typed, then its accent variants (the `accent_variant_terms` rule). The buckets are
+/// disjoint (same length in chars, different strings). The rest of the pattern is matched
+/// against the folded term. `MAX_WILDCARD_TERMS` bounds the whole union, as it bounds a plain
+/// leaf, and the `min_prefix_len` gate is measured on the folded prefix, so a typed "a" stays
+/// gated instead of expanding through its two-byte "á" variant.
+pub(crate) fn accent_wildcard_terms(
+    index: &impl IndexReader,
+    field: &str,
+    pattern: &str,
+    min_prefix_len: usize,
+) -> Vec<String> {
+    let folded = crate::analysis::fold_accents(pattern);
+    let prefix = literal_prefix(&folded);
+    if prefix.len() < min_prefix_len {
+        return Vec::new();
+    }
+    // A prefix spanning words matches no analyzed term (the multi-word no-op of
+    // `text_subquery`), and its variants would grow with the whole query text: keep it plain.
+    if prefix.contains(char::is_whitespace) {
+        return wildcard_terms(index, field, pattern, min_prefix_len);
+    }
+    let Some(re) = wildcard_regex(&folded) else {
+        return Vec::new();
+    };
+    // the typed spelling comes first (see `accent_variants`): the cap is filled in bucket order
+    let mut terms = Vec::new();
+    for bucket in crate::analysis::accent_variants(literal_prefix(pattern)) {
+        let room = MAX_WILDCARD_TERMS - terms.len();
+        if room == 0 {
+            break;
+        }
+        terms.extend(
+            index
+                .terms_with_prefix_limited(field, &bucket, room)
+                .into_iter()
+                .filter(|t| re.is_match(&crate::analysis::fold_accents(t))),
+        );
+    }
+    terms
 }
 
 /// terms of `field` matching fuzzy (without scoring). Faithful port of
@@ -707,6 +757,20 @@ mod tests {
     }
 
     #[test]
+    fn accent_variant_terms_reaches_the_typed_form_with_two_accents() {
+        // the analyzer keeps `-` inside a token, so one term can carry two tildes: no
+        // single-tilde variant spells it, so the typed form itself must be one of the variants
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", "información-gestión", FieldKind::Text);
+        idx.add_document(d);
+        assert_eq!(
+            accent_variant_terms(&idx, "body", "información-gestión"),
+            vec!["información-gestión"]
+        );
+    }
+
+    #[test]
     fn accent_variant_terms_empty_when_nothing_matches() {
         let idx = accent_corpus();
         assert_eq!(
@@ -790,6 +854,69 @@ mod tests {
         // literal prefix "a" (len 1) < min_prefix 2 => empty (as today)
         let hits = wildcard_query(&wildcard_corpus(), "body", "a*b*", 2, 0.0, 10);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn accent_wildcard_terms_keeps_the_per_leaf_cap() {
+        // two full buckets ("co…" and "có…") must not add up past the cap that bounds a plain
+        // wildcard leaf: the accent variants are one leaf, not one leaf per variant
+        let half = MAX_WILDCARD_TERMS - 1000;
+        let words: Vec<String> = (0..half)
+            .flat_map(|i| [format!("co{i:05}"), format!("có{i:05}")])
+            .collect();
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", &words.join(" "), FieldKind::Text);
+        idx.add_document(d);
+        let terms = accent_wildcard_terms(&idx, "body", "co*", 0);
+        assert_eq!(terms.len(), MAX_WILDCARD_TERMS);
+    }
+
+    #[test]
+    fn accent_wildcard_terms_searches_the_typed_prefix_first() {
+        // the cap is filled in bucket order: a full unaccented bucket must not crowd out the
+        // spelling the user actually typed
+        let mut words: Vec<String> = (0..MAX_WILDCARD_TERMS)
+            .map(|i| format!("co{i:05}"))
+            .collect();
+        words.extend(["código".to_string(), "cómo".to_string()]);
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", &words.join(" "), FieldKind::Text);
+        idx.add_document(d);
+        let terms = accent_wildcard_terms(&idx, "body", "có*", 0);
+        for typed in ["código", "cómo"] {
+            assert!(terms.iter().any(|t| t == typed), "{typed} crowded out");
+        }
+    }
+
+    #[test]
+    fn accent_wildcard_terms_reaches_a_typed_prefix_with_two_accents() {
+        // the analyzer keeps `-` inside a token, so one term can carry two tildes: no
+        // single-tilde variant spells it, the typed prefix does
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add(
+            "body",
+            "información-gestión información-gestiónes",
+            FieldKind::Text,
+        );
+        idx.add_document(d);
+        let mut got = accent_wildcard_terms(&idx, "body", "información-gestión*", 0);
+        got.sort();
+        assert_eq!(got, vec!["información-gestión", "información-gestiónes"]);
+    }
+
+    #[test]
+    fn accent_wildcard_terms_matches_accents_after_the_prefix() {
+        // only the literal prefix picks dictionary buckets; the rest is matched folded
+        let mut idx = MemoryIndex::new();
+        let mut d = Document::new();
+        d.add("body", "camión camioneta", FieldKind::Text);
+        idx.add_document(d);
+        let mut got = accent_wildcard_terms(&idx, "body", "cam*on*", 0);
+        got.sort();
+        assert_eq!(got, vec!["camioneta", "camión"]);
     }
 
     #[test]
